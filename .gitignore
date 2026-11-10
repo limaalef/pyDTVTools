@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+dtv_tools.json
+tools/*
+!tools/README.md
+.pytest_cache/
+/tests
+/docs
+README.example.md
+requirements-dev.txt

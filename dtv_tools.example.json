@@ -1,0 +1,6 @@
+{
+  "mp4box": "C:/tools/gpac/MP4Box.exe",
+  "ffmpeg": "C:/tools/ffmpeg-dtvplus/ffmpeg.exe",
+  "mpegh_ui": "C:/tools/mpegh/mpeghUiManager.exe",
+  "mpegh_decoder": "C:/tools/mpegh/mpeghDecoder.exe"
+}
