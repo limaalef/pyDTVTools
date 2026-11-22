@@ -13,6 +13,9 @@ Caso você seja um uusário que tenha ressalvas ao uso de inteligência artifica
 | `mpegh-audio` | Gera arquivos de áudio dos presets/grupos escolhidos |
 | `mp4-cut` | Corte sem perdas (VVC + LCEVC + MPEG-H preservados), com verificação e correção do sincronismo A/V |
 | `dash-capture` | Grava o stream DASH ao vivo ou estático (VVC + LCEVC + MPEG-H) em MP4 |
+| `transcode` | MP4 single-track -> HEVC 10 bits HDR10 (camada LCEVC aplicada) e presets MPEG-H renderizados como trilhas de áudio |
+| `frame` | Salva um quadro como imagem HDR (PNG 16 bits, AVIF) e/ou SDR com tone mapping (PNG, JPG) |
+| `sdr` | Gera imagens SDR a partir de um PNG HDR salvo |
 | `doctor` | Verifica os programas externos e os módulos Python necessários para o script funcionar |
 
 ### Opções comuns a todos os comandos
@@ -252,6 +255,71 @@ python dtv_tools.py dash-capture "https://example.com/live.mpd" --keep-temp --lo
  
 Pare uma gravação ao vivo com **Ctrl+C** (ou SIGTERM / Ctrl+Break): ela para de baixar e ainda empacota o que foi gravado.
 
+### `transcode`
+ 
+Recodifica o MP4 single-track (VVC c/ LCEVC SEI + MPEG-H) para **HEVC 10 bits HDR10** (x265), aplicando o enhancement LCEVC pelo filtro `lcevc` do FFmpeg. O mastering display e o MaxCLL/MaxFALL são lidos do primeiro quadro;
+se o stream não tiver, usa 1000/0,005 nits e 1000/300 e avisa em uma nota.
+
+> [!IMPORTANT]
+> Necessário FFmpeg, `mpeghDecoder` e `mpeghUiManager` para utilizar este comando. No Python, é necessário ter os módulos `numpy` e `Pillow` instalados.
+ 
+```
+python dtv_tools.py transcode ENTRADA.mp4 [-o SAIDA.mp4] [--audio render|copy|none] [--crf 18] [opções]
+```
+ 
+| Opção | Significado |
+|---|---|
+| `-o`, `--output` | Saída (`.mp4`, `.m4v`, `.mov` ou `.mkv`). Padrão `<nome>_hevc_hdr10.mp4` (`.mkv` quando há trilhas PCM/FLAC) |
+| `--audio` | `render` (padrão): cada preset MPEG-H vira uma trilha, como em `mpegh-audio`. `copy`: só a trilha original (não precisa das ferramentas MPEG-H); `none` |
+| `--option`, `--audio-format`, `--audio-delay`, `--original-audio`, `--native-layout`, `--jobs` | Mesmo significado de `mpegh-audio`; `--original-audio keep` acrescenta a trilha original MPEG-H no fim |
+| `--container` | `auto`, `mp4` ou `mkv` |
+| `--crf`, `--preset`, `--x265-params` | Ajustes do encoder; parâmetros extras são anexados aos do HDR10 |
+| `--no-lcevc` | A origem não tem LCEVC (arquivo HDR10 comum): não usa o filtro |
+| `--size WxH`, `--no-size-fix` | Tamanho da saída. Por padrão só se usa um tamanho medido pela verificação LCEVC |
+| `--verify-frames` | Quadros decodificados na verificação LCEVC (padrão 48) |
+| `--limit SEG` | Codifica só os primeiros SEG segundos (teste rápido) |
+| `--dry-run` | Mostra o comando do ffmpeg e para |
+ 
+O arquivo é gravado como `<saída>.part` e só recebe o nome final quando está completo; uma execução que falha nunca deixa um arquivo truncado com o nome final. **Extras do `result`:** `rows`, `notes`, `tracks`. **Etapas:** probe, (decode), encode, report.
+ 
+### `frame`
+ 
+Salva um quadro do mesmo tipo de arquivo como imagem: HDR (PNG 16 bits, AVIF 10 bits) e/ou SDR com tone mapping (PNG, JPG).
+
+> [!IMPORTANT]
+> Necessário FFmpeg para utilizar este comando. No Python, é necessário ter os módulos `numpy` e `Pillow` instalados.
+ 
+```
+python dtv_tools.py frame ENTRADA.mp4 --time 00:01:23.5 [--hdr png,avif] [--sdr png,jpg] [opções]
+python dtv_tools.py frame ENTRADA.mp4 --frame 2500
+```
+ 
+| Opção | Significado |
+|---|---|
+| `--time` / `--frame` | O quadro, por tempo (quadro mais próximo; uma nota avisa se o tempo está fora do vídeo) ou por número na ordem de exibição (a partir de 1) |
+| `--hdr` | `png` (padrão; 16 bits, BT.2020/PQ com `cICP`, `mDCV` e `cLLI`), `avif`, lista separada por vírgula ou `none` |
+| `--sdr` | `png` (padrão), `jpg`, lista ou `none` |
+| `--avif-crf`, `--avif-chroma` | Qualidade e croma do AVIF (`444` padrão; `420` é o mais compatível). Precisa de `libaom-av1`. **O AVIF não leva mastering/MaxCLL; o PNG leva** |
+| `--tonemap` | `mobius` (padrão), `hable`, `reinhard`, `clip`; com `--white-nits`, `--peak-nits`, `--exposure`, `--desat`, `--saturation` |
+| `--jpg-quality` | 1-95 (padrão 95) |
+| `--slow-seek` | Decodifica desde o início do arquivo em vez do IDR mais próximo |
+| `-o`, `--output`, `--outdir` | Nome base (`_hdr.png`, `_sdr.png`... são acrescentados) e pasta |
+ 
+`--no-lcevc`, `--size` e `--no-size-fix` funcionam como em `transcode`.
+ 
+### `sdr`
+ 
+Gera imagens SDR (PNG/JPG, BT.709/sRGB, ICC embutido) a partir de um PNG HDR de 16 bits criado por `frame`, para testar outros ajustes de tone mapping sem decodificar o vídeo de novo.
+
+> [!IMPORTANT]
+> No Python, é necessário ter os módulos `numpy` e `Pillow` instalados.
+ 
+```
+python dtv_tools.py sdr ENTRADA_hdr.png [--sdr png,jpg] [--tonemap hable] [--white-nits 203] [-o NOME]
+```
+ 
+Mesmas opções de tone mapping de `frame`.
+
 ### `doctor`
  
 Verifica os programas externos, os módulos Python e diz onde cada um foi encontrado.
@@ -280,11 +348,11 @@ python dtv_tools.py doctor [--mp4box CAMINHO] [--ffmpeg CAMINHO] [--mpegh-ui CAM
 
 | Programa | Necessário para |
 |---|---|
-| MP4Box (GPAC 2.x) | `ts-tv3`, `mp4-cut`, `dash-capture`, `mpegh-*` |
-| ffmpeg | `mpegh-audio`; verificação opcional do LCEVC nos demais. O filtro `lcevc` estará disponível apenas em builds personalizadas compiladas com LCEVC |
-| mpeghUiManager, mpeghDecoder | `mpegh-scan`, `mpegh-audio` |
+| MP4Box (GPAC 2.x) | `ts-tv3`, `mp4-cut`, `dash-capture`, `mpegh-scan`, `mpegh-audio` |
+| ffmpeg | `mpegh-audio`, `transcode`, `frame` (`transcode` precisa de libx265, `frame --hdr avif` de libaom-av1); verificação opcional do LCEVC nos demais. O filtro `lcevc` estará disponível apenas em builds personalizadas compiladas com LCEVC |
+| mpeghUiManager, mpeghDecoder | `mpegh-scan`, `mpegh-audio`, `transcode --audio render` |
  
-Módulos Python, importados só quando necessários: `requests` (`dash-capture`) e `rich` (painel ao vivo do `dash-capture`).
+Módulos Python, importados só quando necessários: `requests` (`dash-capture`), `rich` (painel ao vivo do `dash-capture`), `numpy` e `Pillow` (`frame` e `sdr`);.
  
 Eles **não estão incluídos**. Eles podem ser disponibilizados para utilização no script das seguintes formas:
  

@@ -9,6 +9,9 @@ Subcommands:
   mpegh-scan    analyse the MPEG-H audio (presets, groups, native layout, availability timeline)
   mpegh-audio   render the chosen presets/groups to audio files (parallel decoding)
   mp4-cut       lossless cut of an MP4 at IDR frames (MP4Box -splitx) with A/V sync check
+  transcode     single-track MP4 (VVC + LCEVC + MPEG-H) -> HEVC 10-bit HDR10, with every MPEG-H preset as an audio track
+  frame         save one frame as HDR-native image (16-bit PNG / AVIF) and/or tone-mapped SDR image (PNG / JPG)
+  sdr           redo the SDR image from a saved *_hdr.png (no decoding)
   dash-capture  record a live or static DASH stream (VVC + LCEVC + MPEG-H) into an MP4
   doctor        check the external programs (MP4Box, ffmpeg, MPEG-H tools) and Python modules
 
@@ -31,10 +34,11 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 PJ = False
 VERBOSE = False
@@ -247,13 +251,6 @@ def tmp_session(tmp: Path, sig: dict) -> bool:
     return reused
 
 
-def done_ok(marker: Path, sig: str) -> bool:
-    try:
-        return marker.is_file() and marker.read_text(encoding="utf-8") == sig
-    except OSError:
-        return False
-
-
 def check_free_space(folder: Path, needed: int, what: str, hard=True):
     free = shutil.disk_usage(folder).free
     if free < needed:
@@ -422,10 +419,10 @@ def cmd_doctor(a):
     set_stages({"check": 100})
     step("check", "running")
     needed_by = {
-        "mp4box": "ts-tv3, mp4-cut, dash-capture, mpegh-scan, mpegh-audio",
-        "ffmpeg": "mpegh-audio (required); LCEVC verification (needs a build with the 'lcevc' filter)",
-        "mpegh_ui": "mpegh-scan, mpegh-audio",
-        "mpegh_decoder": "mpegh-audio",
+        "mp4box": "ts-tv3, mp4-cut, dash-capture, mpegh-scan, mpegh-audio, transcode (audio rendering)",
+        "ffmpeg": "mpegh-audio, transcode, frame (required); LCEVC verification and decoding (needs a build with the 'lcevc' filter)",
+        "mpegh_ui": "mpegh-scan, mpegh-audio, transcode (audio rendering)",
+        "mpegh_decoder": "mpegh-audio, transcode (audio rendering)",
     }
     tools, rows, problems = [], [], []
     for key, d in TOOL_DEFS.items():
@@ -453,13 +450,14 @@ def cmd_doctor(a):
         tools.append(entry)
         rows.append([d["label"], entry["path"] or "not found"])
     mods = {}
-    for mod in ("requests", "rich"):
+    mod_use = {"requests": "dash-capture", "rich": "dash-capture live panel", "numpy": "frame, sdr", "PIL": "frame, sdr (SDR images)"}
+    for mod, use in mod_use.items():
         try:
             __import__(mod)
             mods[mod] = True
         except ImportError:
             mods[mod] = False
-        say(f"Python module '{mod}' (dash-capture{' live panel' if mod == 'rich' else ''}): " + ("ok" if mods[mod] else "not installed (pip install " + mod + ")"),
+        say(f"Python module '{mod}' ({use}): " + ("ok" if mods[mod] else "not installed (pip install " + ("pillow" if mod == "PIL" else mod) + ")"),
             "ok" if mods[mod] else "warn")
         rows.append([f"python:{mod}", "ok" if mods[mod] else "missing"])
     if sys.version_info < (3, 9):
@@ -1098,7 +1096,7 @@ def write_lcevc_nhml(es, raw_bin_path: str, nhml_path: str, width=3840, height=2
         fnhml.write("</NHNTStream>\n")
 
 
-def verify_enhancement(ff: str, mp4_path: str, frames: int = 600):
+def verify_enhancement(ff: str, mp4_path: str, frames: int = 600, start=None):
     if not ff:
         say("ffmpeg da build DTV+ não configurado: verificação do enhancement ignorada.")
         return None
@@ -1106,6 +1104,7 @@ def verify_enhancement(ff: str, mp4_path: str, frames: int = 600):
         note("The ffmpeg in use has no 'lcevc' filter (a DTV+/LCEVC-enabled build is needed): enhancement check skipped.")
         return None
     cmd = [ff, "-hide_banner", "-loglevel", "debug", "-export_side_data", "enhancements",
+           *(["-noaccurate_seek", "-ss", f"{start:.6f}"] if start is not None else []),
            "-i", mp4_path, "-map", "0:v:0", "-vf", "lcevc",
            "-frames:v", str(frames), "-f", "null", "-"]
     log("$ " + subprocess.list2cmdline(cmd))
@@ -1121,7 +1120,7 @@ def verify_enhancement(ff: str, mp4_path: str, frames: int = 600):
     if total == 0:
         note("O filtro lcevc do ffmpeg não processou nenhum quadro. Final do log: " + err[-300:].strip().replace("\n", " | "))
     elif hits == 0:
-        note("Nenhum quadro reportou enhancement; revise o formato do SEI (create_vvc_sei_t35_nalu).")
+        note("No frame carried LCEVC enhancement data (is there an LCEVC layer in the file?).")
     return total, hits, sizes
 
 
@@ -2121,11 +2120,6 @@ def media_duration(ffmpeg, path):
         return None
 
 
-def where_to_set():
-    return (f"Searched: command-line option, {CONFIG_PATH.name}, PATH and the tools folder next to the script. "
-            "Run 'dtv_tools.py doctor' for details.")
-
-
 _LABEL_KEY = {"MP4Box": "mp4box", "ffmpeg": "ffmpeg", "mpeghUiManager": "mpegh_ui", "mpeghDecoder": "mpegh_decoder"}
 
 
@@ -2502,17 +2496,6 @@ def load_scene(d, ui, audio, stage="scene", frac_span=(0.0, 1.0)):
     res = parse_scenes(xmlp.read_text(encoding="utf-8", errors="replace"))
     progress(stage, f1, f"{len(res)} estado(s) de cena lido(s)", force=True)
     return res
-
-
-def scene_info(args, src, root):
-    mp4box = find_mp4box(args.mp4box)
-    ui = need_tool(args.mpegh_ui, "mpeghUiManager")
-    d = prepare_audio(src, root, mp4box)
-    audio = d / "audio.mp4"
-    states = load_scene(d, ui, audio)
-    dur = media_duration(args.ffmpeg, audio)
-    total = int(dur / MPEGH_FRAME_S) if dur else None
-    return d, audio, states, analyze_scenes(states, total), dur
 
 
 MP_SCAN_STEPS = [("prepare", "Extrair só o áudio MPEG-H (MP4Box)"), ("scene", "Ler as cenas de áudio (mpeghUiManager)"), ("catalog", "Montar as opções de saída")]
@@ -3011,8 +2994,258 @@ def encode_audio(ffmpeg, wav_path, out_path, fmt_key, br, dur, cut_warn=False, o
         on_pct(1.0)
 
 
+def pick_options(cat, raw_opts, fmt_override=None):
+    """--option specs (preset:1, group:3=aac:192k ...) -> catalog options with the chosen format/bitrate."""
+    by_id = {o["id"]: o for o in cat["options"]}
+    if not raw_opts:                                   # default: every preset, no groups
+        raw_opts = [o["id"] for o in cat["options"] if o["group"] == "presets"]
+    chosen = []
+    for spec in raw_opts:
+        oid, fmt, br = parse_opt_spec(spec)
+        if oid not in by_id:
+            avail = ", ".join(by_id.keys())
+            raise Fail(f"A opção '{oid}' não existe neste arquivo. Disponíveis: {avail}")
+        base_o = dict(by_id[oid])
+        use_fmt = fmt or base_o["fmt"]
+        if not fmt and fmt_override:
+            if fmt_override in base_o["formats"]:
+                use_fmt = fmt_override
+            else:
+                note(f"{oid}: o formato {fmt_override} não suporta {base_o['out_ch']} canais; usando {base_o['fmt']}.")
+        if use_fmt not in base_o["formats"]:
+            raise Fail(f"Formato '{use_fmt}' incompatível com {oid} ({base_o['out_ch']} canais).")
+        base_o["fmt"] = use_fmt
+        base_o["br"] = br
+        chosen.append(base_o)
+    return chosen
+
+
+def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, pfx="", to_outdir=True):
+    """
+    Prepare -> decode -> check -> encode the chosen presets/groups (raw_opts; default = the presets).
+    Step ids get the prefix `pfx` so another command can embed these four steps in its own list (transcode uses "a_").
+    The audio files go to outdir (to_outdir) or tmp. Returns a dict (made, chosen, dur, use_layout, info, states, enc_plan, enc_map_path).
+    """
+    ffmpeg, mp4box, ui, dec = tools
+    root = cache_root(a.cache_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    purge_cache(root)
+    step(pfx + "prepare", "running")
+    d = prepare_audio(src, root, mp4box, stage=pfx + "prepare", frac_span=(0.0, 0.55))
+    audio = d / "audio.mp4"
+    states = load_scene(d, ui, audio, stage=pfx + "prepare", frac_span=(0.55, 0.90))
+    progress(pfx + "prepare", 0.92, "Calculando duração e analisando cenas…", force=True)
+    dur = media_duration(ffmpeg, audio)
+    total_frames = int(dur / MPEGH_FRAME_S) if dur else None
+    info = analyze_scenes(states, total_frames)
+    use_layout = detect_native_cicp(audio, ffmpeg, mp4box) if (not a.native_layout or int(a.native_layout) == 0) else int(a.native_layout)
+    cat = build_catalog(info, use_layout)
+
+    if info["has_differences"]:
+        note("A configuração de áudio (AudioSceneConfig) muda ao longo do vídeo.")
+
+    chosen = pick_options(cat, raw_opts, fmt_override)
+
+    step(pfx + "prepare", "done", f"{len(chosen)} saída(s) · layout {CICP_NAME.get(use_layout, '2.0')}")
+    progress(pfx + "prepare", 1.0, force=True)
+
+    if not pfx:
+        ev(type="plan", out=str(outdir), outs=[])
+
+    needed_inputs = {}
+    for o in chosen:
+        for tag, cicp in o["inputs"]:
+            needed_inputs[(tag, cicp)] = o
+
+    step(pfx + "decode", "running")
+    progress(pfx + "decode", 0.0, f"Verificando/decodificando {len(needed_inputs)} trilha(s)…", force=True)
+    wav_paths = {}
+    cut_warnings = {}
+    jobs = max(1, min(int(a.jobs or max(1, (os.cpu_count() or 2) // 2)), len(needed_inputs)))
+
+    expected_targets = []
+    total_expected_bytes = 0
+    for (tag, cicp) in needed_inputs:
+        w_path = tmp / f"{tag}_c{cicp}.wav"
+        exp_b = int((dur or 60.0) * 48000 * CICP_CH[cicp] * 3) + 44
+        expected_targets.append((tag, w_path, exp_b))
+        total_expected_bytes += max(1, exp_b)
+
+    done_n = [0]
+    reused_wavs = [0]
+    stop_mon = threading.Event()
+    dec_t0 = time.time()
+
+    def _monitor_decode():
+        while not stop_mon.wait(0.4):
+            cur_bytes = 0
+            for _, wp, exp_b in expected_targets:
+                if wp.with_suffix(".wav.done").is_file() and wp.is_file():
+                    cur_bytes += exp_b
+                    continue
+                sz = wp.stat().st_size if wp.is_file() else 0
+                tail_wp = wp.with_suffix(".tail.wav")
+                if tail_wp.is_file():
+                    sz += tail_wp.stat().st_size
+                cur_bytes += min(exp_b, sz)
+            byte_frac = min(0.99, cur_bytes / max(1, total_expected_bytes))
+            done_frac = done_n[0] / max(1, len(needed_inputs))
+            frac = max(byte_frac, done_frac)
+            el = max(0.1, time.time() - dec_t0)
+            spd = cur_bytes / el / 1048576.0
+            progress(
+                pfx + "decode",
+                frac,
+                f"{done_n[0]}/{len(needed_inputs)} concluídos · {human(cur_bytes)} / {human(total_expected_bytes)} ({spd:.1f} MB/s)"
+            )
+
+    mon_thread = threading.Thread(target=_monitor_decode, daemon=True)
+    mon_thread.start()
+
+    # Assinatura dos parâmetros de decodificação para validar o checkpoint .done
+    dec_sig = f"src={src_sig(src)['size']}:{src_sig(src)['mtime_ns']}|dse={a.drc_effect}|rl={a.target_loudness}|sm={a.sleep_mode}|ver={a.uim_version}"
+    pending_bytes = sum(eb for _, wp, eb in expected_targets if not (wp.with_suffix(".wav.done").is_file() and wp.is_file()))
+    check_free_space(tmp, int(pending_bytes * 1.05) + (64 << 20), "the decoded audio (WAV 24-bit)")
+
+    def _job(item):
+        (tag, cicp), opt = item
+        wav = tmp / f"{tag}_c{cicp}.wav"
+        done_marker = wav.with_suffix(".wav.done")
+
+        # Se o WAV já foi decodificado com sucesso antes da falha, reaproveita sem rodar mpeghDecoder novamente
+        if wav.is_file() and wav.stat().st_size > 100 and done_marker.is_file():
+            try:
+                meta = json.loads(done_marker.read_text(encoding="utf-8"))
+                if meta.get("sig") == dec_sig:
+                    secs, _ = wav_info(wav, fallback_ch=CICP_CH[cicp])
+                    if secs >= 0.5:
+                        return (tag, cicp), wav, meta.get("res"), True
+            except Exception:
+                pass
+            done_marker.unlink(missing_ok=True)
+
+        # Remove eventual WAV incompleto da tentativa anterior antes de recomeçar este item
+        wav.unlink(missing_ok=True)
+        target_kind = "p" if tag.startswith("p") else "g"
+        target_id = int(tag[1:])
+        carrier_pid = opt.get("carrier_preset", target_id)
+        script_path = tmp / f"script_{tag}.xml"
+        has_script = action_script_for_target(
+            script_path, states, target_kind, target_id, carrier_pid, a.uim_version, a.sleep_mode
+        )
+        res = decode_one(
+            dec, ffmpeg, mp4box, audio, wav, cicp,
+            script_path if has_script else None,
+            states, target_kind, target_id, carrier_pid, dur, a
+        )
+        done_marker.write_text(json.dumps({"sig": dec_sig, "res": res}, ensure_ascii=False), encoding="utf-8")
+        return (tag, cicp), wav, res, False
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+            futs = [ex.submit(_job, item) for item in needed_inputs.items()]
+            for fut in concurrent.futures.as_completed(futs):
+                key, wav, res, was_reused = fut.result()
+                wav_paths[key] = wav
+                done_n[0] += 1
+                if was_reused:
+                    reused_wavs[0] += 1
+                if res:
+                    cut_warnings[key] = res
+                    if res.get("resumed"):
+                        note(f"{wav.name}: falha em {fmt_hms(res['cut'])} ({res['error']}); retomado em {fmt_hms(res['resumed'])} e sincronizado até o fim.")
+                    elif res.get("silent_fallback"):
+                        note(f"{wav.name}: sem preset decodificável ({res['error']}); preenchido com silêncio para não interromper o processo.")
+                    elif res.get("cut"):
+                        note(f"{wav.name}: o mpeghDecoder parou em {fmt_hms(res['cut'])} ({res['error']}); áudio preservado até esse ponto e preenchido até o final.")
+                progress(pfx + "decode", done_n[0] / max(len(needed_inputs), 1), f"{done_n[0]}/{len(needed_inputs)} prontos", force=True)
+    finally:
+        stop_mon.set()
+        mon_thread.join(timeout=1.0)
+
+    dec_msg = f"{len(wav_paths)} trilha(s) base decodificada(s)"
+    if reused_wavs[0]:
+        dec_msg += f" ({reused_wavs[0]} reaproveitada(s))"
+    step(pfx + "decode", "done", dec_msg)
+    progress(pfx + "decode", 1.0, force=True)
+
+    step(pfx + "check", "running")
+    checked_info = []
+    sorted_wavs = sorted(wav_paths.items())
+    for idx, ((tag, cicp), wav) in enumerate(sorted_wavs):
+        progress(pfx + "check", idx / max(len(sorted_wavs), 1), f"Verificando {wav.name}…", force=True)
+        secs, ch = wav_info(wav, fallback_ch=CICP_CH[cicp])
+        checked_info.append(f"{tag} ({fmt_hms(secs)}, {ch}ch)")
+    step(pfx + "check", "done", ", ".join(checked_info))
+    progress(pfx + "check", 1.0, force=True)
+
+    step(pfx + "encode", "running")
+    made = []
+    keep_audio_files = to_outdir
+    n_chosen = max(len(chosen), 1)
+    reused_enc = 0
+
+    # Mapa de arquivos de saída já alocados na execução anterior (para não criar "(1)" ao retomar)
+    enc_map_path = tmp / "encode_plan.json"
+    enc_plan = {}
+    if enc_map_path.is_file():
+        try:
+            enc_plan = json.loads(enc_map_path.read_text(encoding="utf-8"))
+        except Exception:
+            enc_plan = {}
+
+    for idx, o in enumerate(chosen):
+        tag, cicp = o["inputs"][0]
+        wav = wav_paths[(tag, cicp)]
+        ext = FORMATS[o["fmt"]]["ext"]
+        target_dir = outdir if keep_audio_files else tmp
+        plan_key = f"{o['id']}|{o['fmt']}|{o.get('br') or ''}"
+        enc_done = tmp / f"enc_{slug(plan_key)}.done"
+
+        if plan_key in enc_plan:
+            out_file = Path(enc_plan[plan_key])
+        else:
+            out_file = unique_path(target_dir / f"{src.stem}_{o['stem']}{ext}", a.overwrite)
+            enc_plan[plan_key] = str(out_file)
+            enc_map_path.write_text(json.dumps(enc_plan, ensure_ascii=False), encoding="utf-8")
+
+        if out_file.is_file() and out_file.stat().st_size > 0 and enc_done.is_file():
+            reused_enc += 1
+            progress(pfx + "encode", (idx + 1) / n_chosen, f"[{idx + 1}/{len(chosen)}] {out_file.name} (reaproveitado)", force=True)
+        else:
+            enc_done.unlink(missing_ok=True)
+            out_file.unlink(missing_ok=True)
+            has_cut = (tag, cicp) in cut_warnings
+            progress(pfx + "encode", idx / n_chosen, f"[{idx + 1}/{len(chosen)}] Convertendo {out_file.name}…", force=True)
+            encode_audio(
+                ffmpeg, wav, out_file, o["fmt"], o.get("br"), dur, cut_warn=has_cut,
+                on_pct=lambda sub_f, i=idx, fn=out_file.name: progress(
+                    pfx + "encode", (i + sub_f) / n_chosen, f"[{i + 1}/{len(chosen)}] {fn} ({sub_f * 100:.0f}%)"
+                )
+            )
+            enc_done.write_text("ok", encoding="utf-8")
+            progress(pfx + "encode", (idx + 1) / n_chosen, f"[{idx + 1}/{len(chosen)}] {out_file.name} concluído", force=True)
+
+        made.append({
+            "kind": o["group"],
+            "title": o["title"].replace(':', ''),
+            "path": str(out_file),
+            "size": out_file.stat().st_size,
+            "duration": dur,
+            "option_id": o["id"],
+        })
+
+    enc_msg = f"{len(made)} arquivo(s) de áudio gerado(s)"
+    if reused_enc:
+        enc_msg += f" ({reused_enc} reaproveitado(s))"
+    step(pfx + "encode", "done", enc_msg)
+    progress(pfx + "encode", 1.0, force=True)
+
+    return {"made": made, "chosen": chosen, "dur": dur, "use_layout": use_layout, "info": info, "states": states,
+            "enc_plan": enc_plan, "enc_map_path": enc_map_path}
+
+
 def cmd_mpegh_audio(a):
-    import threading
     src = Path(a.input).resolve()
     if not src.is_file():
         raise Fail(f"Arquivo não encontrado: {src}")
@@ -3024,10 +3257,6 @@ def cmd_mpegh_audio(a):
     set_steps(MP_STEPS)
     set_stages({"prepare": 15, "decode": 50, "check": 5, "encode": 20, "mux": 10, "report": 0})
 
-    root = cache_root(a.cache_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    purge_cache(root)
-
     outdir = Path(a.outdir).resolve() if a.outdir else src.parent / f"{src.stem}_audios"
     outdir.mkdir(parents=True, exist_ok=True)
     tmp = (Path(a.tmpdir).resolve() / f"{src.stem}_mptmp") if a.tmpdir else outdir / f".{src.stem}_mptmp"
@@ -3035,230 +3264,10 @@ def cmd_mpegh_audio(a):
 
     succeeded = False
     try:
-        step("prepare", "running")
-        d = prepare_audio(src, root, mp4box, stage="prepare", frac_span=(0.0, 0.55))
-        audio = d / "audio.mp4"
-        states = load_scene(d, ui, audio, stage="prepare", frac_span=(0.55, 0.90))
-        progress("prepare", 0.92, "Calculando duração e analisando cenas…", force=True)
-        dur = media_duration(ffmpeg, audio)
-        total_frames = int(dur / MPEGH_FRAME_S) if dur else None
-        info = analyze_scenes(states, total_frames)
-        use_layout = detect_native_cicp(audio, ffmpeg, mp4box) if (not a.native_layout or int(a.native_layout) == 0) else int(a.native_layout)
-        cat = build_catalog(info, use_layout)
-        by_id = {o["id"]: o for o in cat["options"]}
-
-        if info["has_differences"]:
-            note("A configuração de áudio (AudioSceneConfig) muda ao longo do vídeo.")
-
-        chosen = []
-        raw_opts = a.option or [o["id"] for o in cat["options"] if o["group"] == "presets"]
-        for spec in raw_opts:
-            oid, fmt, br = parse_opt_spec(spec)
-            if oid not in by_id:
-                avail = ", ".join(by_id.keys())
-                raise Fail(f"A opção '{oid}' não existe neste arquivo. Disponíveis: {avail}")
-            base_o = dict(by_id[oid])
-            use_fmt = fmt or base_o["fmt"]
-            if use_fmt not in base_o["formats"]:
-                raise Fail(f"Formato '{use_fmt}' incompatível com {oid} ({base_o['out_ch']} canais).")
-            base_o["fmt"] = use_fmt
-            base_o["br"] = br
-            chosen.append(base_o)
-
-        step("prepare", "done", f"{len(chosen)} saída(s) · layout {CICP_NAME.get(use_layout, '2.0')}")
-        progress("prepare", 1.0, force=True)
-
-        ev(type="plan", out=str(outdir), outs=[])
-
-        needed_inputs = {}
-        for o in chosen:
-            for tag, cicp in o["inputs"]:
-                needed_inputs[(tag, cicp)] = o
-
-        step("decode", "running")
-        progress("decode", 0.0, f"Verificando/decodificando {len(needed_inputs)} trilha(s)…", force=True)
-        wav_paths = {}
-        cut_warnings = {}
-        jobs = max(1, min(int(a.jobs or max(1, (os.cpu_count() or 2) // 2)), len(needed_inputs)))
-
-        expected_targets = []
-        total_expected_bytes = 0
-        for (tag, cicp) in needed_inputs:
-            w_path = tmp / f"{tag}_c{cicp}.wav"
-            exp_b = int((dur or 60.0) * 48000 * CICP_CH[cicp] * 3) + 44
-            expected_targets.append((tag, w_path, exp_b))
-            total_expected_bytes += max(1, exp_b)
-
-        done_n = [0]
-        reused_wavs = [0]
-        stop_mon = threading.Event()
-        dec_t0 = time.time()
-
-        def _monitor_decode():
-            while not stop_mon.wait(0.4):
-                cur_bytes = 0
-                for _, wp, exp_b in expected_targets:
-                    if wp.with_suffix(".wav.done").is_file() and wp.is_file():
-                        cur_bytes += exp_b
-                        continue
-                    sz = wp.stat().st_size if wp.is_file() else 0
-                    tail_wp = wp.with_suffix(".tail.wav")
-                    if tail_wp.is_file():
-                        sz += tail_wp.stat().st_size
-                    cur_bytes += min(exp_b, sz)
-                byte_frac = min(0.99, cur_bytes / max(1, total_expected_bytes))
-                done_frac = done_n[0] / max(1, len(needed_inputs))
-                frac = max(byte_frac, done_frac)
-                el = max(0.1, time.time() - dec_t0)
-                spd = cur_bytes / el / 1048576.0
-                progress(
-                    "decode",
-                    frac,
-                    f"{done_n[0]}/{len(needed_inputs)} concluídos · {human(cur_bytes)} / {human(total_expected_bytes)} ({spd:.1f} MB/s)"
-                )
-
-        mon_thread = threading.Thread(target=_monitor_decode, daemon=True)
-        mon_thread.start()
-
-        # Assinatura dos parâmetros de decodificação para validar o checkpoint .done
-        dec_sig = f"src={src_sig(src)['size']}:{src_sig(src)['mtime_ns']}|dse={a.drc_effect}|rl={a.target_loudness}|sm={a.sleep_mode}|ver={a.uim_version}"
-        pending_bytes = sum(eb for _, wp, eb in expected_targets if not (wp.with_suffix(".wav.done").is_file() and wp.is_file()))
-        check_free_space(tmp, int(pending_bytes * 1.05) + (64 << 20), "the decoded audio (WAV 24-bit)")
-
-        def _job(item):
-            (tag, cicp), opt = item
-            wav = tmp / f"{tag}_c{cicp}.wav"
-            done_marker = wav.with_suffix(".wav.done")
-
-            # Se o WAV já foi decodificado com sucesso antes da falha, reaproveita sem rodar mpeghDecoder novamente
-            if wav.is_file() and wav.stat().st_size > 100 and done_marker.is_file():
-                try:
-                    meta = json.loads(done_marker.read_text(encoding="utf-8"))
-                    if meta.get("sig") == dec_sig:
-                        secs, _ = wav_info(wav, fallback_ch=CICP_CH[cicp])
-                        if secs >= 0.5:
-                            return (tag, cicp), wav, meta.get("res"), True
-                except Exception:
-                    pass
-                done_marker.unlink(missing_ok=True)
-
-            # Remove eventual WAV incompleto da tentativa anterior antes de recomeçar este item
-            wav.unlink(missing_ok=True)
-            target_kind = "p" if tag.startswith("p") else "g"
-            target_id = int(tag[1:])
-            carrier_pid = opt.get("carrier_preset", target_id)
-            script_path = tmp / f"script_{tag}.xml"
-            has_script = action_script_for_target(
-                script_path, states, target_kind, target_id, carrier_pid, a.uim_version, a.sleep_mode
-            )
-            res = decode_one(
-                dec, ffmpeg, mp4box, audio, wav, cicp,
-                script_path if has_script else None,
-                states, target_kind, target_id, carrier_pid, dur, a
-            )
-            done_marker.write_text(json.dumps({"sig": dec_sig, "res": res}, ensure_ascii=False), encoding="utf-8")
-            return (tag, cicp), wav, res, False
-
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
-                futs = [ex.submit(_job, item) for item in needed_inputs.items()]
-                for fut in concurrent.futures.as_completed(futs):
-                    key, wav, res, was_reused = fut.result()
-                    wav_paths[key] = wav
-                    done_n[0] += 1
-                    if was_reused:
-                        reused_wavs[0] += 1
-                    if res:
-                        cut_warnings[key] = res
-                        if res.get("resumed"):
-                            note(f"{wav.name}: falha em {fmt_hms(res['cut'])} ({res['error']}); retomado em {fmt_hms(res['resumed'])} e sincronizado até o fim.")
-                        elif res.get("silent_fallback"):
-                            note(f"{wav.name}: sem preset decodificável ({res['error']}); preenchido com silêncio para não interromper o processo.")
-                        elif res.get("cut"):
-                            note(f"{wav.name}: o mpeghDecoder parou em {fmt_hms(res['cut'])} ({res['error']}); áudio preservado até esse ponto e preenchido até o final.")
-                    progress("decode", done_n[0] / max(len(needed_inputs), 1), f"{done_n[0]}/{len(needed_inputs)} prontos", force=True)
-        finally:
-            stop_mon.set()
-            mon_thread.join(timeout=1.0)
-
-        dec_msg = f"{len(wav_paths)} trilha(s) base decodificada(s)"
-        if reused_wavs[0]:
-            dec_msg += f" ({reused_wavs[0]} reaproveitada(s))"
-        step("decode", "done", dec_msg)
-        progress("decode", 1.0, force=True)
-
-        step("check", "running")
-        checked_info = []
-        sorted_wavs = sorted(wav_paths.items())
-        for idx, ((tag, cicp), wav) in enumerate(sorted_wavs):
-            progress("check", idx / max(len(sorted_wavs), 1), f"Verificando {wav.name}…", force=True)
-            secs, ch = wav_info(wav, fallback_ch=CICP_CH[cicp])
-            checked_info.append(f"{tag} ({fmt_hms(secs)}, {ch}ch)")
-        step("check", "done", ", ".join(checked_info))
-        progress("check", 1.0, force=True)
-
-        step("encode", "running")
-        made = []
         mux_mode = (a.mux or "none").lower()
-        keep_audio_files = mux_mode in ("none", "add")
-        n_chosen = max(len(chosen), 1)
-        reused_enc = 0
-
-        # Mapa de arquivos de saída já alocados na execução anterior (para não criar "(1)" ao retomar)
-        enc_map_path = tmp / "encode_plan.json"
-        enc_plan = {}
-        if enc_map_path.is_file():
-            try:
-                enc_plan = json.loads(enc_map_path.read_text(encoding="utf-8"))
-            except Exception:
-                enc_plan = {}
-
-        for idx, o in enumerate(chosen):
-            tag, cicp = o["inputs"][0]
-            wav = wav_paths[(tag, cicp)]
-            ext = FORMATS[o["fmt"]]["ext"]
-            target_dir = outdir if keep_audio_files else tmp
-            plan_key = f"{o['id']}|{o['fmt']}|{o.get('br') or ''}"
-            enc_done = tmp / f"enc_{slug(plan_key)}.done"
-
-            if plan_key in enc_plan:
-                out_file = Path(enc_plan[plan_key])
-            else:
-                out_file = unique_path(target_dir / f"{src.stem}_{o['stem']}{ext}", a.overwrite)
-                enc_plan[plan_key] = str(out_file)
-                enc_map_path.write_text(json.dumps(enc_plan, ensure_ascii=False), encoding="utf-8")
-
-            if out_file.is_file() and out_file.stat().st_size > 0 and enc_done.is_file():
-                reused_enc += 1
-                progress("encode", (idx + 1) / n_chosen, f"[{idx + 1}/{len(chosen)}] {out_file.name} (reaproveitado)", force=True)
-            else:
-                enc_done.unlink(missing_ok=True)
-                out_file.unlink(missing_ok=True)
-                has_cut = (tag, cicp) in cut_warnings
-                progress("encode", idx / n_chosen, f"[{idx + 1}/{len(chosen)}] Convertendo {out_file.name}…", force=True)
-                encode_audio(
-                    ffmpeg, wav, out_file, o["fmt"], o.get("br"), dur, cut_warn=has_cut,
-                    on_pct=lambda sub_f, i=idx, fn=out_file.name: progress(
-                        "encode", (i + sub_f) / n_chosen, f"[{i + 1}/{len(chosen)}] {fn} ({sub_f * 100:.0f}%)"
-                    )
-                )
-                enc_done.write_text("ok", encoding="utf-8")
-                progress("encode", (idx + 1) / n_chosen, f"[{idx + 1}/{len(chosen)}] {out_file.name} concluído", force=True)
-
-            made.append({
-                "kind": o["group"],
-                "title": o["title"].replace(':', ''),
-                "path": str(out_file),
-                "size": out_file.stat().st_size,
-                "duration": dur,
-                "option_id": o["id"],
-            })
-
-        enc_msg = f"{len(made)} arquivo(s) de áudio gerado(s)"
-        if reused_enc:
-            enc_msg += f" ({reused_enc} reaproveitado(s))"
-        step("encode", "done", enc_msg)
-        progress("encode", 1.0, force=True)
+        ctx = mpegh_render(a, src, (ffmpeg, mp4box, ui, dec), outdir, tmp, a.option or None, to_outdir=mux_mode in ("none", "add"))
+        made, dur, use_layout, info, states = ctx["made"], ctx["dur"], ctx["use_layout"], ctx["info"], ctx["states"]
+        enc_plan, enc_map_path = ctx["enc_plan"], ctx["enc_map_path"]
 
         if mux_mode in ("add", "only"):
             step("mux", "running")
@@ -3315,6 +3324,7 @@ def cmd_mpegh_audio(a):
             say(f"Arquivos intermediários mantidos em: {tmp}")
         else:
             safe_rmtree(tmp)
+
 
 # ──────────────────────────── mp4-cut ────────────────────────────
 CUT_STEPS = [("read", "Read the keyframe table"), ("cut", "Cut without re-encoding (MP4Box)"),
@@ -4818,7 +4828,662 @@ def str2bool(v):
     raise argparse.ArgumentTypeError(f"invalid boolean: {v!r} (use true/false)")
 
 
+# ──────────────────────────── transcode / frame (HDR10) ────────────────────────────
+DEFAULT_HDR10 = {"r": (0.7080, 0.2920), "g": (0.1700, 0.7970), "b": (0.1310, 0.0460), "wp": (0.3127, 0.3290),
+                 "lmax": 1000.0, "lmin": 0.005, "maxcll": 1000, "maxfall": 300, "src": "default"}
+HDR10_TAGS = "colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084:range=tv"
+WXH_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
+HDR_MD_RX = re.compile(r"r\(([\d.]+)[,\s]+([\d.]+)\)\s*g\(([\d.]+)[,\s]+([\d.]+)\)\s*b\(([\d.]+)[,\s]+([\d.]+)\)\s*"
+                       r"wp\(([\d.]+)[,\s]+([\d.]+)\)\s*min_luminance=([\d.]+),\s*max_luminance=([\d.]+)")
+HDR_CLL_RX = re.compile(r"MaxCLL=(\d+),\s*MaxFALL=(\d+)")
+AUDIO_EXT_FMT = {".m4a": "aac", ".eac3": "eac3", ".flac": "flac", ".wav": "wav"}
+MUX_FORMATS = {".mp4": "mp4", ".m4v": "mp4", ".mov": "mov", ".mkv": "matroska"}      # output extension -> ffmpeg muxer
+
+
+def same_file(a, b):
+    try:
+        return Path(a).resolve() == Path(b).resolve() or (Path(a).exists() and Path(b).exists() and os.path.samefile(a, b))
+    except OSError:
+        return False
+
+
+def probe_streams(ffmpeg, path):
+    """Video/audio streams and duration, parsed from 'ffmpeg -i' (no ffprobe needed)."""
+    r = sp_run([ffmpeg, "-hide_banner", "-i", str(path)], capture_output=True, text=True, errors="replace", timeout=90, **NOWIN)
+    txt = r.stderr or ""
+    info = {"video": None, "audio": [], "duration": media_duration(ffmpeg, path)}
+    for m in re.finditer(r"Stream #0:(\d+)\S*: (Video|Audio): ([^\n]+)", txt):
+        idx, kind, rest = int(m.group(1)), m.group(2), m.group(3)
+        codec = rest.split()[0].strip(",")
+        if kind == "Audio":
+            info["audio"].append({"index": idx, "codec": codec})
+        elif info["video"] is None:
+            sz = re.search(r",\s*(\d{2,5})x(\d{2,5})", rest)
+            fps = re.search(r"([\d.]+) fps", rest)
+            tg = re.search(r"\((?:(?:tv|pc|limited|full),\s*)?([\w-]+)/([\w-]+)/([\w-]+)", rest)
+            info["video"] = {"index": idx, "codec": codec, "size": f"{sz.group(1)}x{sz.group(2)}" if sz else None,
+                             "fps": float(fps.group(1)) if fps else None, "trc": tg.group(3) if tg else None}
+    if not info["video"]:
+        raise Fail(f"Nenhuma trilha de vídeo encontrada em {path}. É um MP4 gerado pelo dtv_tools?")
+    return info
+
+
+def probe_hdr10(ffmpeg, path):
+    """Mastering display + MaxCLL/MaxFALL of the first decoded frame (base layer only, cheap), via the showinfo filter."""
+    hdr = dict(DEFAULT_HDR10)
+    try:
+        r = sp_run([ffmpeg, "-hide_banner", "-nostdin", "-i", str(path), "-map", "0:v:0", "-vf", "showinfo", "-frames:v", "1",
+                    "-f", "null", "-"], capture_output=True, text=True, errors="replace", timeout=120, **NOWIN)
+        err = r.stderr or ""
+    except Exception:
+        err = ""
+    m, c = HDR_MD_RX.search(err), HDR_CLL_RX.search(err)
+    if m:
+        v = [float(x) for x in m.groups()]
+        hdr.update(r=(v[0], v[1]), g=(v[2], v[3]), b=(v[4], v[5]), wp=(v[6], v[7]), lmin=v[8], lmax=v[9], src="stream")
+    if c:
+        hdr.update(maxcll=int(c.group(1)), maxfall=int(c.group(2)), src="stream")
+    if hdr["src"] == "default":
+        note("Metadados HDR10 (mastering display / MaxCLL) não encontrados no stream: usando os valores padrão "
+             "(primárias BT.2020, 1000/0,005 nits, MaxCLL/MaxFALL 1000,300).")
+    return hdr
+
+
+def x265_master(h):
+    u = lambda p: (round(p[0] * 50000), round(p[1] * 50000))      # noqa: E731  (x265 units: 0.00002)
+    g, b, r, w = u(h["g"]), u(h["b"]), u(h["r"]), u(h["wp"])
+    return (f"G({g[0]},{g[1]})B({b[0]},{b[1]})R({r[0]},{r[1]})WP({w[0]},{w[1]})"
+            f"L({round(h['lmax'] * 10000)},{round(h['lmin'] * 10000)})")
+
+
+def hdr10_summary(h):
+    return f"{h['lmax']:g}/{h['lmin']:g} nits, MaxCLL/MaxFALL {h['maxcll']}/{h['maxfall']} ({'do stream' if h['src'] == 'stream' else 'padrão'})"
+
+
+def pick_size(a, measured):
+    """--size wins; otherwise ONLY a single unambiguous size found by the verification; never a built-in constant."""
+    if a.size:
+        if not WXH_RE.match(a.size):
+            raise Fail(f"--size deve ser LARGURAxALTURA, recebi {a.size!r}")
+        return a.size
+    if a.no_size_fix or measured is None:
+        return None
+    sizes = measured[2]
+    if len(sizes) == 1:
+        return sizes[0]
+    note(("A verificação encontrou vários tamanhos de saída (" + ", ".join(sizes) + ")") if sizes else "A verificação não encontrou o tamanho de saída"
+         + ": o tamanho não será forçado. Use --size LARGURAxALTURA se o encoder abrir no tamanho errado.")
+    return None
+
+
+def tc_prepare(a):
+    ff = find_tool("ffmpeg", a.ffmpeg)[0]
+    src = Path(a.input).resolve()
+    if not src.is_file():
+        raise Fail(f"Arquivo não encontrado: {src}")
+    use_lcevc = not a.no_lcevc
+    if use_lcevc and not ffmpeg_has_lcevc(ff):
+        raise Fail("Este ffmpeg não tem o filtro 'lcevc' (use a build DTV+/LCEVC em --ffmpeg, ou --no-lcevc para um arquivo sem enhancement).")
+    info = probe_streams(ff, src)
+    if info["video"]["trc"] == "arib-std-b67":
+        raise Fail("Fonte HLG detectada; esta ferramenta trata apenas PQ (SMPTE ST 2084).")
+    return ff, src, info, use_lcevc
+
+
+def run_ffmpeg_progress(cmd, total, stage):
+    """Runs ffmpeg with -progress pipe:1 and feeds progress(); returns (returncode, stderr tail)."""
+    log("$ " + subprocess.list2cmdline(cmd))
+    p = sp_popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **NOWIN)
+    err = Drain(p.stderr, keep=16384)
+    cur = {}
+    for raw in p.stdout:
+        line = raw.decode("utf-8", "replace").strip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        cur[k] = v
+        if k == "progress":
+            try:
+                done = int(cur.get("out_time_us") or 0) / 1e6
+            except ValueError:
+                done = 0.0
+            frac = min(1.0, done / total) if total else 0.0
+            progress(stage, frac, f"{fmt_hms(done)} / {fmt_hms(total)} · {cur.get('fps', '0')} fps · {cur.get('speed', '?').strip()}", force=(v == "end"))
+            cur = {}
+    rc = p.wait()
+    return rc, err.text()
+
+
+# ── transcode: audio ──
+def split_options(a):
+    return [x.strip() for spec in (a.option or []) for x in spec.split(",") if x.strip()]
+
+
+def track_label(o):
+    return f"{'P' if o['group'] == 'presets' else 'G'}{str(o['id']).split(':')[-1]} - {o['title']} ({CICP_NAME.get(o['src_cicp'], '?')})"
+
+
+def audio_offset(ff, src, a):
+    """Seconds to delay the rendered audio: 'auto' = first timestamp of the original audio track, else --audio-delay ms."""
+    if str(a.audio_delay).strip().lower() != "auto":
+        try:
+            return float(a.audio_delay) / 1000.0
+        except ValueError:
+            raise Fail("--audio-delay deve ser 'auto' ou um número em milissegundos.")
+    r = sp_run([ff, "-hide_banner", "-nostdin", "-i", str(src), "-map", "0:a:0", "-af", "ashowinfo", "-frames:v", "0", "-frames:a", "1",
+                "-f", "null", "-"], capture_output=True, text=True, errors="replace", timeout=120, **NOWIN)
+    m = re.search(r"pts_time:(-?[\d.]+)", r.stderr or "")
+    if not m:
+        note("Não consegui medir o início da trilha de áudio original (este ffmpeg decodifica MPEG-H?): deslocamento 0. "
+             "Use --audio-delay MS para ajustar.")
+        return 0.0
+    return max(0.0, float(m.group(1)))
+
+
+def build_transcode_cmd(ff, src, out, a, hdr, size, use_lcevc, n_src_audio, items=(), offset=0.0, keep_original=True, target=None):
+    xp = ["hdr10=1", "repeat-headers=1", "colorprim=bt2020", "transfer=smpte2084", "colormatrix=bt2020nc",
+          f"master-display={x265_master(hdr)}", f"max-cll={hdr['maxcll']},{hdr['maxfall']}"]
+    if a.x265_params:
+        xp.append(a.x265_params)
+    cmd = [ff, "-hide_banner", "-y", "-nostdin", "-nostats", "-progress", "pipe:1", "-i", str(src)]
+    for it in items:                                                   # rendered presets: one input each
+        cmd += (["-itsoffset", f"{offset:.3f}"] if offset else []) + ["-i", it["path"]]
+    cmd += ["-map", "0:v:0"]
+    titles = []
+    for i, it in enumerate(items):
+        cmd += ["-map", f"{i + 1}:a:0"]
+        titles.append(it["title"])
+    if a.audio != "none" and n_src_audio and (a.audio == "copy" or keep_original):
+        cmd += ["-map", "0:a?"]                                        # original MPEG-H track(s), as-is
+        if items:
+            titles += [("MPEG-H original (mhm1)" if n_src_audio == 1 else f"Áudio original {k + 1}") for k in range(n_src_audio)]
+    for j, t in enumerate(titles):
+        cmd += [f"-metadata:s:a:{j}", f"title={t}", f"-metadata:s:a:{j}", f"handler_name={t}",
+                f"-disposition:a:{j}", "default" if j == 0 else "0"]
+    cmd += ["-vf", ("lcevc," if use_lcevc else "") + f"setparams={HDR10_TAGS}"]
+    if size:
+        cmd += ["-s", size]
+    cmd += ["-c:v", "libx265"]
+    if a.preset:
+        cmd += ["-preset", a.preset]
+    cmd += ["-crf", str(a.crf), "-pix_fmt", "yuv420p10le", "-x265-params", ":".join(xp), "-tag:v", "hvc1"]
+    if MUX_FORMATS.get(out.suffix.lower()) in ("mp4", "mov"):
+        cmd += ["-movflags", "+faststart"]
+    cmd += ["-c:a", "copy"] if (a.audio != "none" and (items or n_src_audio)) else ["-an"]
+    if a.limit:
+        cmd += ["-t", str(a.limit)]
+    if target:                                                         # written as <name>.part, renamed when finished
+        cmd += ["-f", MUX_FORMATS[out.suffix.lower()]]
+    return cmd + [str(target or out)]
+
+
+TC_STEPS_VIDEO = [("probe", "Analisar o arquivo (HDR10 e LCEVC)")]
+TC_STEPS_AUDIO = [("a_prepare", "Preparar o áudio e a cena"), ("a_decode", "Decodificar os presets (em paralelo)"),
+                  ("a_check", "Verificar os arquivos decodificados"), ("a_encode", "Gerar os arquivos de áudio")]
+TC_WEIGHTS_AUDIO = {"probe": 3, "a_prepare": 4, "a_decode": 8, "a_check": 1, "a_encode": 4, "encode": 79, "report": 1}
+TC_WEIGHTS_VIDEO = {"probe": 4, "encode": 95, "report": 1}
+
+
+def cmd_transcode(a):
+    render = a.audio == "render"
+    set_steps(TC_STEPS_VIDEO + (TC_STEPS_AUDIO if render else []) +
+              [("encode", "Codificar o vídeo HEVC HDR10" + (" e montar o arquivo" if render else "")), ("report", "Resumo")])
+    set_stages(TC_WEIGHTS_AUDIO if render else TC_WEIGHTS_VIDEO)
+    t0 = time.time()
+    step("probe", "running")
+    ff, src, info, use_lcevc = tc_prepare(a)
+    tools = None
+    if render:                                                         # fail early: audio tools are checked before the long work
+        try:
+            tools = (ff, find_mp4box(a.mp4box), need_tool(a.mpegh_ui, "mpeghUiManager"), need_tool(a.mpegh_decoder, "mpeghDecoder"))
+        except Fail as e:
+            raise Fail(f"{e}\nPara manter só a trilha MPEG-H original, sem renderizar os presets, use --audio copy (ou --audio none).")
+    v = info["video"]
+    say(f"Entrada: {v['codec']} {v['size'] or '?'} @ {v['fps'] or '?'} fps · {len(info['audio'])} trilha(s) de áudio "
+        f"({', '.join(x['codec'] for x in info['audio']) or 'nenhuma'}) · {fmt_hms(info['duration'] or 0)}")
+    hdr = probe_hdr10(ff, src)
+    say(f"HDR10: {hdr10_summary(hdr)}")
+    measured = verify_enhancement(ff, str(src), a.verify_frames) if use_lcevc else None
+    if measured and measured[1] == 0:
+        note("Sem enhancement LCEVC: a saída teria só a camada base (use --no-lcevc para um arquivo sem LCEVC).")
+    size = pick_size(a, measured) or (v["size"] if not use_lcevc else None)
+    say(f"Tamanho de saída: {size or 'não forçado (o filtro decide)'}")
+    step("probe", "done", f"HDR10 {hdr['src'] == 'stream' and 'do stream' or 'padrão'} · saída {size or 'automática'}")
+    progress("probe", 1.0, force=True)
+
+    work = tmp = part = None
+    items, offset = [], 0.0
+    succeeded = False
+    ext = {"mp4": ".mp4", "mkv": ".mkv"}.get(a.container)
+    out = None
+    try:
+        if render and not a.dry_run:
+            work = Path(a.tmpdir).resolve() / f"{src.stem}_tctmp" if a.tmpdir else (Path(a.outdir).resolve() if a.outdir else src.parent) / f".{src.stem}_tctmp"
+            tmp_session(work, {"v": 1, "src": src_sig(src), "task": "transcode", "uim": a.uim_version, "native": str(a.native_layout)})
+            adir, tmp = work / "audio", work / "mp"
+            adir.mkdir(exist_ok=True)
+            tmp.mkdir(exist_ok=True)
+            ctx = mpegh_render(a, src, tools, adir, tmp, split_options(a) or None, fmt_override=None if a.audio_format == "auto" else a.audio_format,
+                               pfx="a_", to_outdir=True)
+            for m, o in zip(ctx["made"], ctx["chosen"]):
+                items.append({"path": m["path"], "title": track_label(o), "id": o["id"],
+                              "fmt": AUDIO_EXT_FMT.get(Path(m["path"]).suffix.lower(), "?")})
+            offset = audio_offset(ff, src, a)
+            say(f"Deslocamento do áudio renderizado: {offset * 1000:+.0f} ms ({'início da trilha original' if str(a.audio_delay).lower() == 'auto' else '--audio-delay'})")
+        elif render:
+            note("--dry-run: a renderização do áudio foi pulada; o comando abaixo não tem as trilhas renderizadas.")
+        if ext is None:
+            ext = ".mp4" if all(i["fmt"] in ("aac", "eac3") for i in items) else ".mkv"
+            if ext == ".mkv":
+                note("Contêiner MKV: as trilhas renderizadas incluem PCM/FLAC, que não cabem em MP4. Use --container mp4 para forçar.")
+        out = Path(a.output) if a.output else Path(a.outdir or src.parent) / f"{src.stem}_hevc_hdr10{ext}"
+        if out.suffix.lower() not in MUX_FORMATS:
+            raise Fail(f"A extensão do arquivo de saída deve ser {', '.join(MUX_FORMATS)} (recebi {out.suffix or 'nenhuma'}).")
+        if same_file(out, src):
+            raise Fail("O arquivo de saída não pode ser o próprio arquivo de entrada.")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out = unique_path(out, a.overwrite)
+        part = out.with_name(out.name + ".part")
+        n_src = len(info["audio"])
+        total = min(info["duration"] or 0, float(a.limit)) if a.limit else (info["duration"] or 0)
+        attempts = [True, False] if (render and a.original_audio == "keep" and n_src) else [a.original_audio == "keep" or a.audio == "copy"]
+        step("encode", "running", out.name)
+        rc, tail = 0, ""
+        for k, keep in enumerate(attempts):
+            cmd = build_transcode_cmd(ff, src, out, a, hdr, size, use_lcevc, n_src, items, offset, keep, target=None if a.dry_run else part)
+            if a.dry_run:
+                say(subprocess.list2cmdline(cmd))
+                succeeded = True
+                return 0
+            rc, tail = run_ffmpeg_progress(cmd, total, "encode")
+            if rc != 0 and k + 1 < len(attempts) and re.search(r"mhm1|mpegh|not currently supported|Could not write header|codec not", tail, re.I):
+                note("Este ffmpeg/contêiner não consegue guardar a trilha MPEG-H original: tentando de novo sem ela.")
+                continue
+            break
+        got = media_duration(ff, part) if part.is_file() else None
+        if rc != 0:
+            if "Error flushing BSFs" in tail and got and total and abs(got - total) <= max(2.0, total * 0.005):
+                note("O ffmpeg reportou erro ao fechar a camada LCEVC, mas o arquivo tem a duração esperada.")
+            else:
+                raise Fail(f"O ffmpeg falhou (código {rc}):\n{tail[-1200:]}")
+        final = probe_streams(ff, part)
+        os.replace(part, out)                                          # only a finished file gets the final name
+        step("encode", "done", f"{out.name} · {human(out.stat().st_size)} · {fmt_hms(got or 0)}")
+        progress("encode", 1.0, force=True)
+
+        step("report", "running")
+        rows = [["Entrada", src.name], ["Vídeo", f"HEVC 10-bit HDR10 · {size or v['size'] or '?'} · CRF {a.crf:g}" + (f" · preset {a.preset}" if a.preset else "")],
+                ["HDR10", hdr10_summary(hdr)], ["Duração", fmt_hms(got or 0)], ["Contêiner", out.suffix.lstrip(".").upper()],
+                ["Trilhas de áudio", (f"{len(items)} renderizada(s): " + ", ".join(i['title'] for i in items) +
+                                      (f" + {len(final['audio']) - len(items)} original(is)" if len(final['audio']) > len(items) else ""))
+                 if items else f"{len(final['audio'])} (original)"],
+                ["Tempo total", fmt_hms(time.time() - t0)]]
+        made = [{"kind": "transcode", "title": "Vídeo HEVC HDR10" + (" com todos os presets" if items else ""), "path": str(out.resolve()),
+                 "size": out.stat().st_size, "duration": got}]
+        say(bold("Resultado:"))
+        for k_, v_ in rows:
+            say(f"  {k_}: {v_}")
+        say(f"  Arquivo: {out.resolve()}")
+        ev(type="result", out=str(out.resolve()), outputs=made, notes=NOTES, rows=rows, audio_tracks=[i["title"] for i in items])
+        step("report", "done")
+        progress("report", 1.0, force=True)
+        succeeded = True
+    finally:
+        if part and not succeeded:
+            part.unlink(missing_ok=True)
+        if work and not succeeded:
+            say(f"Execução interrompida: arquivos intermediários preservados em {work} para permitir retomar.", "warn")
+        elif work and a.keep_temp:
+            say(f"Arquivos intermediários mantidos em: {work}")
+        elif work:
+            safe_rmtree(work)
+    return 0
+
+
+# ── frame / sdr ──
+def locate_frame(path, a):
+    """Display-order index of the wanted frame + the IDR to start decoding from (LCEVC may be temporal)."""
+    tracks = mp4_tables(str(path))
+    v = next((t for t in tracks if t["handler"] == "vide"), None)
+    if not v or not v["dts"]:
+        raise Fail("Nenhuma trilha de vídeo nas tabelas de amostras (MP4 fragmentado não é suportado; use --slow-seek --time).")
+    n = len(v["dts"])
+    pres = [mp4_present(v, k) for k in range(n)]
+    order = sorted(range(n), key=pres.__getitem__)
+    rank = [0] * n
+    for r, k in enumerate(order):
+        rank[k] = r
+    ordered = [pres[k] for k in order]
+    treq = None
+    if a.frame is not None:
+        if not 1 <= a.frame <= n:
+            raise Fail(f"--frame deve estar entre 1 e {n}.")
+        rt = a.frame - 1
+    else:
+        t = treq = parse_time_input(a.time)
+        i = bisect.bisect_left(ordered, t)
+        rt = min((j for j in (i - 1, i) if 0 <= j < n), key=lambda j: abs(ordered[j] - t))
+    idr = cut_timeline(str(path))[0]
+    ranks = [rank[x[1] - 1] for x in idr if 0 <= x[1] - 1 < n and rank[x[1] - 1] <= rt]
+    ri = max(ranks) if ranks else 0
+    fd = (ordered[-1] - ordered[0]) / max(1, n - 1)
+    return {"rank": rt, "pts": ordered[rt], "idr_pts": ordered[ri], "skip": rt - ri, "fd": fd, "n": n, "treq": treq,
+            "first": ordered[0], "last": ordered[-1]}
+
+
+def decode_frame_rgb48(ff, src, loc, a, size, use_lcevc):
+    """One frame -> uint16 RGB array (full range, still PQ-coded BT.2020)."""
+    import numpy as np
+    w, h = (int(x) for x in size.split("x"))
+    pre = "lcevc," if use_lcevc else ""
+    if a.slow_seek:
+        sel, seek = f"select=gte(t\\,{max(0.0, loc['pts'] - loc['fd'] / 2):.6f})", []
+    else:
+        sel = f"select=eq(n\\,{loc['skip']})"
+        seek = ["-noaccurate_seek", "-ss", f"{loc['idr_pts'] + loc['fd'] / 2:.6f}"]
+    vf = (f"{pre}{sel},showinfo,setparams={HDR10_TAGS},"
+          f"scale={w}:{h}:in_color_matrix=bt2020:in_range=tv:out_range=full:flags=accurate_rnd+full_chroma_int+bicubic,"
+          "format=rgb48le")
+    cmd = [ff, "-hide_banner", "-nostdin", *seek, "-i", str(src), "-map", "0:v:0", "-vf", vf, "-frames:v", "1", "-f", "rawvideo", "-"]
+    log("$ " + subprocess.list2cmdline(cmd))
+    p = sp_popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **NOWIN)
+    err = Drain(p.stderr, keep=65536)
+    data = p.stdout.read()
+    rc = p.wait()
+    txt = err.text()
+    if rc != 0 or len(data) < w * h * 6:
+        raise Fail(f"Não consegui decodificar o quadro (ffmpeg código {rc}, {len(data)} de {w * h * 6} bytes):\n{txt[-900:]}")
+    m = re.search(r"pts_time:(-?[\d.]+)", txt)
+    if m and not a.slow_seek:
+        want, got = loc["pts"] - (loc["idr_pts"] + loc["fd"] / 2), float(m.group(1))
+        if abs(got - want) > loc["fd"] * 0.6:
+            raise Fail(f"O quadro decodificado está em {got:.3f}s, mas era esperado {want:.3f}s (o seek caiu em outro GOP). Tente --slow-seek.")
+    return np.frombuffer(data[:w * h * 6], dtype="<u2").reshape(h, w, 3)
+
+
+def png_chunk(tag, data):
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+
+def write_png16_hdr(path, rgb, hdr):
+    """16-bit RGB PNG with cICP (BT.2020 / PQ / RGB / full range) + mDCV + cLLI (PNG 3rd edition chunks)."""
+    import numpy as np
+    h, w, _ = rgb.shape
+    be = rgb.astype(">u2").reshape(h, w * 3).view(np.uint8)          # (h, w*6) big-endian samples
+    raw = np.empty((h, 1 + w * 6), np.uint8)
+    raw[:, 0] = 1                                                      # filter 1 = Sub (bpp 6)
+    raw[:, 1:7] = be[:, :6]
+    raw[:, 7:] = be[:, 6:] - be[:, :-6]
+    cp = lambda p: struct.pack(">HH", round(p[0] / 0.00002), round(p[1] / 0.00002))      # noqa: E731
+    mdcv = (cp(hdr["r"]) + cp(hdr["g"]) + cp(hdr["b"]) + cp(hdr["wp"]) +
+            struct.pack(">II", round(hdr["lmax"] * 10000), round(hdr["lmin"] * 10000)))
+    clli = struct.pack(">II", hdr["maxcll"] * 10000, hdr["maxfall"] * 10000)
+    png = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 16, 2, 0, 0, 0)) +
+           png_chunk(b"cICP", bytes([9, 16, 0, 1])) + png_chunk(b"mDCV", mdcv) + png_chunk(b"cLLI", clli) +
+           png_chunk(b"IDAT", zlib.compress(raw.tobytes(), 6)) + png_chunk(b"IEND", b""))
+    Path(path).write_bytes(png)
+
+
+def write_avif_hdr(ff, rgb, path, crf, chroma="444"):
+    """10-bit AVIF (4:4:4 = AV1 High profile, 4:2:0 = Main profile, more widely supported) tagged BT.2020 / PQ (colr nclx 9/16/9).
+    Needs libaom-av1 in the ffmpeg build. Carries no mastering-display/MaxCLL data (the 16-bit PNG does)."""
+    h, w, _ = rgb.shape
+    cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le", "-s", f"{w}x{h}",
+           "-i", "-", "-vf", f"scale=out_color_matrix=bt2020:out_range=tv,format=yuv{chroma}p10le,setparams={HDR10_TAGS}",
+           "-c:v", "libaom-av1", "-crf", str(crf), "-cpu-used", "6", "-still-picture", "1", "-frames:v", "1", str(path)]
+    r = sp_run(cmd, capture_output=True, input=rgb.tobytes(), **NOWIN)
+    if r.returncode != 0:
+        raise Fail("Falha ao gerar o AVIF: " + (r.stderr or b"").decode("utf-8", "replace")[-500:])
+
+
+def pq_eotf(e):
+    import numpy as np
+    m1, m2, c1, c2, c3 = 2610 / 16384, 2523 / 4096 * 128, 3424 / 4096, 2413 / 4096 * 32, 2392 / 4096 * 32
+    ep = np.power(e, 1 / m2)
+    return 10000.0 * np.power(np.maximum(ep - c1, 0) / (c2 - c3 * ep), 1 / m1)
+
+
+def tone_curve(name, x, peak):
+    """Maps scene-linear x (1.0 = SDR white) to [0,1]; peak = x value of the HDR peak."""
+    import numpy as np
+    if name == "clip" or peak <= 1.0:
+        return np.minimum(x, 1.0)
+    if name == "reinhard":
+        return x * (1 + x / (peak * peak)) / (1 + x)
+    if name == "hable":
+        def hb(t):
+            A, B, C, D, E, F = .15, .50, .10, .20, .02, .30
+            return ((t * (A * t + C * B) + D * E) / (t * (A * t + B) + D * F)) - E / F
+        k = 2.0
+        return np.minimum(hb(x * k) / hb(peak * k), 1.0)
+    j = 0.3                                                            # mobius (mpv): linear up to j, smooth roll-off
+    a = -j * j * (peak - 1) / (j * j - 2 * j + peak)
+    b = (j * j - 2 * j * peak + peak) / max(peak - 1, 1e-6)
+    return np.where(x <= j, x, (b * b + 2 * b * j + j * j) / (b - a) * (x + a) / (x + b))
+
+
+def tonemap_sdr(rgb16, hdr, algo, white, peak_nits, exposure=0.0, desat=0.0, saturation=1.0):
+    """
+    PQ BT.2020 (uint16, full range) -> 8-bit sRGB/BT.709. The curve acts on max(R,G,B) (hue-preserving).
+    white: HDR nits that become SDR white (higher = darker image); exposure: stops; desat: highlight desaturation
+    (ffmpeg 'desat' semantics, 0 = off); saturation: final multiplier (1 = unchanged).
+    """
+    import numpy as np
+    m2020to709 = np.array([[1.6605, -0.5876, -0.0728], [-0.1246, 1.1329, -0.0083], [-0.0182, -0.1006, 1.1187]], np.float32)
+    gain = 2.0 ** exposure
+    peak = max(peak_nits / white * gain, 1.0)
+    out = np.empty(rgb16.shape, np.uint8)
+    wy = np.array([0.2126, 0.7152, 0.0722], np.float32)
+    step_rows = 256
+    for y in range(0, rgb16.shape[0], step_rows):
+        e = rgb16[y:y + step_rows].astype(np.float32) / 65535.0
+        lin = np.maximum((pq_eotf(e) / white * gain).astype(np.float32) @ m2020to709.T, 0)
+        if desat > 0:                                      # pull very bright pixels towards grey (like ffmpeg tonemap)
+            sig = (lin @ wy)[..., None]
+            k = np.power(np.maximum(sig - 0.18, 1e-6) / np.maximum(sig, 1e-6), 10.0 / desat)
+            lin = lin * (1 - k) + sig * k
+        m = np.maximum(lin.max(axis=2, keepdims=True), 1e-6)
+        lin = np.clip(lin * (tone_curve(algo, m, peak) / m), 0, 1)
+        if saturation != 1.0:
+            lum = (lin @ wy)[..., None]
+            lin = np.clip(lum + saturation * (lin - lum), 0, 1)
+        srgb = np.where(lin <= 0.0031308, 12.92 * lin, 1.055 * np.power(lin, 1 / 2.4) - 0.055)
+        out[y:y + step_rows] = np.clip(srgb * 255 + 0.5, 0, 255).astype(np.uint8)
+    return out
+
+
+def save_sdr(img8, path, fmt, quality):
+    try:
+        from PIL import Image
+    except ImportError:
+        raise Fail("A imagem SDR precisa de Pillow e numpy: pip install pillow numpy")
+    im = Image.fromarray(img8, "RGB")
+    icc = None
+    try:
+        from PIL import ImageCms
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    except Exception:
+        pass
+    kw = {"icc_profile": icc} if icc else {}
+    if fmt == "jpg":
+        im.save(path, quality=quality, subsampling=0, optimize=True, **kw)
+    else:
+        im.save(path, compress_level=6, **kw)
+
+
+def read_png16_hdr(path):
+    """(uint16 RGB array, hdr dict) from a PNG written by write_png16_hdr."""
+    import numpy as np
+    b = Path(path).read_bytes()
+    if b[:8] != b"\x89PNG\r\n\x1a\n":
+        raise Fail("Não é um arquivo PNG.")
+    hdr, i, idat = dict(DEFAULT_HDR10), 8, b""
+    w = h = 0
+    while i < len(b):
+        n, t = struct.unpack(">I", b[i:i + 4])[0], b[i + 4:i + 8]
+        d = b[i + 8:i + 8 + n]
+        if t == b"IHDR":
+            w, h, depth, ctype = struct.unpack(">IIBB", d[:10])
+            if depth != 16 or ctype != 2:
+                raise Fail("Só aceito o PNG RGB de 16 bits gerado pelo comando 'frame'.")
+        elif t == b"cLLI":
+            hdr["maxcll"], hdr["maxfall"] = (x // 10000 for x in struct.unpack(">II", d))
+        elif t == b"mDCV":
+            v = struct.unpack(">HHHHHHHHII", d)
+            hdr.update(r=(v[0] * 2e-5, v[1] * 2e-5), g=(v[2] * 2e-5, v[3] * 2e-5), b=(v[4] * 2e-5, v[5] * 2e-5),
+                       wp=(v[6] * 2e-5, v[7] * 2e-5), lmax=v[8] / 10000, lmin=v[9] / 10000)
+        elif t == b"IDAT":
+            idat += d
+        i += 12 + n
+    raw = np.frombuffer(zlib.decompress(idat), np.uint8).reshape(h, 1 + w * 6)
+    if not (raw[:, 0] == 1).all():
+        raise Fail("Filtro PNG não suportado (esperado o filtro Sub usado pelo comando 'frame').")
+    px = np.cumsum(raw[:, 1:].reshape(h, w, 6).astype(np.uint32), axis=1, dtype=np.uint32) & 0xFF   # undo Sub, bpp 6
+    px = px.astype(np.uint8).reshape(h, w * 6)
+    return px.view(">u2").reshape(h, w, 3).astype("<u2"), hdr
+
+
+FRAME_STEPS = [("probe", "Localizar o quadro e medir o tamanho"), ("decode", "Decodificar o quadro"), ("save", "Salvar as imagens"), ("report", "Resumo")]
+FRAME_WEIGHTS = {"probe": 20, "decode": 55, "save": 24, "report": 1}
+
+
+def tone_args_summary(a):
+    return f"{a.tonemap} · branco {a.white_nits:g} nits" + (f" · exposição {a.exposure:+g}" if a.exposure else "") + \
+        (f" · saturação {a.saturation:g}" if a.saturation != 1.0 else "")
+
+
+def cmd_frame(a):
+    try:
+        import numpy  # noqa: F401  (availability check)
+    except ImportError:
+        raise Fail("O comando frame precisa de numpy: pip install numpy pillow")
+    set_steps(FRAME_STEPS)
+    set_stages(FRAME_WEIGHTS)
+    hdr_fmts = [] if a.hdr == "none" else [x.strip() for x in a.hdr.split(",")]
+    sdr_fmts = [] if a.sdr == "none" else [x.strip() for x in a.sdr.split(",")]
+    if any(x not in ("png", "avif") for x in hdr_fmts) or any(x not in ("png", "jpg") for x in sdr_fmts):
+        raise Fail("--hdr aceita png,avif,none; --sdr aceita png,jpg,none.")
+    step("probe", "running")
+    ff, src, info, use_lcevc = tc_prepare(a)
+    hdr = probe_hdr10(ff, src)
+    loc = locate_frame(src, a)
+    if loc["treq"] is not None and not loc["first"] - loc["fd"] <= loc["treq"] <= loc["last"] + loc["fd"]:
+        note(f"O tempo pedido ({fmt_clock(loc['treq'])}) está fora do vídeo ({fmt_clock(loc['first'])} a {fmt_clock(loc['last'])}): "
+             f"usando o quadro mais próximo.")
+    say(f"Quadro #{loc['rank'] + 1} (ordem de exibição) em {fmt_clock(loc['pts'])} · decodificando a partir do IDR em {fmt_clock(loc['idr_pts'])} (+{loc['skip']} quadros)")
+    measured = verify_enhancement(ff, str(src), min(8, loc["skip"] + 2), start=None if a.slow_seek else loc["idr_pts"] + loc["fd"] / 2) if use_lcevc else None
+    size = pick_size(a, measured) or (info["video"]["size"] if not use_lcevc else None)
+    if not size:
+        raise Fail("Não consegui determinar o tamanho do quadro pela verificação; informe --size LARGURAxALTURA.")
+    step("probe", "done", f"tamanho {size}")
+    step("decode", "running")
+    rgb = decode_frame_rgb48(ff, src, loc, a, size, use_lcevc)
+    step("decode", "done", f"{rgb.shape[1]}x{rgb.shape[0]}")
+    step("save", "running")
+    base = Path(a.output) if a.output else Path(a.outdir or src.parent) / f"{src.stem}_f{loc['rank'] + 1:06d}"
+    base.parent.mkdir(parents=True, exist_ok=True)
+    base = base.with_suffix("") if base.suffix.lower() in (".png", ".jpg", ".jpeg", ".avif") else base
+    made = []
+    for f in hdr_fmts:
+        p = unique_path(base.with_name(base.name + f"_hdr.{f}"), a.overwrite)
+        if f == "png":
+            write_png16_hdr(p, rgb, hdr)
+        elif "libaom-av1" not in (sp_run([ff, "-hide_banner", "-encoders"], capture_output=True, text=True, errors="replace", **NOWIN).stdout or ""):
+            note("Este ffmpeg não tem libaom-av1: AVIF ignorado (o PNG de 16 bits é o arquivo HDR).")
+            continue
+        else:
+            write_avif_hdr(ff, rgb, p, a.avif_crf, a.avif_chroma)
+        made.append({"kind": "frame-hdr", "title": "Imagem HDR (" + ("PNG 16 bits, BT.2020/PQ" if f == "png" else "AVIF 10 bits, BT.2020/PQ") + ")", "path": str(p.resolve()), "size": p.stat().st_size})
+    if sdr_fmts:
+        peak = a.peak_nits or hdr["maxcll"] or hdr["lmax"]
+        img8 = tonemap_sdr(rgb, hdr, a.tonemap, a.white_nits, float(peak), a.exposure, a.desat, a.saturation)
+        for f in sdr_fmts:
+            p = unique_path(base.with_name(base.name + f"_sdr.{f}"), a.overwrite)
+            save_sdr(img8, p, f, a.jpg_quality)
+            made.append({"kind": "frame-sdr", "title": f"Imagem SDR ({f.upper()}, BT.709/sRGB)", "path": str(p.resolve()), "size": p.stat().st_size})
+    step("save", "done", f"{len(made)} arquivo(s)")
+    step("report", "running")
+    rows = [["Quadro", f"#{loc['rank'] + 1} · {fmt_clock(loc['pts'])}"], ["Tamanho", size], ["HDR10", hdr10_summary(hdr)]]
+    if sdr_fmts:
+        rows.append(["Tone mapping SDR", tone_args_summary(a)])
+    say(bold("Resultado:"))
+    for m in made:
+        say(f"  {m['title']}: {m['path']} ({human(m['size'])})")
+    ev(type="result", out=made[0]["path"] if made else "", outputs=made, notes=NOTES, rows=rows)
+    step("report", "done")
+    progress("report", 1.0, force=True)
+    return 0
+
+
+def cmd_sdr(a):
+    """Redo only the SDR image from a saved *_hdr.png (fast way to tune the look; no decoding)."""
+    set_steps([("sdr", "Converter para SDR"), ("report", "Resumo")])
+    set_stages({"sdr": 99, "report": 1})
+    src = Path(a.input).resolve()
+    if not src.is_file():
+        raise Fail(f"Arquivo não encontrado: {src}")
+    fmts = [x.strip() for x in a.sdr.split(",")]
+    if any(x not in ("png", "jpg") for x in fmts):
+        raise Fail("--sdr aceita png,jpg.")
+    step("sdr", "running")
+    rgb, hdr = read_png16_hdr(src)
+    img8 = tonemap_sdr(rgb, hdr, a.tonemap, a.white_nits, float(a.peak_nits or hdr["maxcll"] or hdr["lmax"]), a.exposure, a.desat, a.saturation)
+    base = Path(a.output) if a.output else src.with_name(re.sub(r"_hdr$", "", src.stem))
+    made = []
+    for f in fmts:
+        p = unique_path(base.with_name(base.stem + f"_sdr.{f}"), a.overwrite)
+        save_sdr(img8, p, f, a.jpg_quality)
+        made.append({"kind": "frame-sdr", "title": f"Imagem SDR ({f.upper()}, BT.709/sRGB)", "path": str(p.resolve()), "size": p.stat().st_size})
+    step("sdr", "done", f"{len(made)} arquivo(s)")
+    step("report", "running")
+    say(bold("Resultado:"))
+    for m in made:
+        say(f"  {m['title']}: {m['path']} ({human(m['size'])})")
+    ev(type="result", out=made[0]["path"], outputs=made, notes=NOTES, rows=[["Tone mapping SDR", tone_args_summary(a)]])
+    step("report", "done")
+    progress("report", 1.0, force=True)
+    return 0
+
+
 # ──────────────────────────── CLI ────────────────────────────
+_MP_HELP = {"--drc-effect": "decoder DRC effect type (-dse; default 0)",
+            "--target-loudness": "decoder target loudness (-rl); empty = decoder default",
+            "--sleep-mode": "how interactivity commands are timed (advanced; default relative)",
+            "--uim-version": "UI manager protocol version (advanced; default 11.0)"}
+HELP_TEXTS = {
+    "*": {"--overwrite": "replace existing output files instead of using a free name",
+          "-v": "show the external commands that are run", "--no-color": "plain output, no colours",
+          "--ascii": "plain output, no Unicode symbols", "--keep-temp": "keep the intermediate files",
+          "--progress-json": "machine-readable events (@@DTV lines) for the web interface",
+          "--outdir": "output folder (default: next to the input)",
+          "--cache-dir": "folder of the MPEG-H analysis cache (default: <system temp>/dtv_audio_cache)"},
+    "ts-tv3": {"--outputs": "single, dual or single,dual (default: both)", "--program": "program number (default: the first in the PAT)",
+               "--vvc-pid": "force the VVC PID (decimal or hex such as 0x100)", "--lcevc-pid": "force the LCEVC PID (decimal or hex)",
+               "--mpegh-pid": "force the MPEG-H PID (decimal or hex)",
+               "--lcevc-size": "frame size written in the lvc1 track of the dual-track file (default: 3840x2160)",
+               "--outdir": "output folder (default: the folder of the input)", "--name": "base name of the outputs (default: the input name)",
+               "--dry-run": "only list the programs, PIDs and stream types; write nothing"},
+    "mpegh-audio": {"--option": "preset:ID or group:ID, optionally =FORMAT[:BITRATE] (repeatable; default: all presets)",
+                    "--jobs": "parallel decoders (0 = automatic)",
+                    "--mux": "none (audio files only), add (files and a copy of the MP4 with the audio tracks) or only (just the MP4)",
+                    "--audio-delay": "delay in ms for the tracks added by --mux (default 0)", **_MP_HELP},
+    "transcode": {"--crf": "x265 CRF (default 18)", "--container": "auto (MP4, or MKV when PCM/FLAC tracks need it), mp4 or mkv", **_MP_HELP},
+    "frame": {"--jpg-quality": "JPEG quality, 1-95 (default 95)", "--avif-crf": "AVIF quality (libaom CRF; default 18)"},
+    "sdr": {"-o": "base name of the output (default: the PNG name without _hdr)", "--jpg-quality": "JPEG quality, 1-95 (default 95)"},
+}
+
+
+def fill_missing_help(sub):
+    """One place for the help of the options that are shared or self-explanatory."""
+    for name, sp in sub.choices.items():
+        table = {**HELP_TEXTS["*"], **HELP_TEXTS.get(name, {})}
+        for act in sp._actions:
+            if act.option_strings and act.help is None and act.dest != "help":
+                txt = next((table[o] for o in act.option_strings if o in table), None)
+                if txt:
+                    act.help = txt
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="dtv_tools.py", description="DTV+ (TV 3.0) tools",
                                 epilog="Run 'dtv_tools.py doctor' to check the external programs.")
@@ -4928,6 +5593,76 @@ def build_parser():
     s_dash.add_argument("--ascii", action="store_true")
     tool_flags(s_dash)
 
+    def tone_flags(sp):
+        sp.add_argument("--tonemap", choices=("mobius", "hable", "reinhard", "clip"), default="mobius", help="HDR -> SDR curve")
+        sp.add_argument("--white-nits", type=float, default=203.0, help="HDR nits that become SDR white (higher = darker; default 203)")
+        sp.add_argument("--peak-nits", type=float, default=0, help="HDR peak for the roll-off (default: MaxCLL, else mastering max)")
+        sp.add_argument("--exposure", type=float, default=0.0, help="stops added before tone mapping (negative = darker)")
+        sp.add_argument("--desat", type=float, default=0.0, help="highlight desaturation, 0 = off (default 0)")
+        sp.add_argument("--saturation", type=float, default=1.0, help="final saturation multiplier (e.g. 0.85 = less vivid)")
+        sp.add_argument("--jpg-quality", type=int, default=95)
+
+    def video_input_flags(sp):
+        sp.add_argument("input", help="single-track MP4 made by ts-tv3 / mp4-cut (VVC + LCEVC SEI + MPEG-H)")
+        sp.add_argument("--no-lcevc", action="store_true", help="source without LCEVC (plain HDR10 file): skip the lcevc filter")
+        sp.add_argument("--size", default="", metavar="WxH", help="force the output size (default: the one measured by the LCEVC verification)")
+        sp.add_argument("--no-size-fix", action="store_true", help="never force a size, even if the verification found one")
+        sp.add_argument("--outdir", default="")
+        sp.add_argument("--overwrite", action="store_true")
+
+    s_tc = sub.add_parser("transcode", help="single-track MP4 -> HEVC 10-bit HDR10 with every MPEG-H preset as an audio track")
+    video_input_flags(s_tc)
+    s_tc.add_argument("-o", "--output", default="", help="output file (default: <name>_hevc_hdr10.mp4 / .mkv)")
+    s_tc.add_argument("--crf", type=float, default=18)
+    s_tc.add_argument("--preset", default="", help="x265 preset (default: not passed, x265 decides)")
+    s_tc.add_argument("--x265-params", default="", metavar="K=V:K=V", help="extra x265 parameters appended to the HDR10 ones")
+    s_tc.add_argument("--verify-frames", type=int, default=48, help="frames decoded by the LCEVC verification (default: 48)")
+    s_tc.add_argument("--limit", type=float, default=0, metavar="SEC", help="encode only the first SEC seconds (quick test; the audio is still rendered in full)")
+    s_tc.add_argument("--dry-run", action="store_true", help="show the ffmpeg command and stop")
+    s_tc.add_argument("--audio", choices=("render", "copy", "none"), default="render",
+                      help="render = every preset as its own track (like mpegh-audio); copy = original track(s) only; none")
+    s_tc.add_argument("--option", action="append", default=[], metavar="SPEC",
+                      help="what to render, e.g. preset:1 or group:3=aac:192k (repeat or comma list; default: all presets, no groups)")
+    s_tc.add_argument("--audio-format", choices=("auto", "aac", "eac3", "flac", "wav"), default="auto", help="auto = AAC for 2.0, E-AC-3 for 5.1, WAV above (per option)")
+    s_tc.add_argument("--audio-delay", default="auto", metavar="auto|MS", help="rendered audio offset; auto = start of the original track")
+    s_tc.add_argument("--original-audio", choices=("keep", "drop"), default="keep", help="also keep the original MPEG-H track (last)")
+    s_tc.add_argument("--container", choices=("auto", "mp4", "mkv"), default="auto")
+    s_tc.add_argument("--native-layout", type=int, default=0, help="0=auto (detect from the stream), 2=2.0, 6=5.1, 19=7.1.4")
+    s_tc.add_argument("--jobs", type=int, default=0, help="parallel decoders (0 = automatic)")
+    s_tc.add_argument("--drc-effect", default="0")
+    s_tc.add_argument("--target-loudness", default="")
+    s_tc.add_argument("--sleep-mode", default="relative")
+    s_tc.add_argument("--uim-version", default="11.0")
+    s_tc.add_argument("--cache-dir", default="")
+    common_flags(s_tc)
+    tool_flags(s_tc, ("mpegh",))
+
+    s_fr = sub.add_parser("frame", help="save one frame as HDR-native and/or tone-mapped SDR image")
+    video_input_flags(s_fr)
+    g = s_fr.add_mutually_exclusive_group(required=True)
+    g.add_argument("--time", help="HH:MM:SS.mmm, MM:SS or seconds (nearest frame)")
+    g.add_argument("--frame", type=int, help="frame number in display order, starting at 1")
+    s_fr.add_argument("-o", "--output", default="", help="base name (_hdr.png / _sdr.png ... are appended)")
+    s_fr.add_argument("--hdr", default="png", help="HDR native: png (16-bit, cICP) and/or avif (10-bit); comma list or none")
+    s_fr.add_argument("--sdr", default="png", help="SDR tone-mapped: png and/or jpg; comma list or none")
+    s_fr.add_argument("--avif-crf", type=int, default=18)
+    s_fr.add_argument("--avif-chroma", choices=("444", "420"), default="444",
+                      help="AVIF chroma format: 444 keeps all the colour detail (AV1 High profile); 420 is the most compatible (Main profile)")
+    s_fr.add_argument("--slow-seek", action="store_true", help="decode from the start of the file (slow, no IDR lookup)")
+    tone_flags(s_fr)
+    common_flags(s_fr)
+
+    s_sdr = sub.add_parser("sdr", help="redo the SDR image from a saved *_hdr.png (no decoding)")
+    s_sdr.add_argument("input", help="16-bit PNG made by 'frame'")
+    s_sdr.add_argument("-o", "--output", default="")
+    s_sdr.add_argument("--sdr", default="png", help="png and/or jpg")
+    s_sdr.add_argument("--overwrite", action="store_true")
+    s_sdr.add_argument("--progress-json", action="store_true")
+    s_sdr.add_argument("-v", "--verbose", action="store_true")
+    s_sdr.add_argument("--no-color", action="store_true")
+    s_sdr.add_argument("--ascii", action="store_true")
+    tone_flags(s_sdr)
+
     s_doc = sub.add_parser("doctor", help="check the external programs and Python modules")
     s_doc.add_argument("--progress-json", action="store_true")
     s_doc.add_argument("-v", "--verbose", action="store_true")
@@ -4935,6 +5670,7 @@ def build_parser():
     s_doc.add_argument("--ascii", action="store_true")
     tool_flags(s_doc, ("mp4box", "ffmpeg", "mpegh"))
 
+    fill_missing_help(sub)
     return p
 
 
@@ -4964,7 +5700,8 @@ def main(argv=None):
     global DASH_LOG, ORIG_LOOK
     DASH_LOG, ORIG_LOOK = None, False
     handlers = {"ts-tv3": cmd_ts_tv3, "mpegh-scan": cmd_mpegh_scan, "mpegh-audio": cmd_mpegh_audio,
-                "mp4-cut": cmd_mp4_cut, "dash-capture": cmd_dash_capture, "doctor": cmd_doctor}
+                "mp4-cut": cmd_mp4_cut, "dash-capture": cmd_dash_capture, "doctor": cmd_doctor,
+                "transcode": cmd_transcode, "frame": cmd_frame, "sdr": cmd_sdr}
     try:
         return handlers[args.cmd](args) or 0
     except Fail as e:
