@@ -13,7 +13,7 @@ import os
 import sys
 
 APP_NAME = "DTV Tools"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--cli":

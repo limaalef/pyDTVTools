@@ -33,15 +33,6 @@ jobs:
         run: python tests/gui/functional.py
         env:
           QT_QPA_PLATFORM: offscreen
-      - name: Capturas de tela (claro e escuro)
-        run: python tests/gui/visual.py shots
-        env:
-          QT_QPA_PLATFORM: offscreen
-      - uses: actions/upload-artifact@v4
-        with:
-          name: capturas-de-tela
-          path: shots/*.png
-          if-no-files-found: ignore
 
   build:
     name: Build ${{ matrix.name }}

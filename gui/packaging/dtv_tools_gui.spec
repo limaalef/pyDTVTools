@@ -9,7 +9,7 @@ from pathlib import Path
 GUI = Path(SPECPATH).resolve().parent      # gui/
 ROOT = GUI.parent                           # raiz do projeto (dtv_tools.py)
 NAME = "DTV-Tools"
-VERSION = os.environ.get("DTV_VERSION", "1.2.0")
+VERSION = os.environ.get("DTV_VERSION", "1.2.1")
 
 datas = [(str(GUI / "packaging" / "icon.png"), "packaging"), (str(GUI / "icons"), "icons")]
 tools_src = os.environ.get("DTV_TOOLS_SRC", "")

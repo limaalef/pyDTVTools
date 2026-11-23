@@ -5,7 +5,7 @@ Uso (a partir de qualquer pasta):
     python gui/packaging/build.py              # build + teste de fumaça + pacote em release/
     python gui/packaging/build.py --no-test    # pula o teste de fumaça
     python gui/packaging/build.py --no-package # só gera dist/
-    python gui/packaging/build.py --version 1.2.0
+    python gui/packaging/build.py --version 1.2.1
     python gui/packaging/build.py --tools DIR  # (opcional) embute os programas de DIR como tools/
 
 Saída: dist/DTV-Tools[.app]  e  release/DTV-Tools-<versão>-<plataforma>.{zip,tar.gz,dmg} + .sha256
@@ -79,7 +79,7 @@ def package(version: str) -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--version", default=os.environ.get("DTV_VERSION", "1.2.0"))
+    ap.add_argument("--version", default=os.environ.get("DTV_VERSION", "1.2.1"))
     ap.add_argument("--tools", help="pasta com programas a embutir (opcional; por padrão nada é embutido)")
     ap.add_argument("--no-test", action="store_true")
     ap.add_argument("--no-package", action="store_true")

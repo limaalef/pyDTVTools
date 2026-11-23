@@ -5,7 +5,6 @@ tools/*
 !tools/README.md
 .pytest_cache/
 /docs
-/tests
 README.example.md
 requirements-dev.txt
 /dist
