@@ -1,0 +1,7 @@
+# Interface gráfica (Qt 6). PySide6-Essentials basta e é bem menor que o PySide6 completo.
+PySide6-Essentials>=6.7,<7
+# Dependências opcionais do dtv_tools (captura DASH, painel no terminal, quadro/imagem)
+requests>=2.31
+rich>=13
+numpy>=1.26
+pillow>=10.3

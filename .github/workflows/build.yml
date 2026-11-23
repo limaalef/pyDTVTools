@@ -1,0 +1,108 @@
+name: Build DTV Tools GUI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # necessário só para anexar os arquivos ao release de uma tag
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  test:
+    name: Testes (Linux, sem tela)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: gui/requirements.txt
+      - name: Bibliotecas do Qt
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libxcb-cursor0
+      - run: pip install -r gui/requirements.txt
+      - name: Testes do script e contrato com a interface
+        run: pip install pytest && python -m pytest -q
+      - name: Testes funcionais da GUI
+        run: python tests/gui/functional.py
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Capturas de tela (claro e escuro)
+        run: python tests/gui/visual.py shots
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capturas-de-tela
+          path: shots/*.png
+          if-no-files-found: ignore
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x64, os: windows-latest }
+          - { name: linux-x64,   os: ubuntu-22.04 }
+          - { name: macos-arm64, os: macos-15 }
+          - { name: macos-x64,   os: macos-15-intel }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: gui/requirements.txt
+
+      - name: Bibliotecas do Qt (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libxcb-cursor0
+
+      - name: Dependências
+        run: pip install -r gui/requirements.txt pyinstaller
+
+      - name: Versão
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) V="0.0.0-dev.${GITHUB_RUN_NUMBER}" ;; esac
+          echo "DTV_VERSION=$V" >> "$GITHUB_ENV"
+
+      # Mesmo script que você roda localmente. Não embute ffmpeg/MP4Box/mpegh*: o usuário os aponta em "Ferramentas e pastas"
+      # (ou coloca em tools/ ao lado do app). Faz: PyInstaller -> teste de fumaça -> pacote + SHA-256 em release/.
+      - name: Gerar, testar e empacotar
+        run: python gui/packaging/build.py --version "$DTV_VERSION"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DTV-Tools-${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    name: Publicar release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: DTV-Tools-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

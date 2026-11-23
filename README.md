@@ -17,6 +17,7 @@ Caso você seja um uusário que tenha ressalvas ao uso de inteligência artifica
 | `frame` | Salva um quadro como imagem HDR (PNG 16 bits, AVIF) e/ou SDR com tone mapping (PNG, JPG) |
 | `sdr` | Gera imagens SDR a partir de um PNG HDR salvo |
 | `doctor` | Verifica os programas externos e os módulos Python necessários para o script funcionar |
+| `describe` | Imprime comandos, opções, ferramentas, formatos e layouts em JSON (para interfaces) |
 
 ### Opções comuns a todos os comandos
 
@@ -274,6 +275,7 @@ python dtv_tools.py transcode ENTRADA.mp4 [-o SAIDA.mp4] [--audio render|copy|no
 | `--option`, `--audio-format`, `--audio-delay`, `--original-audio`, `--native-layout`, `--jobs` | Mesmo significado de `mpegh-audio`; `--original-audio keep` acrescenta a trilha original MPEG-H no fim |
 | `--container` | `auto`, `mp4` ou `mkv` |
 | `--crf`, `--preset`, `--x265-params` | Ajustes do encoder; parâmetros extras são anexados aos do HDR10 |
+| `--encoder x265\|nvenc` | `x265` (CPU, padrão) ou `nvenc` (GPU NVIDIA, `hevc_nvenc`, Main10). Com `nvenc`, `--crf` vira o valor CQ (tente 22), `--preset` é `p1`..`p7` (padrão `p5`) e `--nvenc-params '-opção valor …'` acrescenta opções. O mastering display / MaxCLL não vão como parâmetros do encoder: confira a saída com `ffprobe -show_frames`. Exige ffmpeg com `hevc_nvenc` |
 | `--no-lcevc` | A origem não tem LCEVC (arquivo HDR10 comum): não usa o filtro |
 | `--size WxH`, `--no-size-fix` | Tamanho da saída. Por padrão só se usa um tamanho medido pela verificação LCEVC |
 | `--verify-frames` | Quadros decodificados na verificação LCEVC (padrão 48) |
@@ -360,6 +362,14 @@ Eles **não estão incluídos**. Eles podem ser disponibilizados para utilizaç�
 2. `dtv_tools.json` ao lado do script (veja `dtv_tools.example.json`);
 3. `PATH`, caminho salvo como variável do ambiente;
 4. a pasta `tools/` ao lado do script (e suas subpastas diretas)
+
+## Interface gráfica e protocolo para máquinas
+
+A pasta `gui/` tem uma interface desktop nativa (Qt 6 / PySide6) que executa estes mesmos comandos.
+
+Para qualquer programa que controle o script, `--json` imprime **somente** eventos JSON Lines no stdout (`hello`, `begin` com as
+etapas e seus pesos, `progress` com a etapa e sua fração, `log`, `result`, `error`), `--control` permite parar a execução pelo
+stdin e `describe` imprime comandos, opções, ferramentas, formatos e layouts em JSON. Os campos só são acrescentados.
 
 ## Aviso legal
  

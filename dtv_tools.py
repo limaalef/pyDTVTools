@@ -22,10 +22,12 @@ import atexit
 import bisect
 import concurrent.futures
 import hashlib
+import io
 import itertools
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import struct
@@ -38,16 +40,21 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+PROTOCOL_VERSION = 2
+# What a controlling program (the GUI) may rely on; listed by `describe`, `doctor` and the `hello` event.
+FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation")
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
-PJ = False
+PJ = False          # machine mode: --json (protocol v2) or the legacy --progress-json
+JSONL = False       # --json: stdout carries ONLY one JSON object per line
 VERBOSE = False
 COLOR = False
 ASCII = False
 NOTES: list[str] = []
+CMD = ""
 CUR_STEP = None
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = SCRIPT_DIR / "dtv_tools.json"
+CONFIG_PATH = Path(os.environ["DTV_TOOLS_CONFIG"]) if os.environ.get("DTV_TOOLS_CONFIG") else SCRIPT_DIR / "dtv_tools.json"
 
 BAD_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 WEIGHTS: dict = {}
@@ -72,8 +79,21 @@ def _out(msg):
     hook = _OUT_HOOK
     if hook is not None:
         hook(msg)
+    elif JSONL:     # nothing but events may reach stdout in --json mode
+        _emit({"type": "log", "level": "info", "msg": str(msg)})
     else:
         print(msg, flush=True)
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _emit(obj):
+    """One protocol event = one line of JSON (v2) or '@@DTV {json}' (legacy --progress-json)."""
+    if JSONL:   # text from child programs may carry terminal colours; a front end does not want them
+        obj = {k: (_ANSI.sub("", v) if k in ("msg", "message", "detail") and isinstance(v, str) else v) for k, v in obj.items()}
+    line = json.dumps(obj, ensure_ascii=False, default=str, separators=(",", ":"))
+    print(line if JSONL else "@@DTV " + line, flush=True)
 
 
 def sp_popen(cmd, **kw):
@@ -261,7 +281,7 @@ def check_free_space(folder: Path, needed: int, what: str, hard=True):
 
 
 # ──────────────────────────── external programs ────────────────────────────
-TOOLS_DIR = SCRIPT_DIR / "tools"
+TOOLS_DIR = Path(os.environ["DTV_TOOLS_DIR"]) if os.environ.get("DTV_TOOLS_DIR") else SCRIPT_DIR / "tools"
 TOOL_DEFS = {
     "mp4box": {"label": "MP4Box", "names": ("MP4Box", "mp4box"), "flag": "--mp4box"},
     "ffmpeg": {"label": "ffmpeg", "names": ("ffmpeg",), "flag": "--ffmpeg"},
@@ -276,12 +296,16 @@ def load_config() -> dict:
     """Optional dtv_tools.json next to the script: {"mp4box": "...", "ffmpeg": "...", "mpegh_ui": "...", "mpegh_decoder": "..."}."""
     if "cfg" not in _CFG_CACHE:
         cfg = {}
-        if CONFIG_PATH.is_file():
-            try:
-                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-                cfg = {k: str(v) for k, v in data.items() if k in TOOL_DEFS and v}
-            except (OSError, ValueError) as e:
-                note(f"{CONFIG_PATH.name} ignored (invalid): {e}")
+        files = [CONFIG_PATH]
+        if os.environ.get("DTV_TOOLS_CONFIG"):      # a controlling program's file wins, the one next to the script still fills the gaps
+            files.insert(0, SCRIPT_DIR / "dtv_tools.json")
+        for f in files:
+            if f.is_file():
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    cfg.update({k: str(v) for k, v in data.items() if k in TOOL_DEFS and v})
+                except (OSError, ValueError) as e:
+                    note(f"{f.name} ignored (invalid): {e}")
         _CFG_CACHE["cfg"] = cfg
     return _CFG_CACHE["cfg"]
 
@@ -425,7 +449,9 @@ def cmd_doctor(a):
         "mpegh_decoder": "mpegh-audio, transcode (audio rendering)",
     }
     tools, rows, problems = [], [], []
-    for key, d in TOOL_DEFS.items():
+    n_items = len(TOOL_DEFS) + 4        # programs + Python modules
+    for idx, (key, d) in enumerate(TOOL_DEFS.items()):
+        progress("check", idx / n_items, f"{d['label']}…", force=True)
         given = getattr(a, key, "") or ""
         entry = {"key": key, "name": d["label"], "needed_by": needed_by[key], "ok": False, "path": "", "source": "",
                  "version": "", "caps": {}}
@@ -451,7 +477,8 @@ def cmd_doctor(a):
         rows.append([d["label"], entry["path"] or "not found"])
     mods = {}
     mod_use = {"requests": "dash-capture", "rich": "dash-capture live panel", "numpy": "frame, sdr", "PIL": "frame, sdr (SDR images)"}
-    for mod, use in mod_use.items():
+    for idx, (mod, use) in enumerate(mod_use.items()):
+        progress("check", (len(TOOL_DEFS) + idx) / n_items, f"python: {mod}", force=True)
         try:
             __import__(mod)
             mods[mod] = True
@@ -464,9 +491,11 @@ def cmd_doctor(a):
         say(f"Python {sys.version.split()[0]} is too old (3.9+ required).", "err")
         problems.append("python")
     required_missing = [k for k in problems if k in ("mp4box", "python")]
+    progress("check", 1.0, force=True)
     step("check", "done" if not required_missing else "error",
          "all required programs found" if not required_missing else "missing: " + ", ".join(required_missing))
-    ev(type="result", out="", outputs=[], notes=NOTES, rows=rows, tools=tools, modules=mods, version=__version__)
+    ev(type="result", out="", outputs=[], notes=NOTES, rows=rows, tools=tools, modules=mods, version=__version__,
+       protocol=PROTOCOL_VERSION, features=list(FEATURES))
     return 2 if required_missing else 0
 
 
@@ -509,7 +538,9 @@ ICON = lambda k: {"ok": "✔", "err": "✖", "warn": "⚠", "go": "▸", "dot": 
 
 def ev(**kw):
     if PJ:
-        _out("@@DTV " + json.dumps(kw, ensure_ascii=False, default=str))
+        if JSONL and kw.get("type") == "result":
+            kw.setdefault("command", CMD)
+        _emit(kw)
 
 
 def _clear_bar():
@@ -520,6 +551,9 @@ def _clear_bar():
 
 
 def say(msg="", kind=""):
+    if JSONL:
+        _emit({"type": "log", "level": {"warn": "warn", "err": "error", "ok": "ok"}.get(kind, "info"), "msg": str(msg)})
+        return
     if PJ:
         _out(msg)
         return
@@ -534,7 +568,9 @@ def say(msg="", kind=""):
 
 
 def log(msg=""):
-    if PJ:
+    if JSONL:
+        _emit({"type": "log", "level": "debug", "msg": str(msg)})
+    elif PJ:
         _out(msg)
     elif VERBOSE:
         _clear_bar()
@@ -551,7 +587,9 @@ def note(msg):
     if DASH_LOG is not None and not PJ:
         DASH_LOG("WARN", msg)
         return
-    if PJ:
+    if JSONL:
+        _emit({"type": "log", "level": "warn", "msg": str(msg), "note": True})
+    elif PJ:
         _out("AVISO: " + msg)
     else:
         say(msg, "warn")
@@ -574,6 +612,9 @@ def step(sid, status, detail=""):
     if status == "running":
         CUR_STEP = sid
     ev(type="step", id=sid, status=status, detail=detail)
+    if JSONL and sid in WEIGHTS and status in ("running", "done", "skipped"):
+        # a stage always reports its edges, so even commands without finer progress (frame, doctor...) move the bars
+        _stage_edge(sid, 0.0 if status == "running" else 1.0)
     if PJ or ORIG_LOOK:
         return
     labels = dict(STEP_DEFS)
@@ -592,6 +633,15 @@ def step(sid, status, detail=""):
         _out(dim(f"  {ICON('dot')} {detail or 'ignorado'}"))
 
 
+def _stage_edge(stage, frac):
+    done = 0.0
+    for k in ORDER:
+        if k == stage:
+            break
+        done += WEIGHTS.get(k, 0)
+    ev(type="progress", stage=stage, frac=frac, pct=round(done + WEIGHTS.get(stage, 0) * frac, 1), detail="")
+
+
 _last_prog = [0.0]
 
 
@@ -607,7 +657,7 @@ def progress(stage, frac, detail="", force=False):
         done += WEIGHTS.get(k, 0)
     frac = max(0.0, min(frac, 1.0))
     pct = done + WEIGHTS.get(stage, 0) * frac
-    ev(type="progress", pct=round(pct, 1), detail=detail)
+    ev(type="progress", stage=stage, frac=round(frac, 4), pct=round(pct, 1), detail=detail)
     if PJ or ORIG_LOOK or not sys.stdout.isatty():
         return
     cols = shutil.get_terminal_size((100, 20)).columns
@@ -649,9 +699,13 @@ def set_steps(defs):
 
 
 def set_stages(weights):
+    """Declares the stage weights (percent of the total) and tells a controlling program the whole plan."""
     global WEIGHTS, ORDER
     WEIGHTS = dict(weights)
     ORDER = list(weights)
+    if JSONL:
+        ev(type="begin", command=CMD,
+           steps=[{"id": k, "label": v, "weight": WEIGHTS.get(k, 0)} for k, v in STEP_DEFS])
 
 
 # ──────────────────────────── MPEG-TS ────────────────────────────
@@ -1116,7 +1170,14 @@ def verify_enhancement(ff: str, mp4_path: str, frames: int = 600, start=None):
     total = len(re.findall(r"hasEnhancement \d", err))
     hits = len(re.findall(r"hasEnhancement 1", err))
     sizes = sorted(set(re.findall(r"out PTS -?\d+, (\d+x\d+)", err)))
-    say(f"Verificação: {total} quadros processados, {hits} com enhancement LCEVC; tamanhos de saída: {', '.join(sizes) or 'n/d'}", "ok" if hits else "")
+    where = "a partir do ponto escolhido" if start is not None else "no início do arquivo"
+    miss = total - hits
+    say(f"Verificação do LCEVC por amostragem (só os primeiros {frames} quadros pedidos, {where}; o arquivo inteiro não é decodificado): "
+        f"{total} quadros analisados, {hits} com enhancement" + (f", {miss} sem" if total and miss else "") +
+        f"; tamanho de saída: {', '.join(sizes) or 'n/d'}", "ok" if hits else "")
+    if total and 0 < hits < total:
+        note(f"{miss} dos {total} quadros da amostra vieram sem enhancement LCEVC. Se forem os primeiros, é a partida do filtro; "
+             "se estiverem espalhados, faltou a camada nesses quadros.")
     if total == 0:
         note("O filtro lcevc do ffmpeg não processou nenhum quadro. Final do log: " + err[-300:].strip().replace("\n", " | "))
     elif hits == 0:
@@ -2058,11 +2119,14 @@ def cmd_ts_tv3(a):
 
 
 # ──────────────────────────── mpegh-audio ────────────────────────────
-CICP_CH = {2: 2, 6: 6, 19: 12}
-CICP_NAME = {2: "2.0", 6: "5.1", 19: "7.1.4"}
+CICP_CH = {2: 2, 6: 6, 16: 10, 19: 12}
+CICP_NAME = {2: "2.0", 6: "5.1", 16: "5.1.4", 19: "7.1.4"}
+FF_LAYOUT = {2: "stereo", 6: "5.1", 16: "5.1.4", 19: "12c"}      # CICP -> ffmpeg channel layout (same channel order)
 LAYOUTS = {
     2: [("L", 30, 0), ("R", -30, 0)],
     6: [("L", 30, 0), ("R", -30, 0), ("C", 0, 0), ("LFE", 0, -1), ("Ls", 110, 0), ("Rs", -110, 0)],
+    16: [("L", 30, 0), ("R", -30, 0), ("C", 0, 0), ("LFE", 0, -1), ("Ls", 110, 0), ("Rs", -110, 0),
+         ("Ltf", 30, 1), ("Rtf", -30, 1), ("Ltr", 110, 1), ("Rtr", -110, 1)],
     19: [("L", 30, 0), ("R", -30, 0), ("C", 0, 0), ("LFE", 0, -1), ("Lrs", 135, 0), ("Rrs", -135, 0), ("Lss", 90, 0), ("Rss", -90, 0),
          ("Ltf", 45, 1), ("Rtf", -45, 1), ("Ltr", 135, 1), ("Rtr", -135, 1)],
 }
@@ -2214,11 +2278,15 @@ def parse_scenes(raw):
                         continue
                     eid = int(ch.get("id"))
                     kn = ch.find("kind")
+                    inter = not ch.tag.lower().startswith("noninteractive")
+                    mute_ok = inter and any(x.tag.lower().startswith("muting") and x.get("isActionAllowed", "true").lower() != "false"
+                                            for x in ch.iter())
                     els.append({
                         "id": eid,
                         "name": _desc(ch) or f"Grupo {eid}",
                         "kind": int(kn.get("code", "0")) if kn is not None else 0,
-                        "interactive": not ch.tag.lower().startswith("noninteractive")
+                        "interactive": inter,
+                        "mute_ok": mute_ok,
                     })
             presets.append({
                 "id": pid,
@@ -2295,7 +2363,9 @@ def analyze_scenes(states, total_frames):
             for e in p["elements"]:
                 eid = e["id"]
                 if eid not in pm["elements_map"]:
-                    pm["elements_map"][eid] = {"id": eid, "names": {}, "kind": e["kind"], "interactive": e["interactive"]}
+                    pm["elements_map"][eid] = {"id": eid, "names": {}, "kind": e["kind"], "interactive": e["interactive"], "mute_ok": False}
+                if e.get("mute_ok"):
+                    pm["elements_map"][eid]["mute_ok"] = True
                 pm["elements_map"][eid]["names"][e["name"]] = pm["elements_map"][eid]["names"].get(e["name"], 0) + dur_frames
 
                 if eid not in all_groups_map:
@@ -2333,6 +2403,7 @@ def analyze_scenes(states, total_frames):
                 "names": list(em["names"].keys()),
                 "kind": em["kind"],
                 "interactive": em["interactive"],
+                "mute_ok": em.get("mute_ok", False),
             })
         unified_presets.append({
             "id": pid,
@@ -2397,10 +2468,87 @@ def analyze_scenes(states, total_frames):
     }
 
 
-def build_catalog(info, native=2):
+ISO_TEXT = {"preset": "", "mute": " · isolado silenciando os demais elementos do preset",
+            "edit": " · isolado numa cópia temporária com a cena editada (o original não é alterado)"}
+
+
+def option_layout(stream, native, forced, ids):
+    """Layout in which a preset/group is rendered, from what the stream says about its audio elements.
+    Channel bed(s) only -> the layout of that bed; objects only -> 2.0 (objects have no layout of their own); mixed or unknown -> native.
+    Returns (cicp, text or '')."""
+    els = (stream or {}).get("elements")
+    if forced or not els or not ids or any(i not in els for i in ids):
+        return native, ""
+    ch = sum(els[i]["channels"] for i in ids)
+    ob = sum(els[i]["objects"] for i in ids)
+    if ch and not ob:
+        pick = next((k for k, v in sorted(CICP_CH.items()) if v == ch), None)
+        if pick is None:
+            pick = native
+        return pick, f"{ch} canais"
+    if ob and not ch:
+        return 2, f"{ob} objeto(s) de áudio, renderizado(s) em 2.0"
+    return native, f"{ch} canais + {ob} objeto(s) mixados no layout do stream"
+
+
+_SIDE_RX = re.compile(r"(?i)(?<![A-Za-zÀ-ÿ])(L|R|esq|dir|left|right|esquerd[oa]|direit[oa])(?![A-Za-zÀ-ÿ])")
+
+
+def find_lr_pairs(groups):
+    """Groups whose names differ only by a Left/Right marker (CAMPO L / CAMPO R) are the two halves of one stereo signal.
+    -> [(left id, right id, base name)]"""
+    def split(name):
+        sides = {m.group(1).lower()[0] for m in _SIDE_RX.finditer(name)}
+        if len(sides) != 1 or len(_SIDE_RX.findall(name)) != 1:
+            return None
+        base = re.sub(r"\s+", " ", _SIDE_RX.sub(" ", name)).strip(" -_.:/")
+        return (base.lower(), "l" if sides == {"l"} or sides == {"e"} else "r" if sides == {"r"} or sides == {"d"} else None, base)
+    seen, pairs = {}, []
+    for g in groups:
+        r = split(g["name"])
+        if r and r[1]:
+            seen.setdefault(r[0], {})[r[1]] = (g["id"], r[2])
+    for v in seen.values():
+        if "l" in v and "r" in v and v["l"][0] != v["r"][0]:
+            pairs.append((v["l"][0], v["r"][0], v["l"][1] or "stereo"))
+    return sorted(pairs)
+
+
+def plan_isolation(presets, ids):
+    """How to hear the audio elements `ids` alone. -> {"method", "preset", "others"}
+    preset: a preset has nothing else; mute: the preset lets the others be switched off (action 40);
+    edit: it does not (a preset always disables on/off for its members), so a temporary copy of the stream with an edited scene is decoded."""
+    want = set(ids)
+    best = None
+    for p in presets:
+        have = {e["id"] for e in p["elements"]}
+        if not want <= have:
+            continue
+        others = [e["id"] for e in p["elements"] if e["id"] not in want]
+        blocked = [e for e in p["elements"] if e["id"] not in want and not e.get("mute_ok")]
+        method = "preset" if not others else "mute" if not blocked else "edit"
+        key = ({"preset": 0, "mute": 1, "edit": 2}[method], len(p["elements"]), p["id"])
+        if best is None or key < best[0]:
+            best = (key, {"method": method, "preset": p["id"], "others": others})
+    return best[1] if best else None
+
+
+def isolation(presets, ids):
+    """(can be isolated by the script alone?, text)."""
+    plan = plan_isolation(presets, ids)
+    if plan is None:
+        return False, "não está em nenhum preset"
+    if plan["method"] == "edit":
+        return False, f"o preset {plan['preset']} não permite silenciar G" + ", G".join(map(str, plan["others"]))
+    return True, ""
+
+
+def build_catalog(info, native=2, stream=None, forced=False, compat=False):
     """Monta todas as opções de Presets e Grupos encontrados ao longo do vídeo (sem isolamento por diferença)."""
     if native not in CICP_CH:
-        raise Fail(f"Layout nativo inválido: {native}. Use 2, 6 ou 19.")
+        raise Fail(f"Layout nativo inválido: {native}. Use 2, 6, 16 ou 19.")
+    cm = (lambda c: 6 if c == 16 else c) if compat else (lambda c: c)
+    native = cm(native)
     pres = info.get("unified_presets") or sorted(info["main"]["presets"], key=lambda p: p["id"])
     groups = info.get("unified_groups") or []
     warnings = []
@@ -2416,44 +2564,81 @@ def build_catalog(info, native=2):
 
     for p in pres:
         names = " + ".join(f"G{e['id']} ({e['name']})" for e in p["elements"])
+        lay, why = option_layout(stream, native, forced, [e["id"] for e in p["elements"]])
+        lay = cm(lay)
+        names = f"{names} · {why}" if why else names
         add(
+            composition=why,
             id=f"preset:{p['id']}",
             family=f"preset:{p['id']}",
             group="presets",
             preset=p["id"],
-            layout=native,
+            layout=lay,
             heuristic=False,
             title=p['name'],
             desc=names or "Preset da transmissão",
-            inputs=[[f"p{p['id']}", native]],
+            inputs=[[f"p{p['id']}", lay]],
             expr=None,
             out="direct",
-            out_ch=CICP_CH[native],
-            src_cicp=native,
-            highlight=[list(range(CICP_CH[native]))],
-            stem=f"Preset_{p['id']}_{slug(p['name'])}_{CICP_NAME[native]}",
+            out_ch=CICP_CH[lay],
+            src_cicp=lay,
+            highlight=[list(range(CICP_CH[lay]))],
+            stem=f"Preset_{p['id']}_{slug(p['name'])}_{CICP_NAME[lay]}",
         )
 
     for g in groups:
         preset_list = ", ".join(f"Preset {pid}" for pid in g["preset_ids"])
+        lay, why = option_layout(stream, native, forced, [g["id"]])
+        lay = cm(lay)
+        plan = plan_isolation(pres, [g["id"]]) or {"method": "preset", "preset": g["carrier_preset"], "others": []}
         add(
+            isolation=plan["method"],
+            iso_preset=plan["preset"],
+            iso_keep=[g["id"]],
+            composition=why,
             id=f"group:{g['id']}",
             family=f"group:{g['id']}",
             group="groups",
             element=g["id"],
             carrier_preset=g["carrier_preset"],
             preset_ids=g["preset_ids"],
-            layout=native,
+            layout=lay,
             heuristic=False,
             title=g['name'],
-            desc=f"Presente em: {preset_list}",
-            inputs=[[f"g{g['id']}", native]],
+            desc=f"Presente em: {preset_list}" + (f" · {why}" if why else "") + ISO_TEXT[plan["method"]],
+            inputs=[[f"g{g['id']}", lay]],
             expr=None,
             out="direct",
-            out_ch=CICP_CH[native],
-            src_cicp=native,
-            highlight=[list(range(CICP_CH[native]))],
-            stem=f"Grupo_{g['id']}_{slug(g['name'])}_{CICP_NAME[native]}",
+            out_ch=CICP_CH[lay],
+            src_cicp=lay,
+            highlight=[list(range(CICP_CH[lay]))],
+            stem=f"Grupo_{g['id']}_{slug(g['name'])}_{CICP_NAME[lay]}",
+        )
+
+    for lid, rid, base in find_lr_pairs(groups):
+        plan = plan_isolation(pres, [lid, rid]) or {"method": "preset", "preset": 0, "others": []}
+        add(
+            id=f"pair:{lid}+{rid}",
+            family=f"pair:{lid}+{rid}",
+            group="groups",
+            elements=[lid, rid],
+            carrier_preset=plan["preset"],
+            isolation=plan["method"],
+            iso_preset=plan["preset"],
+            iso_keep=[lid, rid],
+            preset_ids=sorted({pid for g in groups if g["id"] in (lid, rid) for pid in g["preset_ids"]}),
+            composition="par estéreo L+R",
+            layout=2,
+            heuristic=False,
+            title=f"{base} (L+R)",
+            desc=f"Par estéreo: G{lid} (L) + G{rid} (R)" + ISO_TEXT[plan["method"]],
+            inputs=[[f"m{lid}-{rid}", 2]],
+            expr=None,
+            out="direct",
+            out_ch=2,
+            src_cicp=2,
+            highlight=[[0, 1]],
+            stem=f"Par_{lid}-{rid}_{slug(base)}_2.0",
         )
 
     return {"options": opts, "warnings": warnings, "native": native}
@@ -2463,8 +2648,9 @@ def catalog_public():
     return {str(k): {"name": CICP_NAME[k], "channels": [{"n": n, "az": az, "el": el} for n, az, el in v]} for k, v in LAYOUTS.items()}
 
 
-def load_scene(d, ui, audio, stage="scene", frac_span=(0.0, 1.0)):
+def load_scene(d, ui, audio, stage="scene", frac_span=(0.0, 1.0), quiet=False):
     f0, f1 = frac_span
+    progress = (lambda *a, **k: None) if quiet else globals()["progress"]
     xmlp = d / "scene.xml"
     if not xmlp.is_file() or xmlp.stat().st_size == 0:
         tmp_out = d / "_ui.mp4"
@@ -2503,54 +2689,398 @@ MP_STEPS = [("prepare", "Preparar o áudio e a cena"), ("decode", "Decodificar o
             ("encode", "Gerar os arquivos de áudio (ffmpeg)"), ("mux", "Juntar ao vídeo (MP4Box)"), ("report", "Resumo")]
 
 
-def detect_native_cicp(audio_mp4, ffmpeg=None, mp4box=None):
-    """
-    Detecta o layout CICP nativo (referenceChannelLayout: 2=2.0, 6=5.1, 19=7.1.4)
-    inspecionando a box mhaC / MHAS PACTYP_MPEGH3DAFRAME ou via ffmpeg/MP4Box.
-    """
+class _Bits:
+    """MSB-first bit reader (MPEG-H syntax)."""
+
+    def __init__(self, data):
+        self.b, self.p = data, 0
+
+    def u(self, n):
+        v = 0
+        for _ in range(n):
+            if self.p >> 3 >= len(self.b):
+                raise EOFError
+            v = (v << 1) | ((self.b[self.p >> 3] >> (7 - (self.p & 7))) & 1)
+            self.p += 1
+        return v
+
+    def esc(self, a, b, c):
+        v = self.u(a)
+        if v == (1 << a) - 1:
+            x = self.u(b)
+            v += x
+            if x == (1 << b) - 1:
+                v += self.u(c)
+        return v
+
+
+def _mp4_sample_table(path):
+    """[(file offset, size)] of every sample of the first track (stsz + stsc + stco/co64). Reads only the index, via mmap."""
+    import mmap
+    with open(path, "rb") as f:
+        try:
+            data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        except (ValueError, OSError):
+            return []
+        try:
+            def boxes(s, e):
+                p = s
+                while p + 8 <= e:
+                    sz, t = struct.unpack(">I4s", data[p:p + 8])
+                    h = 8
+                    if sz == 1:
+                        sz, h = struct.unpack(">Q", data[p + 8:p + 16])[0], 16
+                    elif sz == 0:
+                        sz = e - p
+                    if sz < h:
+                        return
+                    yield t, p + h, p + sz
+                    p += sz
+
+            def child(s, e, name):
+                return next(((a, z) for t, a, z in boxes(s, e) if t == name), None)
+
+            rng = (0, len(data))
+            for name in (b"moov", b"trak", b"mdia", b"minf", b"stbl"):
+                rng = child(*rng, name)
+                if rng is None:
+                    return []
+            sizes, stsc, offs = [], [], []
+            for t, x, y in boxes(*rng):
+                if t == b"stsz":
+                    ss, n = struct.unpack(">II", data[x + 4:x + 12])
+                    sizes = [ss] * n if ss else list(struct.unpack(f">{n}I", data[x + 12:x + 12 + 4 * n]))
+                elif t == b"stsc":
+                    n = struct.unpack(">I", data[x + 4:x + 8])[0]
+                    stsc = [struct.unpack(">III", data[x + 8 + 12 * i:x + 20 + 12 * i]) for i in range(n)]
+                elif t in (b"stco", b"co64"):
+                    n = struct.unpack(">I", data[x + 4:x + 8])[0]
+                    w = 4 if t == b"stco" else 8
+                    offs = list(struct.unpack(f">{n}{'I' if w == 4 else 'Q'}", data[x + 8:x + 8 + w * n]))
+        finally:
+            data.close()
+    table, idx = [], 0
+    for ci, off in enumerate(offs, 1):
+        per = [spc for first, spc, _ in stsc if first <= ci][-1] if stsc else 1
+        for _ in range(per):
+            if idx >= len(sizes):
+                return table
+            table.append((off, sizes[idx]))
+            off += sizes[idx]
+            idx += 1
+    return table
+
+
+def _mp4_samples(path, limit):
+    """Yields the bytes of the first `limit` samples of the first track."""
+    table = _mp4_sample_table(path)[:limit]
+    with open(path, "rb") as f:
+        for off, size in table:
+            f.seek(off)
+            yield f.read(size)
+
+
+def mhas_packets(smp):
+    """(type, payload start, length) of the MHAS packets in a sample. Fast path for the usual 16-bit header."""
+    pos, n = 0, len(smp)
+    while n - pos > 2:
+        v = (smp[pos] << 8) | smp[pos + 1]
+        ptype, label, ln = v >> 13, (v >> 11) & 3, v & 0x7FF
+        if ptype == 7 or label == 3 or ln == 0x7FF:             # escaped values: slow path
+            r = _Bits(smp)
+            r.p = pos * 8
+            ptype = r.esc(3, 8, 8)
+            r.esc(2, 8, 32)
+            ln = r.esc(11, 24, 24)
+            start = (r.p + 7) // 8
+        else:
+            start = pos + 2
+        yield ptype, start, ln
+        pos = start + ln
+
+
+def mhas_stream_config(path, limit=600):
+    """Reads the in-band MPEG-H data of an 'mhm1' track (it has no 'mhaC' box): the configuration (MHAS packet 1: reference layout
+    and signal groups = channel beds / objects) and the audio scene info (packet 3: which signals each audio element uses).
+    Returns None when the configuration cannot be read."""
+    cfg = scene = None
+    try:
+        for i, smp in enumerate(_mp4_samples(path, limit)):
+            for ptype, start, ln in mhas_packets(smp):
+                if ptype == 1 and cfg is None:
+                    cfg = _parse_3da_config(smp[start:start + ln], i)
+                    if cfg is None:
+                        return None
+                elif ptype == 3 and cfg is not None and scene is None:
+                    scene = _parse_mae_groups(smp[start:start + ln])
+            if cfg is not None and (scene is not None or i > cfg["sample"] + 200):
+                break
+    except (EOFError, struct.error, OSError, IndexError):
+        pass
+    if cfg is not None:
+        cfg["elements"] = _element_channels(cfg, scene)
+    return cfg
+
+
+def _asi_layout(payload):
+    """Bit positions inside an mae_AudioSceneInfo payload: each group's default on/off bit and each preset condition's reference-ID field."""
+    c = _Bits(payload)
+    if not c.u(1):                                   # not the main stream
+        return None
+    if c.u(1):
+        c.u(8)
+    groups = []
+    for _ in range(c.u(7)):
+        gid = c.u(7)
+        c.u(1)
+        default_pos = c.p
+        c.u(1)
+        pos, gain = c.u(1), c.u(1)
+        if pos:
+            for n in (7, 7, 5, 5, 4, 4):
+                c.u(n)
+        if gain:
+            c.u(6)
+            c.u(5)
+        n = c.u(7) + 1
+        if c.u(1):
+            c.u(7)
+        else:
+            for _ in range(n):
+                c.u(7)
+        groups.append({"id": gid, "default_pos": default_pos})
+    for _ in range(c.u(5)):                          # switch groups
+        c.u(5)
+        if c.u(1):
+            c.u(1)
+        for _ in range(c.u(5) + 1):
+            c.u(7)
+        c.u(7)
+    presets = []
+    for _ in range(c.u(5)):
+        pid = c.u(5)
+        c.u(5)
+        conds = []
+        for _ in range(c.u(4) + 1):
+            ref_pos = c.p
+            ref = c.u(7)
+            if c.u(1):
+                c.u(1)
+                if c.u(1):
+                    c.u(8)
+                c.u(1)
+                if c.u(1):
+                    c.u(8 + 6 + 4)
+            conds.append({"ref": ref, "pos": ref_pos})
+        presets.append({"id": pid, "conds": conds})
+    return {"groups": groups, "presets": presets}
+
+
+def _set_bits(buf, pos, n, val):
+    for i in range(n):
+        bit = (val >> (n - 1 - i)) & 1
+        byte, off = (pos + i) >> 3, 7 - ((pos + i) & 7)
+        buf[byte] = (buf[byte] & ~(1 << off)) | (bit << off)
+
+
+def isolate_stream(src, dst, keep, preset_id):
+    """Writes a copy of an MPEG-H audio MP4 in which preset `preset_id` plays only the audio elements in `keep`.
+
+    The UI manager never lets an element that a preset lists be switched off (a preset always disables on/off for its members), so an element
+    cannot be muted from a script. Instead, in every audio scene info packet: the other groups get default-off, and the preset's conditions that
+    point to them are redirected to an unused group id (the decoder ignores a condition for a group that does not exist). Only fixed-size bit
+    fields change, so the file keeps its size and structure. Returns the number of scene packets edited."""
+    keep = set(keep)
+    shutil.copyfile(src, dst)
+    table = _mp4_sample_table(dst)
+    patched = 0
+    with open(dst, "r+b") as f:
+        for off, size in table:
+            f.seek(off)
+            smp = f.read(size)
+            for ptype, start, ln in mhas_packets(smp):
+                if ptype != 3:
+                    continue
+                payload = bytearray(smp[start:start + ln])
+                try:
+                    lay = _asi_layout(payload)
+                except EOFError:
+                    lay = None
+                if not lay:
+                    continue
+                ids = {g["id"] for g in lay["groups"]}
+                unused = next(i for i in range(127, -1, -1) if i not in ids)
+                for g in lay["groups"]:
+                    if g["id"] not in keep:
+                        _set_bits(payload, g["default_pos"], 1, 0)
+                for p in lay["presets"]:
+                    if p["id"] == preset_id:
+                        for cd in p["conds"]:
+                            if cd["ref"] in ids and cd["ref"] not in keep:
+                                _set_bits(payload, cd["pos"], 7, unused)
+                f.seek(off + start)
+                f.write(bytes(payload))
+                patched += 1
+    return patched
+
+
+def _parse_mae_groups(payload):
+    """mae_AudioSceneInfo, group definitions only: {group id: {"signals": [indices], "position": bool}}."""
+    try:
+        c = _Bits(payload)
+        c.u(1)
+        if c.u(1):
+            c.u(8)
+        out = {}
+        for _ in range(c.u(7)):
+            gid = c.u(7)
+            c.u(2)
+            pos, gain = c.u(1), c.u(1)
+            if pos:
+                for n in (7, 7, 5, 5, 4, 4):
+                    c.u(n)
+            if gain:
+                c.u(6)
+                c.u(5)
+            n = c.u(7) + 1
+            if c.u(1):
+                start = c.u(7)
+                sig = list(range(start, start + n))
+            else:
+                sig = [c.u(7) for _ in range(n)]
+            out[gid] = {"signals": sig, "position": bool(pos)}
+        return out
+    except EOFError:
+        return None
+
+
+def _element_channels(cfg, scene):
+    """{audio element id: {"channels": n, "objects": n}} from the signal groups (signals are numbered group after group)."""
+    if not scene or any(g.get("partial") for g in cfg["groups"]):
+        return None
+    kind, idx = {}, 0
+    for g in cfg["groups"]:
+        for _ in range(g["signals"]):
+            kind[idx] = g["type"]
+            idx += 1
+    res = {}
+    for gid, e in scene.items():
+        ks = [kind.get(x) for x in e["signals"]]
+        if None in ks:
+            return None
+        res[gid] = {"channels": ks.count("channels"), "objects": ks.count("object"), "position": e["position"]}
+    return res
+
+
+def _parse_3da_config(cfg, sample):
+    c = _Bits(cfg)
+
+    def speakers():
+        t = c.u(2)
+        if t == 0:
+            return c.u(6), None
+        n = c.esc(5, 8, 16) + 1
+        if t == 1:
+            for _ in range(n):
+                c.u(7)
+        return None, n
+
+    try:
+        profile = c.u(8)
+        if c.u(5) == 31:
+            c.u(24)
+        c.u(3 + 1 + 1)
+        ref, ref_n = speakers()
+        groups = []
+        for _ in range(c.u(5) + 1):
+            gt, n = c.u(3), c.u(5)
+            if n == 31:
+                n += c.u(8)
+            g = {"type": ("channels", "object", "saoc", "hoa")[gt] if gt < 4 else str(gt), "signals": n + 1}
+            if gt == 0 and c.u(1):
+                g["cicp"], _ = speakers()
+            groups.append(g)
+            if gt > 1:                                   # SAOC/HOA carry extra fields that are not parsed
+                g["partial"] = True
+                break
+    except EOFError:
+        return None
+    return {"profile": profile, "cicp": ref, "ref_speakers": ref_n, "groups": groups, "sample": sample}
+
+
+def describe_stream_config(m):
+    if not m:
+        return ""
+    bed = [g["signals"] for g in m["groups"] if g["type"] == "channels"]
+    obj = sum(g["signals"] for g in m["groups"] if g["type"] == "object")
+    return (f"CICP {m['cicp']}; " if m.get("cicp") else "") + f"{len(m['groups'])} grupo(s) de sinais: " + \
+        (f"{' + '.join(map(str, bed))} canais" if bed else "sem canais") + (f", {obj} objeto(s)" if obj else "")
+
+
+def detect_native_info(audio_mp4, ffmpeg=None, mp4box=None):
+    """-> (supported CICP used for rendering, {"source", "cicp", "config", "note"}). Order: mhaC box, in-band MHAS config,
+    ffmpeg (only when it reports channels), MP4Box, then 2.0 as a last resort (with a note)."""
+    info = {"source": None, "cicp": None, "config": None, "elements": None, "note": ""}
+
+    def pick(cicp, channels=None):
+        if cicp in CICP_CH:
+            return cicp
+        n = channels or 0
+        best = max((k for k, v in CICP_CH.items() if v <= n), default=2) if n else 2
+        info["note"] = (f"O layout do stream (CICP {cicp}{f', {n} canais' if n else ''}) não é um dos que a renderização suporta ({', '.join(CICP_NAME.values())}); "
+                        f"usando {CICP_NAME[best]} (o decoder faz o downmix). Para outro, use --native-layout.")
+        return best
+
+    try:
+        with open(audio_mp4, "rb") as f:
+            buf = f.read(8 * 1024 * 1024)
+        idx = buf.find(b"mhaC")
+        if idx != -1 and idx + 10 <= len(buf):
+            ref = buf[idx + 6] & 0x3F
+            info.update(source="mhaC", cicp=ref)
+            return pick(ref), info
+    except OSError:
+        pass
+
+    m = mhas_stream_config(audio_mp4)
+    if m and m.get("cicp"):
+        bed = sum(g["signals"] for g in m["groups"] if g["type"] == "channels")
+        info.update(source="MHAS", cicp=m["cicp"], config=m, elements=m.get("elements"))
+        return pick(m["cicp"], bed or None), info
+
     if ffmpeg:
         try:
-            r = sp_run([ffmpeg, "-hide_banner", "-i", str(audio_mp4)],
-                               capture_output=True, text=True, errors="replace", timeout=15, **NOWIN)
+            r = sp_run([ffmpeg, "-hide_banner", "-i", str(audio_mp4)], capture_output=True, text=True, errors="replace", timeout=15, **NOWIN)
             err = r.stderr or ""
-            if re.search(r"Audio:.*?(7\.1\.4|12 channels|11\.1)", err, re.I):
-                return 19
-            if re.search(r"Audio:.*?(5\.1|6 channels)", err, re.I):
-                return 6
-            if re.search(r"Audio:.*?(stereo|2 channels|2\.0)", err, re.I):
-                return 2
+            for rx, val in ((r"Audio:.*?(7\.1\.4|12 channels|11\.1)", 19), (r"Audio:.*?(5\.1|6 channels)", 6), (r"Audio:.*?(stereo|2 channels|2\.0)", 2)):
+                if re.search(rx, err, re.I):
+                    info.update(source="ffmpeg", cicp=val)
+                    return val, info
         except Exception:
             pass
 
     if mp4box:
         try:
-            r = sp_run([mp4box, "-info", str(audio_mp4)],
-                               capture_output=True, text=True, errors="replace", timeout=15, **NOWIN)
-            info_txt = (r.stdout or "") + "\n" + (r.stderr or "")
-            m = re.search(r"(?:ChannelLayout|referenceChannelLayout|Channels)\s*[:=]\s*([^\r\n]+)", info_txt, re.I)
-            if m:
-                val = m.group(1).strip().lower()
-                if "19" in val or "7.1.4" in val or "12" in val:
-                    return 19
-                if "6" in val or "5.1" in val:
-                    return 6
-                if "2" in val or "stereo" in val:
-                    return 2
+            r = sp_run([mp4box, "-info", str(audio_mp4)], capture_output=True, text=True, errors="replace", timeout=15, **NOWIN)
+            mm = re.search(r"(?:ChannelLayout|referenceChannelLayout|Channels)\s*[:=]\s*([^\r\n]+)", (r.stdout or "") + "\n" + (r.stderr or ""), re.I)
+            if mm:
+                val = mm.group(1).strip().lower()
+                v = 19 if ("19" in val or "7.1.4" in val or "12" in val) else 6 if ("6" in val or "5.1" in val) else 2 if ("2" in val or "stereo" in val) else None
+                if v:
+                    info.update(source="MP4Box", cicp=v)
+                    return v, info
         except Exception:
             pass
 
-    try:
-        with open(audio_mp4, "rb") as f:
-            buf = f.read(256 * 1024)
-        idx = buf.find(b"mhaC")
-        if idx != -1 and idx + 10 <= len(buf):
-            ref_cicp = buf[idx + 6] & 0x3F
-            if ref_cicp in CICP_CH:
-                return ref_cicp
-    except Exception:
-        pass
+    info["note"] = ("Não foi possível descobrir o layout nativo do stream; assumindo 2.0. Se o áudio for multicanal, informe --native-layout (6 = 5.1, 16 = 5.1.4, 19 = 7.1.4).")
+    return 2, info
 
-    return 2
+
+def detect_native_cicp(audio_mp4, ffmpeg=None, mp4box=None):
+    cicp, info = detect_native_info(audio_mp4, ffmpeg, mp4box)
+    if info["note"]:
+        note(info["note"])
+    return cicp
 
 
 def do_scan(a):
@@ -2578,10 +3108,15 @@ def do_scan(a):
     step("scene", "done", f"{len(states)} estado(s) de cena")
     step("catalog", "running")
     progress("catalog", 0.2, "Detectando layout nativo do stream…", force=True)
-    detected_cicp = detect_native_cicp(audio_mp4, ffmpeg_opt, mp4box)
+    detected_cicp, det = detect_native_info(audio_mp4, ffmpeg_opt, mp4box)
     use_layout = detected_cicp if (not a.native_layout or int(a.native_layout) == 0) else int(a.native_layout)
-    cat = build_catalog(info, use_layout)
+    compat = bool(getattr(a, "compat_51", False))
+    cat = build_catalog(info, use_layout, det, bool(a.native_layout), compat)
     warns = list(cat["warnings"])
+    if det["note"]:
+        warns.append(det["note"])
+    if compat:
+        warns.append("Modo de compatibilidade: tudo o que seria CICP 16 (5.1.4) é renderizado como 5.1.")
     if info["has_differences"]:
         warns.append("A configuração de áudio (AudioSceneConfig) muda ao longo do vídeo. Confira no gráfico abaixo a disponibilidade de cada preset e grupo.")
     scan = {
@@ -2600,6 +3135,8 @@ def do_scan(a):
         "options": cat["options"],
         "native": cat["native"],
         "detected_native": detected_cicp,
+        "stream_layout": {"source": det["source"], "cicp": det["cicp"], "groups": (det["config"] or {}).get("groups"),
+                          "text": describe_stream_config(det["config"])},
         "warnings": warns,
         "layouts": catalog_public(),
         "formats": {k: {"label": v["label"], "br": v["br"]} for k, v in FORMATS.items()},
@@ -2611,15 +3148,35 @@ def do_scan(a):
 
 
 def print_catalog(scan):
+    sl = scan.get("stream_layout") or {}
     say(bold(f"Layout detectado no stream: {CICP_NAME.get(scan.get('detected_native', 2), '2.0')} (usando {CICP_NAME.get(scan.get('native', 2), '2.0')})"))
+    if sl.get("text"):
+        say(f"Configuração lida do stream ({sl.get('source')}): {sl['text']}")
+    opt = {o["id"]: o for o in scan.get("options", [])}
+
+    def lay(oid):
+        o = opt.get(oid)
+        if not o:
+            return ""
+        comp = f"; origem: {o['composition']}" if o.get("composition") else ""
+        return f" · saída {CICP_NAME.get(o['layout'], '?')} ({o['out_ch']} canais{comp})"
+
     say(bold("Presets encontrados no vídeo:"))
     for p in scan.get("presets", []):
         els = ", ".join(f"G{e['id']} ({e['name']})" for e in p.get("elements", []))
-        say(f"  --option preset:{p['id']}   → Preset {p['id']}: {p['name']} [{els}]")
+        say(f"  --option preset:{p['id']}   → Preset {p['id']}: {p['name']} [{els}]{lay('preset:' + str(p['id']))}")
     say(bold("Grupos (Audio Elements) encontrados no vídeo:"))
     for g in scan.get("groups", []):
         prs = ", ".join(f"P{pid}" for pid in g.get("preset_ids", []))
-        say(f"  --option group:{g['id']}    → Grupo {g['id']}: {g['name']} (em {prs})")
+        o = opt.get("group:" + str(g["id"]))
+        iso = "" if not o or o.get("isolation") != "edit" else "  [isolado editando a cena]"
+        say(f"  --option group:{g['id']}    → Grupo {g['id']}: {g['name']} (em {prs}){lay('group:' + str(g['id']))}{iso}")
+    pairs = [o for o in scan.get("options", []) if o["id"].startswith("pair:")]
+    if pairs:
+        say(bold("Pares estéreo (L/R) identificados pelo nome:"))
+        for o in pairs:
+            iso = "" if o.get("isolation") != "edit" else "  [isolado editando a cena]"
+            say(f"  --option {o['id']}   → {o['title']}: {o['desc']}{iso}")
 
 
 def cmd_mpegh_scan(a):
@@ -2635,7 +3192,8 @@ def action_script_for_target(path, states, target_kind, target_id, carrier_pid, 
     Gera o script de ActionEvent para um Preset ou Grupo ao longo das mudanças de cena.
     - Só emite ActionEvent nos estados de cena onde há presets válidos (evitando erro 440039 em cenas vazias).
     - Usa o UUID de cada cena em que o preset aparece.
-    - Para grupos ('g'), seleciona o preset portador que contém o grupo naquela cena e atenua os demais elementos.
+    - Para grupos ('g') e conjuntos de grupos ('m'), seleciona o preset portador que contém o(s) grupo(s) e silencia (ação 40) os demais elementos.
+      O decoder só obedece se o preset permitir silenciar o elemento (elemento interativo com muting permitido).
     """
     lines = []
     pos = 0
@@ -2655,11 +3213,16 @@ def action_script_for_target(path, states, target_kind, target_id, carrier_pid, 
             use_pid = target_id if target_id in avail_by_id else st["presets"][0]["id"]
             other_eids = []
         else:
-            candidates = [p for p in st["presets"] if any(e["id"] == target_id for e in p["elements"])]
+            want = set(target_id if isinstance(target_id, (list, tuple, set)) else [target_id])
+            candidates = [p for p in st["presets"] if want <= {e["id"] for e in p["elements"]}]
             if candidates:
-                best_p = min(candidates, key=lambda p: (len(p["elements"]), p["id"]))
+                # prefer a preset whose other elements can be muted (or that has none), then the smallest one
+                def cost(p):
+                    others = [e for e in p["elements"] if e["id"] not in want]
+                    return (sum(1 for e in others if not e.get("mute_ok")), len(p["elements"]), p["id"])
+                best_p = min(candidates, key=cost)
                 use_pid = best_p["id"]
-                other_eids = [e["id"] for e in best_p["elements"] if e["id"] != target_id]
+                other_eids = [e["id"] for e in best_p["elements"] if e["id"] not in want]
             else:
                 use_pid = carrier_pid if carrier_pid in avail_by_id else st["presets"][0]["id"]
                 other_eids = []
@@ -2678,13 +3241,13 @@ def action_script_for_target(path, states, target_kind, target_id, carrier_pid, 
             ("actionType", 30),
             ("paramInt", use_pid),
         ]))
-        for oe in other_eids:
+        for oe in other_eids:                     # 40 = IIS_UIM_CMD_AUDIO_ELEMENT_MUTING_CHANGED (the only documented way to switch an element off)
             lines.append(_xml_el("ActionEvent", [
                 ("uuid", uuid),
                 ("version", ver),
-                ("actionType", 32),
+                ("actionType", 40),
                 ("paramInt", oe),
-                ("paramFloat", "-64.0"),
+                ("paramBool", "true"),
             ]))
 
     if not lines:
@@ -2771,7 +3334,7 @@ def wav_info(path, fallback_ch=2, fallback_rate=48000, fallback_bps=3):
 
 def _create_silence_wav(ffmpeg, out_wav, duration_s, cicp):
     ch = CICP_CH[cicp]
-    layout = {2: "stereo", 6: "5.1", 19: "12c"}.get(cicp, f"{ch}c")
+    layout = FF_LAYOUT.get(cicp, f"{ch}c")
     cmd = [
         ffmpeg, "-hide_banner", "-y", "-v", "error",
         "-f", "lavfi", "-i", f"anullsrc=channel_layout={layout}:sample_rate=48000",
@@ -2857,7 +3420,7 @@ def decode_one(dec, ffmpeg, mp4box, audio, wav, cicp, script, states, target_kin
                             if t_secs >= 0.5:
                                 gap_s = max(0.0, resume_sec - secs)
                                 ch = CICP_CH[cicp]
-                                layout = {2: "stereo", 6: "5.1", 19: "12c"}.get(cicp, f"{ch}c")
+                                layout = FF_LAYOUT.get(cicp, f"{ch}c")
                                 if gap_s > 0.02:
                                     fc = "[0:a][1:a][2:a]concat=n=3:v=0:a=1,apad[out]"
                                     cmd_m = [
@@ -2919,7 +3482,7 @@ def decode_one(dec, ffmpeg, mp4box, audio, wav, cicp, script, states, target_kin
                         t_secs, _ = wav_info(tail_wav, fallback_ch=CICP_CH[cicp])
                         if t_secs >= 0.5:
                             ch = CICP_CH[cicp]
-                            layout = {2: "stereo", 6: "5.1", 19: "12c"}.get(cicp, f"{ch}c")
+                            layout = FF_LAYOUT.get(cicp, f"{ch}c")
                             cmd_m = [
                                 ffmpeg, "-hide_banner", "-y", "-v", "error",
                                 "-f", "lavfi", "-t", f"{first_valid_sec:.3f}", "-i", f"anullsrc=channel_layout={layout}:sample_rate=48000",
@@ -2948,7 +3511,7 @@ def decode_one(dec, ffmpeg, mp4box, audio, wav, cicp, script, states, target_kin
 
 def parse_opt_spec(spec: str):
     """Aceita 'preset:0=eac3:640k' ou 'group:5=aac'."""
-    m = re.fullmatch(r"([A-Za-z0-9:_.-]+?)(?:=([a-z0-9]+)(?::(\d{2,4}k))?)?", spec.strip())
+    m = re.fullmatch(r"([A-Za-z0-9:_.+-]+?)(?:=([a-z0-9]+)(?::(\d{2,4}k))?)?", spec.strip())
     if not m:
         raise Fail(f"Opção inválida: {spec}")
     return m.group(1), m.group(2), m.group(3)
@@ -3038,8 +3601,16 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
     dur = media_duration(ffmpeg, audio)
     total_frames = int(dur / MPEGH_FRAME_S) if dur else None
     info = analyze_scenes(states, total_frames)
-    use_layout = detect_native_cicp(audio, ffmpeg, mp4box) if (not a.native_layout or int(a.native_layout) == 0) else int(a.native_layout)
-    cat = build_catalog(info, use_layout)
+    forced = bool(a.native_layout) and int(a.native_layout) != 0
+    use_layout, det = detect_native_info(audio, ffmpeg, mp4box)
+    if forced:
+        use_layout = int(a.native_layout)
+    elif det["note"]:
+        note(det["note"])
+    compat = bool(getattr(a, "compat_51", False))
+    cat = build_catalog(info, use_layout, det, forced, compat)
+    if compat:
+        use_layout = cat["native"]
 
     if info["has_differences"]:
         note("A configuração de áudio (AudioSceneConfig) muda ao longo do vídeo.")
@@ -3103,7 +3674,7 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
     mon_thread.start()
 
     # Assinatura dos parâmetros de decodificação para validar o checkpoint .done
-    dec_sig = f"src={src_sig(src)['size']}:{src_sig(src)['mtime_ns']}|dse={a.drc_effect}|rl={a.target_loudness}|sm={a.sleep_mode}|ver={a.uim_version}"
+    dec_sig = f"src={src_sig(src)['size']}:{src_sig(src)['mtime_ns']}|dse={a.drc_effect}|rl={a.target_loudness}|sm={a.sleep_mode}|ver={a.uim_version}|act=41"
     pending_bytes = sum(eb for _, wp, eb in expected_targets if not (wp.with_suffix(".wav.done").is_file() and wp.is_file()))
     check_free_space(tmp, int(pending_bytes * 1.05) + (64 << 20), "the decoded audio (WAV 24-bit)")
 
@@ -3126,18 +3697,34 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
 
         # Remove eventual WAV incompleto da tentativa anterior antes de recomeçar este item
         wav.unlink(missing_ok=True)
-        target_kind = "p" if tag.startswith("p") else "g"
-        target_id = int(tag[1:])
-        carrier_pid = opt.get("carrier_preset", target_id)
+        target_kind = tag[0]                                    # p = preset, g = one group, m = several groups (e.g. an L/R pair)
+        target_id = [int(x) for x in tag[1:].split("-")] if target_kind == "m" else int(tag[1:])
+        carrier_pid = opt.get("carrier_preset", target_id if target_kind != "m" else target_id[0])
+        job_audio, job_states, iso_dir = audio, states, None
+        if opt.get("isolation") == "edit" and target_kind in "gm":
+            # the preset does not let its elements be muted: decode a temporary copy whose scene plays only the wanted elements
+            iso_dir = tmp / f"iso_{tag}"
+            iso_dir.mkdir(parents=True, exist_ok=True)
+            (iso_dir / TMP_MARK).write_text("dtv_tools temporary folder\n")
+            job_audio = iso_dir / "audio.mp4"
+            check_free_space(iso_dir, audio.stat().st_size + (64 << 20), "the edited copy of the audio")
+            if isolate_stream(audio, job_audio, opt["iso_keep"], opt["iso_preset"]) == 0:
+                raise Fail(f"Não consegui editar a cena de áudio para isolar {opt['title']}.")
+            job_states = load_scene(iso_dir, ui, job_audio, quiet=True)
+            target_kind, target_id, carrier_pid = "p", opt["iso_preset"], opt["iso_preset"]
         script_path = tmp / f"script_{tag}.xml"
-        has_script = action_script_for_target(
-            script_path, states, target_kind, target_id, carrier_pid, a.uim_version, a.sleep_mode
-        )
-        res = decode_one(
-            dec, ffmpeg, mp4box, audio, wav, cicp,
-            script_path if has_script else None,
-            states, target_kind, target_id, carrier_pid, dur, a
-        )
+        try:
+            has_script = action_script_for_target(
+                script_path, job_states, target_kind, target_id, carrier_pid, a.uim_version, a.sleep_mode
+            )
+            res = decode_one(
+                dec, ffmpeg, mp4box, job_audio, wav, cicp,
+                script_path if has_script else None,
+                job_states, target_kind, target_id, carrier_pid, dur, a
+            )
+        finally:
+            if iso_dir is not None and not a.keep_temp:
+                safe_rmtree(iso_dir)
         done_marker.write_text(json.dumps({"sig": dec_sig, "res": res}, ensure_ascii=False), encoding="utf-8")
         return (tag, cicp), wav, res, False
 
@@ -5003,10 +5590,18 @@ def build_transcode_cmd(ff, src, out, a, hdr, size, use_lcevc, n_src_audio, item
     cmd += ["-vf", ("lcevc," if use_lcevc else "") + f"setparams={HDR10_TAGS}"]
     if size:
         cmd += ["-s", size]
-    cmd += ["-c:v", "libx265"]
-    if a.preset:
-        cmd += ["-preset", a.preset]
-    cmd += ["-crf", str(a.crf), "-pix_fmt", "yuv420p10le", "-x265-params", ":".join(xp), "-tag:v", "hvc1"]
+    if getattr(a, "encoder", "x265") == "nvenc":                       # GPU: no x265 params; HDR10 SEI depends on frame side data
+        pr = a.preset if re.fullmatch(r"p[1-7]", a.preset or "") else "p5"
+        cmd += ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le", "-preset", pr, "-tune", "hq",
+                "-rc", "vbr", "-cq", str(int(round(a.crf))), "-b:v", "0", "-multipass", "fullres",
+                "-bf", "3", "-b_ref_mode", "middle", "-tag:v", "hvc1"]
+        if a.nvenc_params:
+            cmd += shlex.split(a.nvenc_params)
+    else:
+        cmd += ["-c:v", "libx265"]
+        if a.preset:
+            cmd += ["-preset", a.preset]
+        cmd += ["-crf", str(a.crf), "-pix_fmt", "yuv420p10le", "-x265-params", ":".join(xp), "-tag:v", "hvc1"]
     if MUX_FORMATS.get(out.suffix.lower()) in ("mp4", "mov"):
         cmd += ["-movflags", "+faststart"]
     cmd += ["-c:a", "copy"] if (a.audio != "none" and (items or n_src_audio)) else ["-an"]
@@ -5041,6 +5636,12 @@ def cmd_transcode(a):
     v = info["video"]
     say(f"Entrada: {v['codec']} {v['size'] or '?'} @ {v['fps'] or '?'} fps · {len(info['audio'])} trilha(s) de áudio "
         f"({', '.join(x['codec'] for x in info['audio']) or 'nenhuma'}) · {fmt_hms(info['duration'] or 0)}")
+    if a.encoder == "nvenc":
+        r = subprocess.run([ff, "-hide_banner", "-encoders"], capture_output=True, text=True, errors="replace", **NOWIN)
+        if "hevc_nvenc" not in (r.stdout or ""):
+            raise Fail("Este ffmpeg não tem o codificador hevc_nvenc (precisa de um build com NVENC, GPU NVIDIA e driver). Use --encoder x265.")
+        note("NVENC: o hevc_nvenc não aceita parâmetros do x265; os metadados HDR10 (mastering display / MaxCLL) só saem no arquivo "
+             "se vierem nos quadros de entrada. Confira a saída com ffprobe -show_frames.")
     hdr = probe_hdr10(ff, src)
     say(f"HDR10: {hdr10_summary(hdr)}")
     measured = verify_enhancement(ff, str(src), a.verify_frames) if use_lcevc else None
@@ -5262,7 +5863,7 @@ def tone_curve(name, x, peak):
     return np.where(x <= j, x, (b * b + 2 * b * j + j * j) / (b - a) * (x + a) / (x + b))
 
 
-def tonemap_sdr(rgb16, hdr, algo, white, peak_nits, exposure=0.0, desat=0.0, saturation=1.0):
+def tonemap_sdr(rgb16, hdr, algo, white, peak_nits, exposure=0.0, desat=2.0, saturation=1.0):
     """
     PQ BT.2020 (uint16, full range) -> 8-bit sRGB/BT.709. The curve acts on max(R,G,B) (hue-preserving).
     white: HDR nits that become SDR white (higher = darker image); exposure: stops; desat: highlight desaturation
@@ -5454,7 +6055,6 @@ HELP_TEXTS = {
     "*": {"--overwrite": "replace existing output files instead of using a free name",
           "-v": "show the external commands that are run", "--no-color": "plain output, no colours",
           "--ascii": "plain output, no Unicode symbols", "--keep-temp": "keep the intermediate files",
-          "--progress-json": "machine-readable events (@@DTV lines) for the web interface",
           "--outdir": "output folder (default: next to the input)",
           "--cache-dir": "folder of the MPEG-H analysis cache (default: <system temp>/dtv_audio_cache)"},
     "ts-tv3": {"--outputs": "single, dual or single,dual (default: both)", "--program": "program number (default: the first in the PAT)",
@@ -5467,7 +6067,7 @@ HELP_TEXTS = {
                     "--jobs": "parallel decoders (0 = automatic)",
                     "--mux": "none (audio files only), add (files and a copy of the MP4 with the audio tracks) or only (just the MP4)",
                     "--audio-delay": "delay in ms for the tracks added by --mux (default 0)", **_MP_HELP},
-    "transcode": {"--crf": "x265 CRF (default 18)", "--container": "auto (MP4, or MKV when PCM/FLAC tracks need it), mp4 or mkv", **_MP_HELP},
+    "transcode": {"--crf": "x265 CRF (default 18); with --encoder nvenc it is the CQ value (try 22)", "--container": "auto (MP4, or MKV when PCM/FLAC tracks need it), mp4 or mkv", **_MP_HELP},
     "frame": {"--jpg-quality": "JPEG quality, 1-95 (default 95)", "--avif-crf": "AVIF quality (libaom CRF; default 18)"},
     "sdr": {"-o": "base name of the output (default: the PNG name without _hdr)", "--jpg-quality": "JPEG quality, 1-95 (default 95)"},
 }
@@ -5499,12 +6099,17 @@ def build_parser():
             sp.add_argument("--mpegh-ui", default="", metavar="PATH", help="mpeghUiManager executable")
             sp.add_argument("--mpegh-decoder", default="", metavar="PATH", help="mpeghDecoder executable")
 
+    def machine_flags(sp):
+        sp.add_argument("--json", action="store_true", help="protocol v2: stdout carries only JSON Lines events (see docs/PROTOCOL.md)")
+        sp.add_argument("--control", action="store_true", help="read control commands on stdin (STOP / {\"cmd\":\"stop\"}); closing stdin also stops")
+        sp.add_argument("--progress-json", action="store_true", help=argparse.SUPPRESS)   # legacy: '@@DTV {json}' lines mixed with text
+
     def common_flags(sp):
         tool_flags(sp)
         sp.add_argument("--ffprobe", default="", help=argparse.SUPPRESS)  # accepted for compatibility, not used
         sp.add_argument("--tmpdir", "--tmp-dir", default="", help="base folder for intermediates (a private sub-folder is created inside it)")
         sp.add_argument("--keep-temp", action="store_true", help="keep the intermediate files")
-        sp.add_argument("--progress-json", action="store_true", help="machine-readable events (@@DTV lines) for the web interface")
+        machine_flags(sp)
         sp.add_argument("-v", "--verbose", action="store_true")
         sp.add_argument("--no-color", action="store_true")
         sp.add_argument("--ascii", action="store_true")
@@ -5528,7 +6133,8 @@ def build_parser():
     s_scan.add_argument("input")
     s_scan.add_argument("--mpegh-ui", default="", metavar="PATH", help="mpeghUiManager executable")
     s_scan.add_argument("--mpegh-decoder", default="", help=argparse.SUPPRESS)  # accepted for compatibility, not used
-    s_scan.add_argument("--native-layout", type=int, default=0, help="0=auto (detect from the stream), 2=2.0, 6=5.1, 19=7.1.4")
+    s_scan.add_argument("--native-layout", type=int, default=0, help="0=auto (detect from the stream), 2=2.0, 6=5.1, 16=5.1.4, 19=7.1.4")
+    s_scan.add_argument("--compat-51", action="store_true", help="compatibility mode: whatever is CICP 16 (5.1.4) is rendered as 5.1")
     s_scan.add_argument("--cache-dir", default="")
     common_flags(s_scan)
 
@@ -5537,7 +6143,8 @@ def build_parser():
     s_aud.add_argument("--option", action="append", default=[])
     s_aud.add_argument("--mpegh-ui", default="", metavar="PATH", help="mpeghUiManager executable")
     s_aud.add_argument("--mpegh-decoder", default="", metavar="PATH", help="mpeghDecoder executable")
-    s_aud.add_argument("--native-layout", type=int, default=0, help="0=auto (detect from the stream), 2=2.0, 6=5.1, 19=7.1.4")
+    s_aud.add_argument("--native-layout", type=int, default=0, help="0=auto (detect from the stream), 2=2.0, 6=5.1, 16=5.1.4, 19=7.1.4")
+    s_aud.add_argument("--compat-51", action="store_true", help="compatibility mode: whatever is CICP 16 (5.1.4) is rendered as 5.1")
     s_aud.add_argument("--jobs", type=int, default=0)
     s_aud.add_argument("--mux", default="none")
     s_aud.add_argument("--audio-delay", default="0")
@@ -5561,7 +6168,7 @@ def build_parser():
     s_cut.add_argument("--no-av-fix", "--sem-ajuste-av", dest="no_av_fix", action="store_true",
                        help="only measure the A/V sync after the cut, do not fix the output edit list")
     s_cut.add_argument("--overwrite", action="store_true")
-    s_cut.add_argument("--progress-json", action="store_true")
+    machine_flags(s_cut)
     s_cut.add_argument("-v", "--verbose", action="store_true")
     s_cut.add_argument("--no-color", action="store_true")
     s_cut.add_argument("--ascii", action="store_true")
@@ -5587,7 +6194,7 @@ def build_parser():
     s_dash.add_argument("--overwrite", action="store_true")
     s_dash.add_argument("--tmpdir", "--tmp-dir", default="", help="base folder for temporary files (default: --save-dir)")
     s_dash.add_argument("--keep-temp", action="store_true")
-    s_dash.add_argument("--progress-json", action="store_true")
+    machine_flags(s_dash)
     s_dash.add_argument("-v", "--verbose", action="store_true")
     s_dash.add_argument("--no-color", action="store_true")
     s_dash.add_argument("--ascii", action="store_true")
@@ -5598,7 +6205,7 @@ def build_parser():
         sp.add_argument("--white-nits", type=float, default=203.0, help="HDR nits that become SDR white (higher = darker; default 203)")
         sp.add_argument("--peak-nits", type=float, default=0, help="HDR peak for the roll-off (default: MaxCLL, else mastering max)")
         sp.add_argument("--exposure", type=float, default=0.0, help="stops added before tone mapping (negative = darker)")
-        sp.add_argument("--desat", type=float, default=0.0, help="highlight desaturation, 0 = off (default 0)")
+        sp.add_argument("--desat", type=float, default=2.0, help="highlight desaturation, 0 = off (default 2, like ffmpeg tonemap)")
         sp.add_argument("--saturation", type=float, default=1.0, help="final saturation multiplier (e.g. 0.85 = less vivid)")
         sp.add_argument("--jpg-quality", type=int, default=95)
 
@@ -5613,8 +6220,12 @@ def build_parser():
     s_tc = sub.add_parser("transcode", help="single-track MP4 -> HEVC 10-bit HDR10 with every MPEG-H preset as an audio track")
     video_input_flags(s_tc)
     s_tc.add_argument("-o", "--output", default="", help="output file (default: <name>_hevc_hdr10.mp4 / .mkv)")
-    s_tc.add_argument("--crf", type=float, default=18)
-    s_tc.add_argument("--preset", default="", help="x265 preset (default: not passed, x265 decides)")
+    s_tc.add_argument("--encoder", choices=("x265", "nvenc"), default="x265",
+                      help="video encoder: x265 (CPU, default) or nvenc (NVIDIA GPU, hevc_nvenc)")
+    s_tc.add_argument("--crf", type=float, default=18, help="x265 CRF; with --encoder nvenc it is used as the CQ value (try 22)")
+    s_tc.add_argument("--preset", default="", help="x265 preset (ultrafast..placebo) or NVENC preset (p1..p7); default: encoder decides")
+    s_tc.add_argument("--nvenc-params", default="", metavar="'-opt val ...'",
+                      help="extra hevc_nvenc options appended as-is, e.g. '-spatial-aq 1 -rc-lookahead 32'")
     s_tc.add_argument("--x265-params", default="", metavar="K=V:K=V", help="extra x265 parameters appended to the HDR10 ones")
     s_tc.add_argument("--verify-frames", type=int, default=48, help="frames decoded by the LCEVC verification (default: 48)")
     s_tc.add_argument("--limit", type=float, default=0, metavar="SEC", help="encode only the first SEC seconds (quick test; the audio is still rendered in full)")
@@ -5627,7 +6238,8 @@ def build_parser():
     s_tc.add_argument("--audio-delay", default="auto", metavar="auto|MS", help="rendered audio offset; auto = start of the original track")
     s_tc.add_argument("--original-audio", choices=("keep", "drop"), default="keep", help="also keep the original MPEG-H track (last)")
     s_tc.add_argument("--container", choices=("auto", "mp4", "mkv"), default="auto")
-    s_tc.add_argument("--native-layout", type=int, default=0, help="0=auto (detect from the stream), 2=2.0, 6=5.1, 19=7.1.4")
+    s_tc.add_argument("--native-layout", type=int, default=0, help="0=auto (detect from the stream), 2=2.0, 6=5.1, 16=5.1.4, 19=7.1.4")
+    s_tc.add_argument("--compat-51", action="store_true", help="compatibility mode: whatever is CICP 16 (5.1.4) is rendered as 5.1")
     s_tc.add_argument("--jobs", type=int, default=0, help="parallel decoders (0 = automatic)")
     s_tc.add_argument("--drc-effect", default="0")
     s_tc.add_argument("--target-loudness", default="")
@@ -5657,18 +6269,23 @@ def build_parser():
     s_sdr.add_argument("-o", "--output", default="")
     s_sdr.add_argument("--sdr", default="png", help="png and/or jpg")
     s_sdr.add_argument("--overwrite", action="store_true")
-    s_sdr.add_argument("--progress-json", action="store_true")
+    machine_flags(s_sdr)
     s_sdr.add_argument("-v", "--verbose", action="store_true")
     s_sdr.add_argument("--no-color", action="store_true")
     s_sdr.add_argument("--ascii", action="store_true")
     tone_flags(s_sdr)
 
     s_doc = sub.add_parser("doctor", help="check the external programs and Python modules")
-    s_doc.add_argument("--progress-json", action="store_true")
+    machine_flags(s_doc)
     s_doc.add_argument("-v", "--verbose", action="store_true")
     s_doc.add_argument("--no-color", action="store_true")
     s_doc.add_argument("--ascii", action="store_true")
     tool_flags(s_doc, ("mp4box", "ffmpeg", "mpegh"))
+
+    s_desc = sub.add_parser("describe", help="print the capabilities of this script as JSON (commands, options, tools, formats, layouts)")
+    s_desc.add_argument("--no-color", action="store_true", help=argparse.SUPPRESS)
+    s_desc.add_argument("--ascii", action="store_true", help=argparse.SUPPRESS)
+    s_desc.add_argument("-v", "--verbose", action="store_true", help=argparse.SUPPRESS)
 
     fill_missing_help(sub)
     return p
@@ -5678,18 +6295,170 @@ def _term_to_interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
+def _fix_stdio():
+    """A frozen Windows executable without a console may have a None/null sys.stdout or sys.stdin even with inherited pipes."""
+    def broken(f):
+        return f is None or not hasattr(f, "fileno") or type(f).__name__ == "NullWriter"
+    try:
+        if broken(sys.stdout):
+            sys.stdout = io.TextIOWrapper(os.fdopen(1, "wb", buffering=0, closefd=False), encoding="utf-8", errors="replace", line_buffering=True)
+        if broken(sys.stderr):
+            sys.stderr = io.TextIOWrapper(os.fdopen(2, "wb", buffering=0, closefd=False), encoding="utf-8", errors="replace", line_buffering=True)
+        if broken(sys.stdin):
+            sys.stdin = io.TextIOWrapper(os.fdopen(0, "rb", closefd=False), encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+
+
+def _utf8_stdio():
+    for f in (sys.stdout, sys.stderr):
+        try:
+            f.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def _frozen_env():
+    """PyInstaller's Linux bootloader rewrites LD_LIBRARY_PATH; MP4Box/ffmpeg must not inherit that."""
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+        orig = os.environ.get("LD_LIBRARY_PATH_ORIG")
+        if orig is not None:
+            os.environ["LD_LIBRARY_PATH"] = orig
+        else:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+
+
+def _control_command(line):
+    """'STOP' or {"cmd":"stop"} -> "STOP"; anything else -> ""."""
+    t = line.strip()
+    if not t:
+        return ""
+    if t.startswith("{"):
+        try:
+            return str(json.loads(t).get("cmd", "")).upper()
+        except ValueError:
+            return ""
+    return t.upper()
+
+
+def _control_poll(peek, read, sleep=time.sleep, interval=0.1):
+    """Windows: never block in ReadFile on the stdin pipe. A pending synchronous read keeps that handle locked, and anything else
+    that touches it in the meantime (importing numpy, starting a child process...) hangs. So: ask how many bytes are waiting
+    (PeekNamedPipe) and read only those. peek() -> bytes available, raises EOFError when the other end closed; read(n) -> bytes."""
+    buf = b""
+    while True:
+        try:
+            n = peek()
+        except EOFError:
+            return
+        if n:
+            buf += read(n)
+            *lines, buf = buf.split(b"\n")
+            if any(_control_command(ln.decode("utf-8", "replace")) == "STOP" for ln in lines):
+                return
+        else:
+            sleep(interval)
+
+
+def start_control_reader():
+    """--control: a controlling program talks to us on stdin. 'STOP' or {"cmd":"stop"} = Ctrl+C (clean stop);
+    end of stdin = the controller died = the same."""
+    import _thread
+    main_id = threading.main_thread().ident
+
+    def interrupt():
+        if hasattr(signal, "pthread_kill"):     # POSIX: a real SIGINT to the main thread also wakes sleep()/waitpid()
+            signal.pthread_kill(main_id, signal.SIGINT)
+        else:
+            _thread.interrupt_main()
+
+    def watch_posix():
+        try:
+            for line in sys.stdin:
+                if _control_command(line) == "STOP":
+                    break
+        except Exception:
+            pass
+        interrupt()
+
+    def watch_windows():
+        import msvcrt
+        import _winapi
+        try:
+            fd = sys.stdin.fileno()
+            handle = msvcrt.get_osfhandle(fd)
+        except (OSError, ValueError, AttributeError):
+            return
+
+        def peek():
+            try:
+                return _winapi.PeekNamedPipe(handle, 0)[0]
+            except OSError as e:
+                if getattr(e, "winerror", 0) == 109:        # ERROR_BROKEN_PIPE: the controller closed its end
+                    raise EOFError from e
+                raise
+        try:
+            peek()
+        except (OSError, EOFError):
+            return          # not a pipe (a console, a file): nobody is controlling us through it
+        try:
+            _control_poll(peek, lambda n: os.read(fd, n))
+        except OSError:
+            pass
+        interrupt()
+
+    threading.Thread(target=watch_windows if os.name == "nt" else watch_posix, daemon=True, name="dtv-control").start()
+
+
+def describe():
+    """Everything a front end would otherwise have to hard-code."""
+    parser = build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    helps = {c.dest: c.help for c in sub._choices_actions}
+    commands = {}
+    for name, sp in sub.choices.items():
+        opts = []
+        for act in sp._actions:
+            if act.dest == "help" or act.help == argparse.SUPPRESS:
+                continue
+            kind = ("flag" if isinstance(act, (argparse._StoreTrueAction, argparse._StoreFalseAction))
+                    else "append" if isinstance(act, argparse._AppendAction) else "value")
+            opts.append({"flags": list(act.option_strings), "dest": act.dest, "kind": kind, "positional": not act.option_strings,
+                         "help": act.help or "", "choices": list(act.choices) if act.choices else None,
+                         "default": act.default if isinstance(act.default, (str, int, float, bool, type(None))) else None})
+        commands[name] = {"help": helps.get(name, ""), "options": opts}
+    return {"version": __version__, "protocol": PROTOCOL_VERSION, "features": list(FEATURES),
+            "tools": {k: {"label": d["label"], "names": list(d["names"]), "flag": d["flag"]} for k, d in TOOL_DEFS.items()},
+            "formats": {k: {"label": f["label"], "ext": f["ext"], "default_bitrate": f["br"], "max_channels": f["max"]} for k, f in FORMATS.items()},
+            "layouts": catalog_public(), "commands": commands}
+
+
 def main(argv=None):
-    global PJ, VERBOSE
+    global PJ, JSONL, VERBOSE, CMD
+    _fix_stdio()
+    _frozen_env()
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.cmd:
         parser.print_help()
         return 0
-    PJ = bool(getattr(args, "progress_json", False))
+    if args.cmd == "describe":
+        _utf8_stdio()
+        print(json.dumps(describe(), ensure_ascii=False, indent=1))
+        return 0
+    CMD = args.cmd
+    JSONL = bool(getattr(args, "json", False))
+    PJ = JSONL or bool(getattr(args, "progress_json", False))
+    if PJ:
+        _utf8_stdio()
     VERBOSE = bool(getattr(args, "verbose", False))
     init_console(getattr(args, "no_color", False), getattr(args, "ascii", False))
     NOTES.clear()
     install_exit_hooks()
+    if JSONL:
+        ev(type="hello", protocol=PROTOCOL_VERSION, version=__version__, command=args.cmd, pid=os.getpid(), features=list(FEATURES))
+    if getattr(args, "control", False):
+        start_control_reader()
     if args.cmd == "dash-capture":   # stop request (SIGTERM / Ctrl+Break) = stop recording and package, like Ctrl+C
         for name in ("SIGTERM", "SIGBREAK"):
             if hasattr(signal, name):
@@ -5705,17 +6474,17 @@ def main(argv=None):
     try:
         return handlers[args.cmd](args) or 0
     except Fail as e:
-        ev(type="error", message=str(e))
+        ev(type="error", kind="fail", message=str(e), step=CUR_STEP)
         if CUR_STEP:
             step(CUR_STEP, "error", str(e))
         say(f"ERRO: {e}", "err")
         return 2
     except KeyboardInterrupt:
-        ev(type="error", message="Interrompido pelo usuário.")
+        ev(type="error", kind="interrupted", message="Interrompido pelo usuário.", step=CUR_STEP)
         say("Interrompido.", "err")
         return 130
     except Exception as e:
-        ev(type="error", message=str(e))
+        ev(type="error", kind="unexpected", message=str(e), step=CUR_STEP)
         say(f"ERRO inesperado: {e}", "err")
         if VERBOSE:
             import traceback
