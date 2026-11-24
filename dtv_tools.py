@@ -9,7 +9,7 @@ Subcommands:
   mpegh-scan    analyse the MPEG-H audio (presets, groups, native layout, availability timeline)
   mpegh-audio   render the chosen presets/groups to audio files (parallel decoding)
   mp4-cut       lossless cut of an MP4 at IDR frames (MP4Box -splitx) with A/V sync check
-  transcode     single-track MP4 (VVC + LCEVC + MPEG-H) -> HEVC 10-bit HDR10, with every MPEG-H preset as an audio track
+  transcode     single-track MP4 (VVC + LCEVC + MPEG-H) -> HEVC or AV1 10-bit HDR10, with every MPEG-H preset as an audio track
   frame         save one frame as HDR-native image (16-bit PNG / AVIF) and/or tone-mapped SDR image (PNG / JPG)
   sdr           redo the SDR image from a saved *_hdr.png (no decoding)
   dash-capture  record a live or static DASH stream (VVC + LCEVC + MPEG-H) into an MP4
@@ -460,12 +460,16 @@ def cmd_doctor(a):
             entry.update(ok=True, path=path, source=src, version=tool_version(key, path))
             if key == "ffmpeg":
                 entry["caps"]["lcevc_filter"] = ffmpeg_has_lcevc(path)
+                have = ffmpeg_encoders(path)
+                entry["caps"]["encoders"] = {k: e["ffmpeg"] in have for k, e in ENCODERS.items()}
             if key == "mp4box":
                 mv = mp4box_major(entry["version"])
                 entry["caps"]["vvc"] = bool(mv and mv[0] >= 2)
                 if mv is None:
                     entry["caps"]["vvc"] = None
             say(f"{d['label']}: {path}  [{src}]" + (f"  {entry['version']}" if entry["version"] else ""), "ok")
+            if key == "ffmpeg":
+                say("  Video encoders: " + ", ".join(f"{ENCODERS[k]['ffmpeg']} {'ok' if v else 'no'}" for k, v in entry["caps"]["encoders"].items()))
             if key == "ffmpeg" and not entry["caps"]["lcevc_filter"]:
                 say("  ffmpeg has no 'lcevc' filter: the LCEVC enhancement check will be skipped.", "warn")
             if key == "mp4box" and entry["caps"].get("vvc") is False:
@@ -5471,6 +5475,59 @@ AUDIO_EXT_FMT = {".m4a": "aac", ".eac3": "eac3", ".flac": "flac", ".wav": "wav"}
 MUX_FORMATS = {".mp4": "mp4", ".m4v": "mp4", ".mov": "mov", ".mkv": "matroska"}      # output extension -> ffmpeg muxer
 
 
+# Video encoders of `transcode`. One table drives the ffmpeg command, the --help text, `describe` (for front ends) and `doctor`.
+#   ffmpeg: encoder name; codec: output codec (hevc/av1); crf: default quality; crf_range: valid range; presets: valid names
+ENCODERS = {
+    "x265":      {"label": "x265 (CPU)", "ffmpeg": "libx265", "codec": "hevc", "crf": 18, "crf_range": [0, 51], "step": 0.5,
+                  "presets": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
+                  "preset_default": "", "params_hint": "key=value:key=value"},
+    "nvenc":     {"label": "HEVC NVENC (GPU NVIDIA)", "ffmpeg": "hevc_nvenc", "codec": "hevc", "crf": 22, "crf_range": [0, 51], "step": 1,
+                  "presets": [f"p{i}" for i in range(1, 8)], "preset_default": "p5", "params_hint": "-spatial-aq 1 -rc-lookahead 32"},
+    "av1":       {"label": "AV1 SVT-AV1 (CPU)", "ffmpeg": "libsvtav1", "codec": "av1", "crf": 28, "crf_range": [0, 63], "step": 1,
+                  "presets": [str(i) for i in range(0, 14)], "preset_default": "6", "params_hint": "tune=0:film-grain=8"},
+    "av1-nvenc": {"label": "AV1 NVENC (GPU NVIDIA RTX 40+)", "ffmpeg": "av1_nvenc", "codec": "av1", "crf": 28, "crf_range": [0, 63], "step": 1,
+                  "presets": [f"p{i}" for i in range(1, 8)], "preset_default": "p5", "params_hint": "-spatial-aq 1 -rc-lookahead 32"},
+}
+CODEC_NAMES = {"hevc": "HEVC", "av1": "AV1"}
+
+
+def enc_crf(a):
+    """--crf, or the default quality of the chosen encoder (the scales differ: x265 18, NVENC 22, SVT-AV1 28)."""
+    return a.crf if getattr(a, "crf", None) is not None else ENCODERS[getattr(a, "encoder", "x265")]["crf"]
+
+
+def enc_preset(a):
+    """The preset to pass, or '' to let the encoder decide. A name that belongs to another encoder falls back to the default."""
+    e = ENCODERS[getattr(a, "encoder", "x265")]
+    p = getattr(a, "preset", "") or ""
+    return p if p in e["presets"] else e["preset_default"]
+
+
+def enc_extra(a):
+    """Extra encoder parameters: --encoder-params, or the older per-encoder options."""
+    if getattr(a, "encoder_params", ""):
+        return a.encoder_params
+    return (getattr(a, "x265_params", "") if a.encoder == "x265" else getattr(a, "nvenc_params", "")) or ""
+
+
+def ffmpeg_encoders(ff):
+    """Set of video encoder names the ffmpeg build has (cached)."""
+    key = ("enc", ff)
+    if key not in _FF_CAPS:
+        try:
+            r = sp_run([ff, "-hide_banner", "-encoders"], capture_output=True, text=True, errors="replace", timeout=30, **NOWIN)
+            _FF_CAPS[key] = set(re.findall(r"^\s*V\S*\s+(\S+)", r.stdout or "", re.M))
+        except Exception:
+            _FF_CAPS[key] = set()
+    return _FF_CAPS[key]
+
+
+def svtav1_master(h):
+    """Mastering display in the SVT-AV1 form: G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min), decimal values."""
+    return (f"G({h['g'][0]:.4f},{h['g'][1]:.4f})B({h['b'][0]:.4f},{h['b'][1]:.4f})R({h['r'][0]:.4f},{h['r'][1]:.4f})"
+            f"WP({h['wp'][0]:.4f},{h['wp'][1]:.4f})L({h['lmax']:.4f},{h['lmin']:.4f})")
+
+
 def same_file(a, b):
     try:
         return Path(a).resolve() == Path(b).resolve() or (Path(a).exists() and Path(b).exists() and os.path.samefile(a, b))
@@ -5613,10 +5670,8 @@ def audio_offset(ff, src, a):
 
 
 def build_transcode_cmd(ff, src, out, a, hdr, size, use_lcevc, n_src_audio, items=(), offset=0.0, keep_original=True, target=None):
-    xp = ["hdr10=1", "repeat-headers=1", "colorprim=bt2020", "transfer=smpte2084", "colormatrix=bt2020nc",
-          f"master-display={x265_master(hdr)}", f"max-cll={hdr['maxcll']},{hdr['maxfall']}"]
-    if a.x265_params:
-        xp.append(a.x265_params)
+    enc = getattr(a, "encoder", "x265")
+    extra = enc_extra(a)
     cmd = [ff, "-hide_banner", "-y", "-nostdin", "-nostats", "-progress", "pipe:1", "-i", str(src)]
     for it in items:                                                   # rendered presets: one input each
         cmd += (["-itsoffset", f"{offset:.3f}"] if offset else []) + ["-i", it["path"]]
@@ -5635,18 +5690,32 @@ def build_transcode_cmd(ff, src, out, a, hdr, size, use_lcevc, n_src_audio, item
     cmd += ["-vf", ("lcevc," if use_lcevc else "") + f"setparams={HDR10_TAGS}"]
     if size:
         cmd += ["-s", size]
-    if getattr(a, "encoder", "x265") == "nvenc":                       # GPU: no x265 params; HDR10 SEI depends on frame side data
-        pr = a.preset if re.fullmatch(r"p[1-7]", a.preset or "") else "p5"
-        cmd += ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le", "-preset", pr, "-tune", "hq",
-                "-rc", "vbr", "-cq", str(int(round(a.crf))), "-b:v", "0", "-multipass", "fullres",
+    crf, preset = enc_crf(a), enc_preset(a)
+    if enc == "nvenc":                                                 # GPU: no x265 params; HDR10 SEI depends on frame side data
+        cmd += ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le", "-preset", preset, "-tune", "hq",
+                "-rc", "vbr", "-cq", str(int(round(crf))), "-b:v", "0", "-multipass", "fullres",
                 "-bf", "3", "-b_ref_mode", "middle", "-tag:v", "hvc1"]
-        if a.nvenc_params:
-            cmd += shlex.split(a.nvenc_params)
+        cmd += shlex.split(extra)
+    elif enc == "av1-nvenc":
+        cmd += ["-c:v", "av1_nvenc", "-pix_fmt", "p010le", "-preset", preset, "-tune", "hq",
+                "-rc", "vbr", "-cq", str(int(round(crf))), "-b:v", "0", "-multipass", "fullres"]
+        cmd += shlex.split(extra)
+    elif enc == "av1":                                                 # SVT-AV1 takes the HDR10 metadata as OBUs through its own parameters
+        sp = ["color-primaries=9", "transfer-characteristics=16", "matrix-coefficients=9", "color-range=0",
+              f"mastering-display={svtav1_master(hdr)}", f"content-light={hdr['maxcll']},{hdr['maxfall']}"]
+        if extra:
+            sp.append(extra)
+        cmd += ["-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le", "-crf", str(int(round(crf))), "-preset", preset,
+                "-svtav1-params", ":".join(sp)]
     else:
+        xp = ["hdr10=1", "repeat-headers=1", "colorprim=bt2020", "transfer=smpte2084", "colormatrix=bt2020nc",
+              f"master-display={x265_master(hdr)}", f"max-cll={hdr['maxcll']},{hdr['maxfall']}"]
+        if extra:
+            xp.append(extra)
         cmd += ["-c:v", "libx265"]
-        if a.preset:
-            cmd += ["-preset", a.preset]
-        cmd += ["-crf", str(a.crf), "-pix_fmt", "yuv420p10le", "-x265-params", ":".join(xp), "-tag:v", "hvc1"]
+        if preset:
+            cmd += ["-preset", preset]
+        cmd += ["-crf", str(crf), "-pix_fmt", "yuv420p10le", "-x265-params", ":".join(xp), "-tag:v", "hvc1"]
     if MUX_FORMATS.get(out.suffix.lower()) in ("mp4", "mov"):
         cmd += ["-movflags", "+faststart"]
     cmd += ["-c:a", "copy"] if (a.audio != "none" and (items or n_src_audio)) else ["-an"]
@@ -5667,7 +5736,7 @@ TC_WEIGHTS_VIDEO = {"probe": 4, "encode": 95, "report": 1}
 def cmd_transcode(a):
     render = a.audio == "render"
     set_steps(TC_STEPS_VIDEO + (TC_STEPS_AUDIO if render else []) +
-              [("encode", "Codificar o vídeo HEVC HDR10" + (" e montar o arquivo" if render else "")), ("report", "Resumo")])
+              [("encode", f"Codificar o vídeo {CODEC_NAMES[ENCODERS[a.encoder]['codec']]} HDR10" + (" e montar o arquivo" if render else "")), ("report", "Resumo")])
     set_stages(TC_WEIGHTS_AUDIO if render else TC_WEIGHTS_VIDEO)
     t0 = time.time()
     step("probe", "running")
@@ -5681,12 +5750,18 @@ def cmd_transcode(a):
     v = info["video"]
     say(f"Entrada: {v['codec']} {v['size'] or '?'} @ {v['fps'] or '?'} fps · {len(info['audio'])} trilha(s) de áudio "
         f"({', '.join(x['codec'] for x in info['audio']) or 'nenhuma'}) · {fmt_hms(info['duration'] or 0)}")
-    if a.encoder == "nvenc":
-        r = subprocess.run([ff, "-hide_banner", "-encoders"], capture_output=True, text=True, errors="replace", **NOWIN)
-        if "hevc_nvenc" not in (r.stdout or ""):
-            raise Fail("Este ffmpeg não tem o codificador hevc_nvenc (precisa de um build com NVENC, GPU NVIDIA e driver). Use --encoder x265.")
-        note("NVENC: o hevc_nvenc não aceita parâmetros do x265; os metadados HDR10 (mastering display / MaxCLL) só saem no arquivo "
+    E = ENCODERS[a.encoder]
+    if E["ffmpeg"] not in ffmpeg_encoders(ff):
+        gpu = " (precisa de GPU NVIDIA compatível e driver)" if "nvenc" in a.encoder else ""
+        raise Fail(f"Este ffmpeg não tem o codificador {E['ffmpeg']}{gpu}. Escolha outro com --encoder ({', '.join(ENCODERS)}) ou use um ffmpeg que o tenha.")
+    if a.preset and a.preset not in E["presets"]:
+        note(f"O preset '{a.preset}' não existe em {E['label']}; usando {E['preset_default'] or 'o padrão do codificador'}. Válidos: {', '.join(E['presets'])}.")
+    if "nvenc" in a.encoder:
+        note("NVENC: o encoder não aceita parâmetros de HDR10; os metadados (mastering display / MaxCLL) só saem no arquivo "
              "se vierem nos quadros de entrada. Confira a saída com ffprobe -show_frames.")
+    if a.encoder == "av1":
+        note("AV1 (SVT-AV1): mastering display e MaxCLL vão pelos parâmetros do encoder (precisa de SVT-AV1 1.2 ou mais novo). "
+             "Confira a saída com ffprobe -show_frames.")
     hdr = probe_hdr10(ff, src)
     say(f"HDR10: {hdr10_summary(hdr)}")
     measured = verify_enhancement(ff, str(src), a.verify_frames) if use_lcevc else None
@@ -5722,9 +5797,11 @@ def cmd_transcode(a):
             ext = ".mp4" if all(i["fmt"] in ("aac", "eac3") for i in items) else ".mkv"
             if ext == ".mkv":
                 note("Contêiner MKV: as trilhas renderizadas incluem PCM/FLAC, que não cabem em MP4. Use --container mp4 para forçar.")
-        out = Path(a.output) if a.output else Path(a.outdir or src.parent) / f"{src.stem}_hevc_hdr10{ext}"
+        out = Path(a.output) if a.output else Path(a.outdir or src.parent) / f"{src.stem}_{E['codec']}_hdr10{ext}"
         if out.suffix.lower() not in MUX_FORMATS:
             raise Fail(f"A extensão do arquivo de saída deve ser {', '.join(MUX_FORMATS)} (recebi {out.suffix or 'nenhuma'}).")
+        if E["codec"] == "av1" and out.suffix.lower() == ".mov":
+            raise Fail("AV1 não é suportado em .mov pela maioria dos players; use .mp4 ou .mkv.")
         if same_file(out, src):
             raise Fail("O arquivo de saída não pode ser o próprio arquivo de entrada.")
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -5758,13 +5835,13 @@ def cmd_transcode(a):
         progress("encode", 1.0, force=True)
 
         step("report", "running")
-        rows = [["Entrada", src.name], ["Vídeo", f"HEVC 10-bit HDR10 · {size or v['size'] or '?'} · CRF {a.crf:g}" + (f" · preset {a.preset}" if a.preset else "")],
+        rows = [["Entrada", src.name], ["Vídeo", f"{CODEC_NAMES[E['codec']]} 10-bit HDR10 ({E['label']}) · {size or v['size'] or '?'} · CRF {enc_crf(a):g}" + (f" · preset {enc_preset(a)}" if enc_preset(a) else "")],
                 ["HDR10", hdr10_summary(hdr)], ["Duração", fmt_hms(got or 0)], ["Contêiner", out.suffix.lstrip(".").upper()],
                 ["Trilhas de áudio", (f"{len(items)} renderizada(s): " + ", ".join(i['title'] for i in items) +
                                       (f" + {len(final['audio']) - len(items)} original(is)" if len(final['audio']) > len(items) else ""))
                  if items else f"{len(final['audio'])} (original)"],
                 ["Tempo total", fmt_hms(time.time() - t0)]]
-        made = [{"kind": "transcode", "title": "Vídeo HEVC HDR10" + (" com todos os presets" if items else ""), "path": str(out.resolve()),
+        made = [{"kind": "transcode", "title": f"Vídeo {CODEC_NAMES[E['codec']]} HDR10" + (" com todos os presets" if items else ""), "path": str(out.resolve()),
                  "size": out.stat().st_size, "duration": got}]
         say(bold("Resultado:"))
         for k_, v_ in rows:
@@ -6112,7 +6189,7 @@ HELP_TEXTS = {
                     "--jobs": "parallel decoders (0 = automatic)",
                     "--mux": "none (audio files only), add (files and a copy of the MP4 with the audio tracks) or only (just the MP4)",
                     "--audio-delay": "delay in ms for the tracks added by --mux (default 0)", **_MP_HELP},
-    "transcode": {"--crf": "x265 CRF (default 18); with --encoder nvenc it is the CQ value (try 22)", "--container": "auto (MP4, or MKV when PCM/FLAC tracks need it), mp4 or mkv", **_MP_HELP},
+    "transcode": {"--crf": "quality: x265 CRF (default 18), NVENC CQ (22), SVT-AV1 CRF (28)", "--container": "auto (MP4, or MKV when PCM/FLAC tracks need it), mp4 or mkv", **_MP_HELP},
     "frame": {"--jpg-quality": "JPEG quality, 1-95 (default 95)", "--avif-crf": "AVIF quality (libaom CRF; default 18)"},
     "sdr": {"-o": "base name of the output (default: the PNG name without _hdr)", "--jpg-quality": "JPEG quality, 1-95 (default 95)"},
 }
@@ -6262,16 +6339,17 @@ def build_parser():
         sp.add_argument("--outdir", default="")
         sp.add_argument("--overwrite", action="store_true")
 
-    s_tc = sub.add_parser("transcode", help="single-track MP4 -> HEVC 10-bit HDR10 with every MPEG-H preset as an audio track")
+    s_tc = sub.add_parser("transcode", help="single-track MP4 -> HEVC or AV1 10-bit HDR10 with every MPEG-H preset as an audio track")
     video_input_flags(s_tc)
-    s_tc.add_argument("-o", "--output", default="", help="output file (default: <name>_hevc_hdr10.mp4 / .mkv)")
-    s_tc.add_argument("--encoder", choices=("x265", "nvenc"), default="x265",
-                      help="video encoder: x265 (CPU, default) or nvenc (NVIDIA GPU, hevc_nvenc)")
-    s_tc.add_argument("--crf", type=float, default=18, help="x265 CRF; with --encoder nvenc it is used as the CQ value (try 22)")
-    s_tc.add_argument("--preset", default="", help="x265 preset (ultrafast..placebo) or NVENC preset (p1..p7); default: encoder decides")
-    s_tc.add_argument("--nvenc-params", default="", metavar="'-opt val ...'",
-                      help="extra hevc_nvenc options appended as-is, e.g. '-spatial-aq 1 -rc-lookahead 32'")
-    s_tc.add_argument("--x265-params", default="", metavar="K=V:K=V", help="extra x265 parameters appended to the HDR10 ones")
+    s_tc.add_argument("-o", "--output", default="", help="output file (default: <name>_hevc_hdr10.mp4 / <name>_av1_hdr10.mp4, or .mkv)")
+    s_tc.add_argument("--encoder", choices=tuple(ENCODERS), default="x265",
+                      help="video encoder: x265 (CPU, default), nvenc (HEVC, NVIDIA GPU), av1 (SVT-AV1, CPU) or av1-nvenc (AV1, NVIDIA RTX 40+)")
+    s_tc.add_argument("--crf", type=float, default=None, help="quality: x265 CRF (default 18), NVENC CQ (22), SVT-AV1 CRF (28)")
+    s_tc.add_argument("--preset", default="", help="x265: ultrafast..placebo; NVENC: p1..p7; SVT-AV1: 0..13 (default: x265 decides, NVENC p5, SVT-AV1 6)")
+    s_tc.add_argument("--encoder-params", default="", metavar="PARAMS",
+                      help="extra encoder parameters: x265 'k=v:k=v', SVT-AV1 'k=v:k=v', NVENC '-opt val ...' (appended as-is)")
+    s_tc.add_argument("--nvenc-params", default="", metavar="'-opt val ...'", help="same as --encoder-params with an NVENC encoder (older name)")
+    s_tc.add_argument("--x265-params", default="", metavar="K=V:K=V", help="same as --encoder-params with x265 (older name)")
     s_tc.add_argument("--verify-frames", type=int, default=48, help="frames decoded by the LCEVC verification (default: 48)")
     s_tc.add_argument("--limit", type=float, default=0, metavar="SEC", help="encode only the first SEC seconds (quick test; the audio is still rendered in full)")
     s_tc.add_argument("--dry-run", action="store_true", help="show the ffmpeg command and stop")
@@ -6475,7 +6553,7 @@ def describe():
     return {"version": __version__, "protocol": PROTOCOL_VERSION, "features": list(FEATURES),
             "tools": {k: {"label": d["label"], "names": list(d["names"]), "flag": d["flag"]} for k, d in TOOL_DEFS.items()},
             "formats": {k: {"label": f["label"], "ext": f["ext"], "default_bitrate": f["br"], "max_channels": f["max"]} for k, f in FORMATS.items()},
-            "layouts": catalog_public(), "commands": commands}
+            "layouts": catalog_public(), "encoders": ENCODERS, "commands": commands}
 
 
 def main(argv=None):

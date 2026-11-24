@@ -13,7 +13,7 @@ Caso você seja um uusário que tenha ressalvas ao uso de inteligência artifica
 | `mpegh-audio` | Gera arquivos de áudio dos presets/grupos escolhidos |
 | `mp4-cut` | Corte sem perdas (VVC + LCEVC + MPEG-H preservados), com verificação e correção do sincronismo A/V |
 | `dash-capture` | Grava o stream DASH ao vivo ou estático (VVC + LCEVC + MPEG-H) em MP4 |
-| `transcode` | MP4 single-track -> HEVC 10 bits HDR10 (camada LCEVC aplicada) e presets MPEG-H renderizados como trilhas de áudio |
+| `transcode` | MP4 single-track -> HEVC ou AV1 10 bits HDR10 (camada LCEVC aplicada) e presets MPEG-H renderizados como trilhas de áudio |
 | `frame` | Salva um quadro como imagem HDR (PNG 16 bits, AVIF) e/ou SDR com tone mapping (PNG, JPG) |
 | `sdr` | Gera imagens SDR a partir de um PNG HDR salvo |
 | `doctor` | Verifica os programas externos e os módulos Python necessários para o script funcionar |
@@ -258,7 +258,7 @@ Pare uma gravação ao vivo com **Ctrl+C** (ou SIGTERM / Ctrl+Break): ela para d
 
 ### `transcode`
  
-Recodifica o MP4 single-track (VVC c/ LCEVC SEI + MPEG-H) para **HEVC 10 bits HDR10** (x265), aplicando o enhancement LCEVC pelo filtro `lcevc` do FFmpeg. O mastering display e o MaxCLL/MaxFALL são lidos do primeiro quadro;
+Recodifica o MP4 single-track (VVC c/ LCEVC SEI + MPEG-H) para **HEVC ou AV1 10 bits HDR10** (x265, NVENC, SVT-AV1 ou NVENC AV1), aplicando o enhancement LCEVC pelo filtro `lcevc` do FFmpeg. O mastering display e o MaxCLL/MaxFALL são lidos do primeiro quadro;
 se o stream não tiver, usa 1000/0,005 nits e 1000/300 e avisa em uma nota.
 
 > [!IMPORTANT]
@@ -270,12 +270,12 @@ python dtv_tools.py transcode ENTRADA.mp4 [-o SAIDA.mp4] [--audio render|copy|no
  
 | Opção | Significado |
 |---|---|
-| `-o`, `--output` | Saída (`.mp4`, `.m4v`, `.mov` ou `.mkv`). Padrão `<nome>_hevc_hdr10.mp4` (`.mkv` quando há trilhas PCM/FLAC) |
+| `-o`, `--output` | Saída (`.mp4`, `.m4v`, `.mov` ou `.mkv`). Padrão `<nome>_hevc_hdr10.mp4` ou `<nome>_av1_hdr10.mp4` (`.mkv` quando há trilhas PCM/FLAC) |
 | `--audio` | `render` (padrão): cada preset MPEG-H vira uma trilha, como em `mpegh-audio`. `copy`: só a trilha original (não precisa das ferramentas MPEG-H); `none` |
 | `--option`, `--audio-format`, `--audio-delay`, `--original-audio`, `--native-layout`, `--jobs` | Mesmo significado de `mpegh-audio`; `--original-audio keep` acrescenta a trilha original MPEG-H no fim |
 | `--container` | `auto`, `mp4` ou `mkv` |
-| `--crf`, `--preset`, `--x265-params` | Ajustes do encoder; parâmetros extras são anexados aos do HDR10 |
-| `--encoder x265\|nvenc` | `x265` (CPU, padrão) ou `nvenc` (GPU NVIDIA, `hevc_nvenc`, Main10). Com `nvenc`, `--crf` vira o valor CQ (tente 22), `--preset` é `p1`..`p7` (padrão `p5`) e `--nvenc-params '-opção valor …'` acrescenta opções. O mastering display / MaxCLL não vão como parâmetros do encoder: confira a saída com `ffprobe -show_frames`. Exige ffmpeg com `hevc_nvenc` |
+| `--crf`, `--preset`, `--encoder-params` | Ajustes do encoder. Os padrões e as escalas dependem do codificador (veja abaixo). Parâmetros extras são anexados aos do HDR10. `--x265-params` e `--nvenc-params` são nomes antigos de `--encoder-params` |
+| `--encoder` | `x265` (CPU, padrão), `nvenc` (HEVC na GPU NVIDIA), `av1` (SVT-AV1, CPU) ou `av1-nvenc` (AV1 na GPU NVIDIA RTX 40 ou mais nova). Veja a tabela abaixo |
 | `--no-lcevc` | A origem não tem LCEVC (arquivo HDR10 comum): não usa o filtro |
 | `--size WxH`, `--no-size-fix` | Tamanho da saída. Por padrão só se usa um tamanho medido pela verificação LCEVC |
 | `--verify-frames` | Quadros decodificados na verificação LCEVC (padrão 48) |
@@ -287,6 +287,15 @@ O arquivo é gravado como `<saída>.part` e só recebe o nome final quando está
 ### `frame`
  
 Salva um quadro do mesmo tipo de arquivo como imagem: HDR (PNG 16 bits, AVIF 10 bits) e/ou SDR com tone mapping (PNG, JPG).
+
+| `--encoder` | Codificador do ffmpeg | `--crf` padrão (faixa) | `--preset` (padrão) | Extras em `--encoder-params` |
+|---|---|---|---|---|
+| `x265` | `libx265` | 18 (0–51) | `ultrafast`…`placebo` (o do x265) | `chave=valor:chave=valor` |
+| `nvenc` | `hevc_nvenc` | 22 (0–51), valor CQ | `p1`…`p7` (`p5`) | `-opção valor …` |
+| `av1` | `libsvtav1` | 28 (0–63) | `0`…`13` (`6`) | `chave=valor:chave=valor` |
+| `av1-nvenc` | `av1_nvenc` | 28 (0–63), valor CQ | `p1`…`p7` (`p5`) | `-opção valor …` |
+
+Os valores de qualidade não são equivalentes entre codificadores. No AV1, o mastering display e o MaxCLL/MaxFALL vão pelos parâmetros do SVT-AV1 (precisa da versão 1.2 ou mais nova). Nos codificadores NVENC eles só saem no arquivo se vierem nos quadros de entrada: confira a saída com `ffprobe -show_frames`. AV1 não é aceito em `.mov`. O `doctor` mostra quais codificadores o seu ffmpeg tem, e o `transcode` recusa, antes de começar, um que ele não tenha.
 
 > [!IMPORTANT]
 > Necessário FFmpeg para utilizar este comando. No Python, é necessário ter os módulos `numpy` e `Pillow` instalados.
@@ -351,7 +360,7 @@ python dtv_tools.py doctor [--mp4box CAMINHO] [--ffmpeg CAMINHO] [--mpegh-ui CAM
 | Programa | Necessário para |
 |---|---|
 | MP4Box (GPAC 2.x) | `ts-tv3`, `mp4-cut`, `dash-capture`, `mpegh-scan`, `mpegh-audio` |
-| ffmpeg | `mpegh-audio`, `transcode`, `frame` (`transcode` precisa de libx265, `frame --hdr avif` de libaom-av1); verificação opcional do LCEVC nos demais. O filtro `lcevc` estará disponível apenas em builds personalizadas compiladas com LCEVC |
+| ffmpeg | `mpegh-audio`, `transcode`, `frame` (`transcode` precisa do codificador escolhido: libx265, hevc_nvenc, libsvtav1 ou av1_nvenc; `frame --hdr avif` de libaom-av1); verificação opcional do LCEVC nos demais. O filtro `lcevc` estará disponível apenas em builds personalizadas compiladas com LCEVC |
 | mpeghUiManager, mpeghDecoder | `mpegh-scan`, `mpegh-audio`, `transcode --audio render` |
  
 Módulos Python, importados só quando necessários: `requests` (`dash-capture`), `rich` (painel ao vivo do `dash-capture`), `numpy` e `Pillow` (`frame` e `sdr`);.

@@ -152,5 +152,24 @@ w.nav_to("ts"); tp = w.pages["ts"]; tp.files.add_item("a", f1); tp.files.add_ite
 tp.files.rm_btn.click(); check("lista: remoção de arquivo", tp.files.values() == [f2])
 jobs = tp.build_jobs(); check("ts: comando monta --outputs single,dual", "single,dual" in jobs[0].args)
 w.close()
+
+# --- codificadores (tabela vinda do describe do dtv_tools)
+sys.path.insert(0, ROOT); import dtv_tools as _dtv
+G.MainWindow._describe_core = lambda self: _dtv.describe()
+w = G.MainWindow(); w.show(); done(w)
+w.nav_to("transcode"); tp = w.pages["transcode"]
+check("encoders: 4 codificadores no seletor", [tp.encoder.itemData(i) for i in range(tp.encoder.count())] == ["x265", "nvenc", "av1", "av1-nvenc"])
+tp.files.add_item("a", f1)
+tp.encoder.setCurrentIndex(tp.encoder.findData("av1"))
+check("encoders: AV1 -> qualidade 28, presets 0..13, faixa até 63", tp.crf.value() == 28 and tp.crf.maximum() == 63 and tp.preset.count() == 15)
+a = tp.build_jobs(True)[0].args
+check("encoders: comando leva --encoder av1 --crf 28", a[a.index("--encoder") + 1] == "av1" and a[a.index("--crf") + 1] == "28.0")
+tp.encoder.setCurrentIndex(tp.encoder.findData("x265"))
+check("encoders: volta ao x265 com CRF 18", tp.crf.value() == 18 and tp.crf_lb.text() == "Qualidade (CRF)")
+w.on_tools = None
+w.set_tools_status({"version": _dtv.__version__, "protocol": 2, "tools": [{"key": "ffmpeg", "ok": True, "name": "ffmpeg", "path": "ff", "source": "x", "version": "",
+                     "caps": {"lcevc_filter": True, "encoders": {"x265": True, "nvenc": False, "av1": True, "av1-nvenc": False}}}]})
+check("encoders: sem hevc_nvenc/av1_nvenc no ffmpeg -> itens desabilitados", not tp.encoder.model().item(1).isEnabled() and tp.encoder.model().item(2).isEnabled())
+w.close()
 print("RESULTADO:", sum(ok), "/", len(ok))
 sys.exit(0 if all(ok) else 1)

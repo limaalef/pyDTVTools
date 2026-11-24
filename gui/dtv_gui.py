@@ -62,6 +62,11 @@ NATIVE_LAYOUTS = [("Detectar do stream", 0), ("2.0 (estéreo)", 2), ("5.1", 6), 
 TOOL_ROWS = [("mp4box", "MP4Box"), ("ffmpeg", "ffmpeg (build DTV+/LCEVC)"), ("mpegh_ui", "mpeghUiManager"), ("mpegh_decoder", "mpeghDecoder")]
 
 
+# usado só se o dtv_tools não informar a tabela de codificadores no `describe` (versão antiga)
+FALLBACK_ENCODERS = {"x265": {"label": "x265 (CPU)", "crf": 18, "crf_range": [0, 51], "step": 0.5, "preset_default": "", "params_hint": "key=value:key=value",
+                              "presets": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"]}}
+
+
 def bundled_tools_dir() -> Path:
     if getattr(sys, "frozen", False):
         exe = Path(sys.executable).parent
@@ -930,13 +935,14 @@ class TranscodePage(Page):
         lay.addWidget(g)
 
         gv, fv = self.group("Vídeo")
-        self.crf = self.spin(0, 51, 18, 0.5, 1)
+        self.encs = (self.win.core_info or {}).get("encoders") or FALLBACK_ENCODERS     # tabela do dtv_tools (describe)
+        self.crf = self.spin(0, 63, 18, 0.5, 1)
         self.encoder = QComboBox()
-        self.encoder.addItem("x265 (CPU)", "x265")
-        self.encoder.addItem("NVENC (GPU NVIDIA)", "nvenc")
+        for k, e in self.encs.items():
+            self.encoder.addItem(e["label"], k)
         self.preset = QComboBox()
-        self._fill_presets()
         self.encoder.currentIndexChanged.connect(self._encoder_changed)
+        self._encoder_changed()
         self.container = QComboBox()
         for t, v in (("Automático", "auto"), ("MP4", "mp4"), ("MKV", "mkv")):
             self.container.addItem(t, v)
@@ -945,7 +951,8 @@ class TranscodePage(Page):
         self.nolcevc = QCheckBox("A fonte não tem LCEVC (arquivo HDR10 comum)")
         self.limit = self.spin(0, 86400, 0, 5, special="Arquivo inteiro", suffix=" s")
         fv.addRow("Codificador", self.encoder)
-        fv.addRow("Qualidade (CRF/CQ)", self.crf)
+        self.crf_lb = QLabel("Qualidade (CRF)")
+        fv.addRow(self.crf_lb, self.crf)
         fv.addRow("Velocidade (preset)", self.preset)
         fv.addRow("Contêiner", self.container)
         fv.addRow("Tamanho de saída", self.size)
@@ -954,10 +961,9 @@ class TranscodePage(Page):
         adv = Collapsible("Avançado: codificador e verificação", flat=True)
         f3 = QFormLayout()
         self.x265 = QLineEdit()
-        self.x265.setPlaceholderText("chave=valor:chave=valor")
         self.verify = self.spin(1, 5000, 48)
         self.f3 = f3
-        f3.addRow("Parâmetros extras do x265", self.x265)
+        f3.addRow("Parâmetros extras do codificador", self.x265)
         f3.addRow("Quadros na verificação LCEVC", self.verify)
         adv.content.addLayout(f3)
         fv.addRow(adv)
@@ -1025,23 +1031,40 @@ class TranscodePage(Page):
             self.catalog.set_scan(res["scan"])
             self.catalog.setVisible(True)
 
-    X265_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo")
-    NVENC_PRESETS = ("p1", "p2", "p3", "p4", "p5", "p6", "p7")
-
-    def _fill_presets(self):
-        nv = self.encoder.currentData() == "nvenc"
-        self.preset.clear()
-        self.preset.addItem("Padrão do NVENC (p5)" if nv else "Padrão do x265", "")
-        for p in (self.NVENC_PRESETS if nv else self.X265_PRESETS):
-            self.preset.addItem(p, p)
-
     def _encoder_changed(self):
-        nv = self.encoder.currentData() == "nvenc"
-        self._fill_presets()
-        self.crf.setValue(22 if nv else 18)                     # CRF do x265 e CQ do NVENC têm escalas diferentes
-        self.x265.clear()
-        self.x265.setPlaceholderText("-spatial-aq 1 -rc-lookahead 32" if nv else "chave=valor:chave=valor")
-        self.f3.labelForField(self.x265).setText("Opções extras do NVENC" if nv else "Parâmetros extras do x265")
+        """Cada codificador tem a sua escala de qualidade, lista de presets e sintaxe de parâmetros (tabela ENCODERS do dtv_tools)."""
+        e = self.encs[self.encoder.currentData()]
+        self.preset.clear()
+        d = e["preset_default"]
+        self.preset.addItem(f"Padrão ({d})" if d else "Padrão do codificador", "")
+        for p in e["presets"]:
+            self.preset.addItem(p, p)
+        self.crf.setRange(*e["crf_range"])
+        self.crf.setSingleStep(e["step"])
+        self.crf.setValue(e["crf"])
+        if hasattr(self, "x265"):
+            self.x265.clear()
+            self.x265.setPlaceholderText(e["params_hint"])
+        self.crf_label_set()
+
+    def crf_label_set(self):
+        lb = getattr(self, "crf_lb", None)
+        if lb is not None:
+            lb.setText("Qualidade (CQ)" if "nvenc" in self.encoder.currentData() else "Qualidade (CRF)")
+
+    def on_tools(self, res: dict):
+        """Desabilita codificadores que o ffmpeg configurado não tem (resultado do doctor)."""
+        have = next((t.get("caps", {}).get("encoders") for t in res.get("tools", []) if t["key"] == "ffmpeg" and t["ok"]), None)
+        model = self.encoder.model()
+        for i in range(self.encoder.count()):
+            k = self.encoder.itemData(i)
+            ok = have is None or bool(have.get(k, True))
+            it = model.item(i)
+            if it is not None:
+                it.setEnabled(ok)
+                it.setToolTip("" if ok else "O ffmpeg configurado não tem este codificador")
+        if have is not None and not have.get(self.encoder.currentData(), True):
+            self.encoder.setCurrentIndex(next((i for i in range(self.encoder.count()) if have.get(self.encoder.itemData(i), True)), 0))
 
     def build_jobs(self, dry: bool):
         files = self.files.values()
@@ -1061,7 +1084,7 @@ class TranscodePage(Page):
             if self.size.text().strip():
                 a += ["--size", self.size.text().strip()]
             if self.x265.text().strip():
-                a += ["--nvenc-params" if self.encoder.currentData() == "nvenc" else "--x265-params", self.x265.text().strip()]
+                a += ["--encoder-params", self.x265.text().strip()]
             if self.limit.value():
                 a += ["--limit", str(self.limit.value())]
             if self.nolcevc.isChecked():
@@ -1785,6 +1808,9 @@ class MainWindow(QMainWindow):
 
     def set_tools_status(self, res: dict):
         self._tools_res = res
+        for pg in self.pages.values():
+            if hasattr(pg, "on_tools"):
+                pg.on_tools(res)
         self.core_version, self.core_protocol = res.get("version", ""), int(res.get("protocol", 0) or 0)
         missing = [t["name"] for t in res.get("tools", []) if not t["ok"]]
         if self.core_protocol != PROTOCOL:

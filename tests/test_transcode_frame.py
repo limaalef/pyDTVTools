@@ -133,3 +133,49 @@ def test_transcode_nvenc_command():
     # a x265 preset name is not valid for NVENC: falls back to p5
     c = _tc_cmd(_tc_args("--encoder", "nvenc", "--preset", "slow"))
     assert c[c.index("-preset") + 1] == "p5"
+
+
+def test_encoder_table_is_consistent():
+    for k, e in d.ENCODERS.items():
+        assert e["codec"] in d.CODEC_NAMES and e["ffmpeg"] and e["crf_range"][0] <= e["crf"] <= e["crf_range"][1]
+        assert e["preset_default"] in ("", *e["presets"]), k
+
+
+def test_default_quality_depends_on_the_encoder():
+    assert d.enc_crf(_tc_args()) == 18
+    assert d.enc_crf(_tc_args("--encoder", "nvenc")) == 22
+    assert d.enc_crf(_tc_args("--encoder", "av1")) == 28
+    assert d.enc_crf(_tc_args("--encoder", "av1", "--crf", "30")) == 30
+
+
+def test_svtav1_command_carries_hdr10():
+    c = _tc_cmd(_tc_args("--encoder", "av1", "--preset", "4", "--encoder-params", "tune=0"))
+    assert c[c.index("-c:v") + 1] == "libsvtav1" and "libx265" not in c and "-tag:v" not in c
+    assert c[c.index("-crf") + 1] == "28" and c[c.index("-preset") + 1] == "4" and c[c.index("-pix_fmt") + 1] == "yuv420p10le"
+    sp = c[c.index("-svtav1-params") + 1]
+    assert "transfer-characteristics=16" in sp and "color-primaries=9" in sp and "content-light=1000,400" in sp
+    assert "mastering-display=G(0.1700,0.7970)B(0.1310,0.0460)R(0.7080,0.2920)WP(0.3127,0.3290)L(1000.0000,0.0050)" in sp
+    assert sp.endswith("tune=0")
+
+
+def test_svtav1_preset_from_another_encoder_falls_back():
+    c = _tc_cmd(_tc_args("--encoder", "av1", "--preset", "slow"))
+    assert c[c.index("-preset") + 1] == "6"
+
+
+def test_av1_nvenc_command():
+    c = _tc_cmd(_tc_args("--encoder", "av1-nvenc", "--preset", "p6", "--encoder-params", "-spatial-aq 1"))
+    assert c[c.index("-c:v") + 1] == "av1_nvenc" and c[c.index("-cq") + 1] == "28" and c[c.index("-preset") + 1] == "p6"
+    assert c[c.index("-pix_fmt") + 1] == "p010le" and "-spatial-aq" in c and "-profile:v" not in c and "-tag:v" not in c
+
+
+def test_old_param_options_still_work():
+    assert "-spatial-aq" in _tc_cmd(_tc_args("--encoder", "nvenc", "--nvenc-params", "-spatial-aq 1"))
+    xp = _tc_cmd(_tc_args("--x265-params", "aq-mode=3"))
+    assert xp[xp.index("-x265-params") + 1].endswith("aq-mode=3")
+    xp = _tc_cmd(_tc_args("--encoder-params", "aq-mode=2"))
+    assert xp[xp.index("-x265-params") + 1].endswith("aq-mode=2")
+
+
+def test_describe_lists_the_encoders():
+    assert set(d.describe()["encoders"]) == {"x265", "nvenc", "av1", "av1-nvenc"}
