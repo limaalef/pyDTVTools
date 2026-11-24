@@ -25,7 +25,7 @@ import json  # noqa: E402
 import re  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from PySide6.QtCore import QRectF, QSettings, QSize, QStandardPaths, Qt, QTime, QTimer  # noqa: E402
+from PySide6.QtCore import QRectF, QSettings, QSize, QStandardPaths, Qt, QTime, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import QAction, QActionGroup, QColor, QGuiApplication, QIcon, QPainter, QPalette  # noqa: E402
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,  # noqa: E402
                                QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
 
 import cutmath  # noqa: E402
 from dtv_gui_notify import Notifier, summarize
+from dtv_gui_presets import PresetStore  # noqa: E402
 from dtv_gui_runner import PROTOCOL, Job, Runner, program_and_prefix  # noqa: E402
 from dtv_gui_style import AccentButton, FluentStyle, accent_of, apply_backdrop, apply_fluent, mica_supported  # noqa: E402
 from dtv_gui_widgets import (CardBox, WheelGuard, svg_icon, fit_view, AvailabilityChart, Collapsible, Colors, CutTimeline, FileEdit, ImagePreview, ItemList,  # noqa: E402
@@ -553,6 +554,70 @@ class CatalogView(QWidget):
         return out
 
 
+class NormalizeRow(QWidget):
+    """Normalização de volume dos áudios gerados (--normalize / --true-peak): desligado, uma das metas padrão ou um valor em LUFS."""
+    changed = Signal()
+    CHOICES = (("Desligado", "off"), ("EBU R128 (−23 LUFS)", "ebu"), ("ATSC A/85 (−24 LUFS)", "atsc"), ("Streaming (−16 LUFS)", "streaming"), ("Outro valor…", "custom"))
+
+    def __init__(self):
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.combo = QComboBox()
+        for t, v in self.CHOICES:
+            self.combo.addItem(t, v)
+        self.target = QDoubleSpinBox()
+        self.target.setDecimals(1)
+        self.target.setRange(-40, -5)
+        self.target.setValue(-23)
+        self.target.setSuffix(" LUFS")
+        self.peak_lb = QLabel("Pico máx.")
+        self.peak = QDoubleSpinBox()
+        self.peak.setDecimals(1)
+        self.peak.setRange(-9, 0)
+        self.peak.setValue(-1)
+        self.peak.setSuffix(" dBTP")
+        tip = ("Mede o volume de cada áudio gerado (EBU R128: volume integrado e pico verdadeiro) e aplica um único ganho para chegar à meta, sem mexer na "
+               "dinâmica. O ganho nunca leva o pico acima do máximo indicado; se levaria, o arquivo fica um pouco abaixo da meta e isso aparece no registro. "
+               "Não substitui o “Loudness alvo (-rl)” do decoder, que usa os metadados do MPEG-H.")
+        for w in (self.combo, self.target, self.peak):
+            w.setToolTip(tip)
+        lay.addWidget(self.combo, 1)
+        lay.addWidget(self.target)
+        lay.addWidget(self.peak_lb)
+        lay.addWidget(self.peak)
+        self.combo.currentIndexChanged.connect(self._sync)
+        for sig in (self.combo.currentIndexChanged, self.target.valueChanged, self.peak.valueChanged):
+            sig.connect(lambda *_: self.changed.emit())
+        self._sync()
+
+    def _sync(self):
+        mode = self.combo.currentData()
+        self.target.setVisible(mode == "custom")
+        self.peak_lb.setVisible(mode != "off")
+        self.peak.setVisible(mode != "off")
+
+    def value(self) -> str:
+        mode = self.combo.currentData()
+        return f"{self.target.value():g}" if mode == "custom" else mode
+
+    def set_value(self, v: str, peak=None):
+        i = self.combo.findData(v)
+        if i >= 0:
+            self.combo.setCurrentIndex(i)
+        else:
+            try:
+                self.target.setValue(float(str(v).replace(",", ".")))
+                self.combo.setCurrentIndex(self.combo.findData("custom"))
+            except ValueError:
+                self.combo.setCurrentIndex(0)
+        if peak is not None:
+            self.peak.setValue(peak)
+
+    def args(self) -> list:
+        return [] if self.combo.currentData() == "off" else ["--normalize", self.value(), "--true-peak", f"{self.peak.value():g}"]
+
+
 def native_combo() -> QComboBox:
     cb = QComboBox()
     for t, v in NATIVE_LAYOUTS:
@@ -620,6 +685,8 @@ class AudioPage(Page):
         f2.addRow("Pasta de saída", self.outdir)
         f2.addRow("Juntar ao vídeo", self.mux)
         f2.addRow("Atraso das faixas juntadas", self.delay)
+        self.norm = NormalizeRow()
+        f2.addRow("Normalizar volume", self.norm)
         f2.addRow("Decodificações paralelas", self.jobs)
         f2.addRow("", self.overwrite)
         adv = Collapsible("Avançado: decoder", flat=True)
@@ -707,7 +774,7 @@ class AudioPage(Page):
         a = ["mpegh-audio", self.input.text()]
         for s in specs:
             a += ["--option", s]
-        a += self._scan_args() + ["--mux", self.mux.currentData(), "--audio-delay", str(self.delay.value()), "--drc-effect", self.drc.text().strip() or "0"]
+        a += self._scan_args() + ["--mux", self.mux.currentData(), "--audio-delay", str(self.delay.value()), "--drc-effect", self.drc.text().strip() or "0"] + self.norm.args()
         if self.outdir.text():
             a += ["--outdir", self.outdir.text()]
         if self.jobs.value():
@@ -1025,6 +1092,8 @@ class TranscodePage(Page):
         rf.addRow("", self.keep_orig)
         rf.addRow("Formato", self.afmt)
         rf.addRow("Atraso (auto ou ms)", self.adelay)
+        self.norm = NormalizeRow()
+        rf.addRow("Normalizar volume", self.norm)
         rf.addRow("Layout nativo", self.layout_cb)
         rf.addRow("", self.compat)
         self.scan_btn = QPushButton("Analisar áudio do 1º arquivo")
@@ -1115,7 +1184,7 @@ class TranscodePage(Page):
                 "no_lcevc": self.nolcevc.isChecked(), "params": self.x265.text().strip(), "verify": int(self.verify.value()),
                 "audio_mode": self.audio_mode.currentData(), "keep_orig": self.keep_orig.isChecked(), "audio_format": self.afmt.currentData(),
                 "audio_delay": self.adelay.text().strip() or "auto", "native_layout": int(self.layout_cb.currentData()),
-                "compat_51": self.compat.isChecked()}
+                "compat_51": self.compat.isChecked(), "normalize": self.norm.value(), "true_peak": float(self.norm.peak.value())}
 
     def apply_settings(self, s: dict) -> list:
         """Aplica uma predefinição; o que não existe neste computador (codificador, por exemplo) é ignorado e devolvido na lista de avisos."""
@@ -1158,6 +1227,8 @@ class TranscodePage(Page):
                 self.adelay.setText(s["audio_delay"])
             if "compat_51" in s:
                 self.compat.setChecked(s["compat_51"])
+            if "normalize" in s:
+                self.norm.set_value(s["normalize"], s.get("true_peak"))
         finally:
             self._applying = False
         return warn
@@ -1167,7 +1238,7 @@ class TranscodePage(Page):
         for sig in (self.encoder.currentIndexChanged, self.crf.valueChanged, self.maxrate.valueChanged, self.preset.currentIndexChanged, self.container.currentIndexChanged,
                     self.size.textChanged, self.limit.valueChanged, self.nolcevc.toggled, self.x265.textChanged, self.verify.valueChanged,
                     self.audio_mode.currentIndexChanged, self.keep_orig.toggled, self.afmt.currentIndexChanged, self.adelay.textChanged,
-                    self.layout_cb.currentIndexChanged, self.compat.toggled):
+                    self.layout_cb.currentIndexChanged, self.compat.toggled, self.norm.changed):
             sig.connect(self._preset_dirty)
         self._fill_presets(QSettings().value("tc_preset_last", "", str))
         name = self.preset_cb.currentData()
@@ -1313,6 +1384,7 @@ class TranscodePage(Page):
             if mode == "render":
                 for s in specs:
                     a += ["--option", s]
+                a += self.norm.args()
                 a += ["--audio-format", self.afmt.currentData(), "--audio-delay", self.adelay.text().strip() or "auto",
                       "--original-audio", "keep" if self.keep_orig.isChecked() else "drop", "--native-layout", str(self.layout_cb.currentData())]
                 if self.compat.isChecked():
