@@ -220,5 +220,54 @@ tp.store.user["de outra versão"] = {"encoder": "vp9", "crf": 25.0, "limit": 12}
 warn = tp.apply_settings(tp.store.get("de outra versão"))
 check("predefinições: codificador desconhecido é avisado e o resto é aplicado", bool(warn) and "vp9" in warn[0] and tp.limit.value() == 12)
 w.close()
+
+# --- normalização de volume
+w = G.MainWindow(); w.show(); done(w)
+w.nav_to("transcode"); tp = w.pages["transcode"]; tp.files.add_item("a", f1)
+check("normalizar: desligado por padrão, nada vai para o comando", tp.norm.args() == [] and "--normalize" not in tp.build_jobs(True)[0].args)
+check("normalizar: desligado esconde o pico e a meta", tp.norm.peak.isHidden() and tp.norm.target.isHidden())
+tp.norm.combo.setCurrentIndex(tp.norm.combo.findData("ebu")); tp.norm.peak.setValue(-2)
+a = tp.build_jobs(True)[0].args
+check("normalizar: EBU vira --normalize ebu --true-peak -2", a[a.index("--normalize") + 1] == "ebu" and a[a.index("--true-peak") + 1] == "-2" and not tp.norm.peak.isHidden())
+tp.norm.combo.setCurrentIndex(tp.norm.combo.findData("custom")); tp.norm.target.setValue(-18.5)
+a = tp.build_jobs(True)[0].args
+check("normalizar: outro valor em LUFS", a[a.index("--normalize") + 1] == "-18.5" and not tp.norm.target.isHidden())
+tp.audio_mode.setCurrentIndex(tp.audio_mode.findData("copy"))
+check("normalizar: só vale no modo que renderiza os áudios", "--normalize" not in tp.build_jobs(True)[0].args)
+tp.audio_mode.setCurrentIndex(tp.audio_mode.findData("render"))
+n = tp.save_preset_as("com volume"); tp.norm.combo.setCurrentIndex(0); tp.preset_cb.setCurrentIndex(tp.preset_cb.findData("com volume")); tp._preset_chosen()
+check("normalizar: faz parte das predefinições", tp.norm.value() == "-18.5" and tp.norm.peak.value() == -2)
+tp.delete_preset("com volume")
+w.nav_to("audio"); ap = w.pages["audio"]; ap.input.setText(f1); ap.scan(); done(w)
+ap.catalog._rows["group:2"]["item"].setCheckState(0, Qt.CheckState.Checked)
+ap.norm.combo.setCurrentIndex(ap.norm.combo.findData("streaming"))
+ja = ap.build_jobs()[0].args
+check("normalizar: a tela de áudio MPEG-H também passa --normalize", ja[ja.index("--normalize") + 1] == "streaming")
+w.close()
+
+# --- aviso nativo ao terminar
+w = G.MainWindow(); w.show(); done(w)
+sent = []
+w.notifier.notify = lambda title, text, kind="info": sent.append((title, text, kind)) or True
+w.settings.setValue("notify/enabled", True); w.settings.setValue("notify/only_background", False)
+w.nav_to("frame"); fp = w.pages["frame"]; fp.input.setText(f1); fp.run_built(fp.build_frame); done(w)
+check("aviso: tarefa concluída gera 'Concluído' com o nome da tarefa", len(sent) == 1 and sent[0][0] == "Concluído" and "Extrair quadro" in sent[0][1])
+w.settings.setValue("notify/only_background", True); w.isActiveWindow = lambda: True
+fp.run_built(fp.build_frame); done(w)
+check("aviso: 'só em segundo plano' não avisa com a janela em foco", len(sent) == 1)
+w.isActiveWindow = lambda: False; fp.run_built(fp.build_frame); done(w)
+check("aviso: em segundo plano avisa", len(sent) == 2)
+w.notify_act.setChecked(False); fp.run_built(fp.build_frame); done(w)
+check("aviso: desligado no menu não avisa e a opção é lembrada", len(sent) == 2 and w.settings.value("notify/enabled", True, bool) is False)
+w.notify_act.setChecked(True)
+w._q_jobs = [{"title": "Transcodificar · a.mp4", "ok": False, "quiet": False, "err": "disco cheio"}]; w._notify_done(False, False)
+check("aviso: erro leva o motivo", sent[-1][0] == "Erro" and "disco cheio" in sent[-1][1] and sent[-1][2] == "error")
+w.nav_to("tools"); w.pages["tools"].check(); done(w)
+check("aviso: verificação pedida pelo usuário avisa", len(sent) == 4 and sent[-1][1] == "Verificando ferramentas")
+w.startup_check(); done(w)
+check("aviso: verificação silenciosa do início não avisa", len(sent) == 4)
+from dtv_gui_notify import Notifier as _N
+check("aviso: sem bandeja/serviço (aqui, offscreen), notificar devolve False em vez de falhar", _N(w).notify("t", "x") is False)
+w.close()
 print("RESULTADO:", sum(ok), "/", len(ok))
 sys.exit(0 if all(ok) else 1)

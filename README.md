@@ -143,6 +143,8 @@ python dtv_tools.py mpegh-audio ENTRADA [--option preset:0 --option group:3=flac
 | `--jobs N` | Decodificações em paralelo. Padrão: metade dos núcleos da CPU |
 | `--mux` | `none` (padrão): gera apenas os arquivos de áudio. `add`: gera os arquivos de áudio **e** `<nome>_multiaudio.mp4` com vídeo original e todas as trilhas processadas. `only`: só o MP4, com os arquivos de áudio removidos |
 | `--audio-delay MS` | Atraso em ms aplicado às trilhas acrescentadas pelo `--mux`. Padrão = 0 |
+| `--normalize off\|ebu\|atsc\|streaming\|LUFS` | Normaliza o volume dos áudios gerados. `ebu` = −23 LUFS, `atsc` = −24, `streaming` = −16, ou um valor entre −40 e −5. Padrão = `off`. O volume integrado e o pico verdadeiro (EBU R128) são medidos no áudio já decodificado e aplica-se **um único ganho** constante, então a dinâmica da mistura não muda. O ganho nunca leva o pico acima de `--true-peak`: se levaria, ele é reduzido, o arquivo fica abaixo da meta e o registro avisa. Não é o mesmo que `--target-loudness`, que usa os metadados do MPEG-H dentro do decoder |
+| `--true-peak DBTP` | Pico verdadeiro máximo depois de `--normalize`, entre −9 e 0 dBTP. Padrão = −1 |
 | `--drc-effect N` | Tipo de efeito DRC do decoder (`-dse`, padrão 0) |
 | `--target-loudness NÍVEL` | Loudness alvo do decoder (`-rl`); vazio = padrão do decoder |
 | `--sleep-mode`, `--uim-version` | Avançado: como os comandos de interatividade são temporizados (`relative`) e a versão do protocolo do UI manager (`11.0`) |
@@ -272,7 +274,7 @@ python dtv_tools.py transcode ENTRADA.mp4 [-o SAIDA.mp4] [--audio render|copy|no
 |---|---|
 | `-o`, `--output` | Saída (`.mp4`, `.m4v`, `.mov` ou `.mkv`). Padrão `<nome>_hevc_hdr10.mp4` ou `<nome>_av1_hdr10.mp4` (`.mkv` quando há trilhas PCM/FLAC) |
 | `--audio` | `render` (padrão): cada preset MPEG-H vira uma trilha, como em `mpegh-audio`. `copy`: só a trilha original (não precisa das ferramentas MPEG-H); `none` |
-| `--option`, `--audio-format`, `--audio-delay`, `--original-audio`, `--native-layout`, `--jobs` | Mesmo significado de `mpegh-audio`; `--original-audio keep` acrescenta a trilha original MPEG-H no fim |
+| `--option`, `--audio-format`, `--audio-delay`, `--normalize`, `--true-peak`, `--original-audio`, `--native-layout`, `--jobs` | Mesmo significado de `mpegh-audio`; `--original-audio keep` acrescenta a trilha original MPEG-H no fim |
 | `--container` | `auto`, `mp4` ou `mkv` |
 | `--crf`, `--preset`, `--encoder-params` | Ajustes do encoder. Os padrões e as escalas dependem do codificador (veja abaixo). Parâmetros extras são anexados aos do HDR10. `--x265-params` e `--nvenc-params` são nomes antigos de `--encoder-params` |
 | `--max-bitrate MBPS` | Limita o **pico** de bitrate do vídeo, em Mbit/s, mantendo a qualidade de `--crf` (0 = sem limite, o padrão). Funciona nos quatro codificadores (tabela abaixo). Referência: HEVC 20 Mbps, AV1 15 Mbps. O limite é aproximado: a média de um trecho curto pode passar um pouco dele |

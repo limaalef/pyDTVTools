@@ -26,6 +26,7 @@ import io
 import itertools
 import json
 import os
+import math
 import re
 import shlex
 import shutil
@@ -3557,15 +3558,71 @@ def set_option_layout(o, lay):
     return o
 
 
-def encode_audio(ffmpeg, wav_path, out_path, fmt_key, br, dur, cut_warn=False, on_pct=None):
+# Volume normalization of the rendered audio (--normalize). Measured on the decoded WAV with ffmpeg's loudnorm (EBU R128: integrated loudness and
+# true peak, all channels, LFE excluded), then applied as ONE constant gain, so the dynamics of the mix are untouched. The gain never pushes
+# the true peak above --true-peak: if it would, it is reduced and the file ends up quieter than the target (reported).
+LOUDNESS_PRESETS = {"ebu": -23.0, "atsc": -24.0, "streaming": -16.0}
+
+
+def loudness_target(a):
+    """--normalize -> target in LUFS, or None (off). Validates --true-peak too."""
+    v = str(getattr(a, "normalize", "off") or "off").strip().lower()
+    tp = getattr(a, "true_peak", -1.0)
+    if tp is None or not -9.0 <= tp <= 0.0:
+        raise Fail("--true-peak deve estar entre -9 e 0 dBTP.")
+    if v in ("off", "none", "no", "0"):
+        return None
+    if v in LOUDNESS_PRESETS:
+        return LOUDNESS_PRESETS[v]
+    try:
+        x = float(v.replace(",", "."))
+    except ValueError:
+        raise Fail(f"--normalize: use off, {', '.join(LOUDNESS_PRESETS)} ou um valor em LUFS (ex.: -23).")
+    if not -40.0 <= x <= -5.0:
+        raise Fail("--normalize: o alvo deve estar entre -40 e -5 LUFS.")
+    return x
+
+
+def measure_loudness(ffmpeg, wav):
+    """{'i': LUFS, 'tp': dBTP, 'lra': LU} of a WAV, or None when it cannot be measured (silence)."""
+    cmd = [ffmpeg, "-hide_banner", "-nostats"] + (["-ignore_length", "1"] if Path(wav).suffix.lower() == ".wav" else []) + [
+        "-i", str(wav), "-af", "loudnorm=I=-23:TP=-1:LRA=11:print_format=json", "-f", "null", "-"]
+    r = sp_run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, **NOWIN)
+    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr or "", re.S)
+    if r.returncode != 0 or not m:
+        raise Fail(f"O ffmpeg não conseguiu medir o volume de {Path(wav).name}: {(r.stderr or '').strip()[-200:]}")
+    j = json.loads(m.group(0))
+    try:
+        i, tp = float(j["input_i"]), float(j["input_tp"])
+    except ValueError:
+        return None
+    if math.isinf(i) or math.isnan(i) or math.isinf(tp):
+        return None
+    return {"i": i, "tp": tp, "lra": float(j.get("input_lra", 0) or 0)}
+
+
+def loudness_gain(m, target, tp_limit):
+    """-> (gain in dB, limited by the peak?). Gains under 0.05 dB are not applied."""
+    g = target - m["i"]
+    limited = False
+    if m["tp"] + g > tp_limit:
+        g, limited = tp_limit - m["tp"], True
+    g = round(g, 2)
+    return (0.0 if abs(g) < 0.05 else g), limited
+
+
+def encode_audio(ffmpeg, wav_path, out_path, fmt_key, br, dur, cut_warn=False, on_pct=None, gain_db=0.0):
     fdef = FORMATS[fmt_key]
     cmd = [
         ffmpeg, "-hide_banner", "-y", "-v", "error",
         "-progress", "pipe:1", "-nostats",
         "-ignore_length", "1", "-i", str(wav_path)
     ]
+    af = ([f"volume={gain_db:.2f}dB"] if gain_db else []) + (["apad"] if dur and cut_warn else [])
+    if af:
+        cmd += ["-af", ",".join(af)]
     if dur and cut_warn:
-        cmd += ["-af", "apad", "-t", f"{dur:.3f}"]
+        cmd += ["-t", f"{dur:.3f}"]
     elif dur:
         cmd += ["-t", f"{dur:.3f}"]
     cmd += list(fdef["args"])
@@ -3829,12 +3886,14 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
         except Exception:
             enc_plan = {}
 
+    norm_target = loudness_target(a)
+    loud_info = {}
     for idx, o in enumerate(chosen):
         tag, cicp = o["inputs"][0]
         wav = wav_paths[(tag, cicp)]
         ext = FORMATS[o["fmt"]]["ext"]
         target_dir = outdir if keep_audio_files else tmp
-        plan_key = f"{o['id']}|{o['fmt']}|{o.get('br') or ''}|{cicp}"
+        plan_key = f"{o['id']}|{o['fmt']}|{o.get('br') or ''}|{cicp}" + (f"|N{norm_target:g}/{a.true_peak:g}" if norm_target is not None else "")
         enc_done = tmp / f"enc_{slug(plan_key)}.done"
 
         if plan_key in enc_plan:
@@ -3852,8 +3911,21 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
             out_file.unlink(missing_ok=True)
             has_cut = (tag, cicp) in cut_warnings
             progress(pfx + "encode", idx / n_chosen, f"[{idx + 1}/{len(chosen)}] Convertendo {out_file.name}…", force=True)
+            gain = 0.0
+            loud_info.pop(o["id"], None)
+            if norm_target is not None:
+                progress(pfx + "encode", idx / n_chosen, f"[{idx + 1}/{len(chosen)}] Medindo o volume de {out_file.name}…", force=True)
+                m = measure_loudness(ffmpeg, wav)
+                if m is None:
+                    note(f"{out_file.name}: sem sinal para medir o volume; mantido como está.")
+                else:
+                    gain, limited = loudness_gain(m, norm_target, a.true_peak)
+                    loud_info[o["id"]] = {"input_lufs": m["i"], "input_tp": m["tp"], "target_lufs": norm_target, "gain_db": gain,
+                                          "limited_by_peak": limited, "output_lufs": round(m["i"] + gain, 2)}
+                    say(f"  Volume de {out_file.name}: {m['i']:.1f} LUFS, pico {m['tp']:.1f} dBTP → {m['i'] + gain:.1f} LUFS ({gain:+.2f} dB)"
+                        + (f" — limitado pelo pico máximo de {a.true_peak:g} dBTP; o alvo era {norm_target:g} LUFS" if limited else ""))
             encode_audio(
-                ffmpeg, wav, out_file, o["fmt"], o.get("br"), dur, cut_warn=has_cut,
+                ffmpeg, wav, out_file, o["fmt"], o.get("br"), dur, cut_warn=has_cut, gain_db=gain,
                 on_pct=lambda sub_f, i=idx, fn=out_file.name: progress(
                     pfx + "encode", (i + sub_f) / n_chosen, f"[{i + 1}/{len(chosen)}] {fn} ({sub_f * 100:.0f}%)"
                 )
@@ -3868,6 +3940,7 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
             "size": out_file.stat().st_size,
             "duration": dur,
             "option_id": o["id"],
+            **({"loudness": loud_info[o["id"]]} if o["id"] in loud_info else {}),
         })
 
     enc_msg = f"{len(made)} arquivo(s) de áudio gerado(s)"
@@ -3881,6 +3954,7 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
 
 
 def cmd_mpegh_audio(a):
+    loudness_target(a)                                                 # validates --normalize / --true-peak before any long work
     src = Path(a.input).resolve()
     if not src.is_file():
         raise Fail(f"Arquivo não encontrado: {src}")
@@ -5754,6 +5828,7 @@ TC_WEIGHTS_VIDEO = {"probe": 4, "encode": 95, "report": 1}
 
 
 def cmd_transcode(a):
+    loudness_target(a)
     render = a.audio == "render"
     set_steps(TC_STEPS_VIDEO + (TC_STEPS_AUDIO if render else []) +
               [("encode", f"Codificar o vídeo {CODEC_NAMES[ENCODERS[a.encoder]['codec']]} HDR10" + (" e montar o arquivo" if render else "")), ("report", "Resumo")])
@@ -6191,7 +6266,10 @@ def cmd_sdr(a):
 
 
 # ──────────────────────────── CLI ────────────────────────────
-_MP_HELP = {"--drc-effect": "decoder DRC effect type (-dse; default 0)",
+_MP_HELP = {"--normalize": "normalize the volume of the rendered audio: off (default), ebu (-23 LUFS), atsc (-24), streaming (-16) or a LUFS value (-40..-5); "
+                           "one constant gain, never above --true-peak",
+            "--true-peak": "highest true peak after --normalize, in dBTP (default -1)",
+            "--drc-effect": "decoder DRC effect type (-dse; default 0)",
             "--target-loudness": "decoder target loudness (-rl); empty = decoder default",
             "--sleep-mode": "how interactivity commands are timed (advanced; default relative)",
             "--uim-version": "UI manager protocol version (advanced; default 11.0)"}
@@ -6292,6 +6370,9 @@ def build_parser():
     s_aud.add_argument("--jobs", type=int, default=0)
     s_aud.add_argument("--mux", default="none")
     s_aud.add_argument("--audio-delay", default="0")
+    s_aud.add_argument("--normalize", default="off", metavar="off|ebu|atsc|streaming|LUFS",
+                       help="normalize the volume of the generated audio files (EBU R128 measurement, one constant gain); default off")
+    s_aud.add_argument("--true-peak", type=float, default=-1.0, metavar="DBTP", help="highest true peak after --normalize (default -1)")
     s_aud.add_argument("--drc-effect", default="0")
     s_aud.add_argument("--target-loudness", default="")
     s_aud.add_argument("--sleep-mode", default="relative")
@@ -6384,6 +6465,9 @@ def build_parser():
                       help="what to render, e.g. preset:1 or group:3=aac:192k@2.0 (@LAYOUT = 2.0 or 5.1; repeat or comma list; default: all presets, no groups)")
     s_tc.add_argument("--audio-format", choices=("auto", "aac", "eac3", "flac", "wav"), default="auto", help="auto = AAC for 2.0, E-AC-3 for 5.1, WAV above (per option)")
     s_tc.add_argument("--audio-delay", default="auto", metavar="auto|MS", help="rendered audio offset; auto = start of the original track")
+    s_tc.add_argument("--normalize", default="off", metavar="off|ebu|atsc|streaming|LUFS",
+                      help="normalize the volume of the rendered audio tracks (EBU R128 measurement, one constant gain); default off")
+    s_tc.add_argument("--true-peak", type=float, default=-1.0, metavar="DBTP", help="highest true peak after --normalize (default -1)")
     s_tc.add_argument("--original-audio", choices=("keep", "drop"), default="keep", help="also keep the original MPEG-H track (last)")
     s_tc.add_argument("--container", choices=("auto", "mp4", "mkv"), default="auto")
     s_tc.add_argument("--native-layout", type=int, default=0, help="0=auto (detect from the stream), 2=2.0, 6=5.1, 16=5.1.4, 19=7.1.4")

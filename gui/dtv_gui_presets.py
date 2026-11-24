@@ -17,7 +17,7 @@ KEYS = {
     "encoder": (str, None), "crf": (float, None), "max_bitrate": (float, None), "preset": (str, None), "container": (str, ("auto", "mp4", "mkv")),
     "size": (str, None), "limit": (int, None), "no_lcevc": (bool, None), "params": (str, None), "verify": (int, None),
     "audio_mode": (str, ("render", "copy", "none")), "keep_orig": (bool, None), "audio_format": (str, ("auto", "aac", "eac3", "flac", "wav")),
-    "audio_delay": (str, None), "native_layout": (int, (0, 2, 6, 16, 19)), "compat_51": (bool, None),
+    "audio_delay": (str, None), "native_layout": (int, (0, 2, 6, 16, 19)), "compat_51": (bool, None), "normalize": (str, None), "true_peak": (float, None),
 }
 
 BUILTIN = {
