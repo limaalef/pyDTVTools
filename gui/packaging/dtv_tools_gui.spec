@@ -11,6 +11,9 @@ GUI = Path(SPECPATH).resolve().parent      # gui/
 ROOT = GUI.parent                           # raiz do projeto (dtv_tools.py)
 NAME = "DTV-Tools"
 VERSION = os.environ.get("DTV_VERSION", "1.2.2")
+# macOS: assinatura Developer ID (opcional). Sem DTV_MAC_IDENTITY o app sai sem assinatura própria (o PyInstaller usa assinatura ad-hoc no arm64).
+MAC_ID = os.environ.get("DTV_MAC_IDENTITY") or None
+ENTITLEMENTS = str(GUI / "packaging" / "entitlements.plist") if MAC_ID else None
 ONEFILE = sys.platform != "darwin" and os.environ.get("DTV_ONEDIR", "") not in ("1", "true", "yes")
 
 datas = [(str(GUI / "packaging" / "icon.png"), "packaging"), (str(GUI / "icons"), "icons")]
@@ -49,6 +52,8 @@ else:
         console=False,
         icon=icon,
         upx=False,
+        codesign_identity=MAC_ID,
+        entitlements_file=ENTITLEMENTS,
     )
     coll = COLLECT(exe, a.binaries, a.datas, name=NAME, upx=False)
 
@@ -58,6 +63,8 @@ if sys.platform == "darwin":
         name=NAME + ".app",
         icon=icon,
         bundle_identifier="br.dtv.tools",
+        codesign_identity=MAC_ID,
+        entitlements_file=ENTITLEMENTS,
         info_plist={
             "CFBundleName": "DTV Tools",
             "CFBundleDisplayName": "DTV Tools",

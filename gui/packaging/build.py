@@ -8,6 +8,14 @@ Uso (a partir de qualquer pasta):
     python gui/packaging/build.py --version 1.2.2
     python gui/packaging/build.py --onedir     # pasta DTV-Tools/ com _internal/ em vez de um único arquivo
     python gui/packaging/build.py --tools DIR  # (opcional) embute os programas de DIR como tools/
+    python gui/packaging/build.py --require-signing   # falha se não houver certificado configurado
+
+Assinatura (opcional; sem certificado o executável sai sem assinatura). Tudo por variáveis de ambiente:
+  Windows   DTV_SIGN_PFX=<arquivo.pfx> ou DTV_SIGN_PFX_BASE64=<conteúdo em base64>, DTV_SIGN_PASSWORD, [DTV_SIGN_TIMESTAMP=<url>]
+            (usa o signtool do Windows SDK) -- ou DTV_SIGN_COMMAND='comando "{file}"' para qualquer outra ferramenta (Azure Trusted Signing etc.)
+  macOS     DTV_MAC_IDENTITY="Developer ID Application: Nome (TEAMID)" (o certificado já no chaveiro) e, para notarizar,
+            DTV_NOTARY_APPLE_ID, DTV_NOTARY_TEAM_ID, DTV_NOTARY_PASSWORD (senha específica de app)
+  qualquer  DTV_SIGN_COMMAND roda para o executável (Windows/Linux) em qualquer sistema
 
 Windows/Linux: um único arquivo (dist/DTV-Tools.exe ou dist/DTV-Tools); macOS: DTV-Tools.app (sempre uma pasta por dentro).
 Saída: dist/…  e  release/DTV-Tools-<versão>-<plataforma>.{exe,zip,tar.gz,dmg} + .sha256
@@ -15,7 +23,7 @@ Os programas externos são configurados pelo usuário na tela "Ferramentas e pas
 """
 from __future__ import annotations
 
-import argparse, hashlib, os, platform, shutil, subprocess, sys, tarfile, zipfile
+import argparse, base64, glob, hashlib, os, platform, shutil, subprocess, sys, tarfile, tempfile, zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +41,88 @@ def plat() -> str:
 def run(cmd, **kw):
     print("+", " ".join(map(str, cmd)), flush=True)
     return subprocess.run(cmd, check=True, cwd=ROOT, **kw)
+
+
+def find_signtool() -> str | None:
+    found = shutil.which("signtool")
+    if found:
+        return found
+    cands = sorted(glob.glob(r"C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe"))
+    return cands[-1] if cands else None
+
+
+def windows_sign_cmd(signtool: str, pfx: str, password: str, timestamp: str, target) -> list:
+    return [signtool, "sign", "/f", pfx, "/p", password, "/fd", "SHA256", "/tr", timestamp, "/td", "SHA256", "/d", "DTV Tools", str(target)]
+
+
+def sign_configured() -> bool:
+    if os.environ.get("DTV_SIGN_COMMAND"):
+        return True
+    if sys.platform == "win32":
+        return bool(os.environ.get("DTV_SIGN_PFX") or os.environ.get("DTV_SIGN_PFX_BASE64"))
+    if sys.platform == "darwin":
+        return bool(os.environ.get("DTV_MAC_IDENTITY"))
+    return False
+
+
+def sign_file(target: Path) -> bool:
+    """Assina um arquivo (Windows: signtool com PFX; qualquer sistema: DTV_SIGN_COMMAND). False = nada configurado."""
+    custom = os.environ.get("DTV_SIGN_COMMAND")
+    if custom:
+        cmd = custom.replace("{file}", str(target))
+        print("+ (DTV_SIGN_COMMAND)", cmd, flush=True)
+        subprocess.run(cmd, shell=True, check=True, cwd=ROOT)
+        return True
+    if sys.platform != "win32":
+        return False
+    pfx, b64, pw = os.environ.get("DTV_SIGN_PFX"), os.environ.get("DTV_SIGN_PFX_BASE64"), os.environ.get("DTV_SIGN_PASSWORD", "")
+    if not (pfx or b64):
+        return False
+    tool = find_signtool()
+    if not tool:
+        raise SystemExit("signtool não encontrado (instale o Windows SDK ou ponha o signtool.exe no PATH).")
+    tmp = None
+    try:
+        if not pfx:
+            fd, tmp = tempfile.mkstemp(suffix=".pfx")
+            with os.fdopen(fd, "wb") as f:
+                f.write(base64.b64decode(b64))
+            pfx = tmp
+        ts = os.environ.get("DTV_SIGN_TIMESTAMP", "http://timestamp.digicert.com")
+        subprocess.run(windows_sign_cmd(tool, pfx, pw, ts, target), check=True, cwd=ROOT)
+        subprocess.run([tool, "verify", "/pa", str(target)], check=True, cwd=ROOT)
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return True
+
+
+def sign_app(exe: Path) -> bool:
+    """Assina o executável gerado. No macOS o PyInstaller já assinou o .app (DTV_MAC_IDENTITY); aqui só se confere."""
+    if sys.platform == "darwin":
+        ident = os.environ.get("DTV_MAC_IDENTITY")
+        if not ident:
+            return sign_file(exe)
+        app = ROOT / "dist" / f"{NAME}.app"
+        run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", app])
+        return True
+    return sign_file(exe)
+
+
+def notarize(dmg: Path) -> bool:
+    """macOS: assina o .dmg, envia à Apple (notarytool) e grampeia o resultado. Exige as três variáveis DTV_NOTARY_*."""
+    ident = os.environ.get("DTV_MAC_IDENTITY")
+    aid, team, pw = (os.environ.get(k) for k in ("DTV_NOTARY_APPLE_ID", "DTV_NOTARY_TEAM_ID", "DTV_NOTARY_PASSWORD"))
+    if sys.platform != "darwin" or not (ident and aid and team and pw):
+        return False
+    run(["codesign", "--force", "--timestamp", "--sign", ident, dmg])
+    run(["xcrun", "notarytool", "submit", dmg, "--apple-id", aid, "--team-id", team, "--password", pw, "--wait"])
+    run(["xcrun", "stapler", "staple", dmg])
+    run(["xcrun", "stapler", "validate", dmg])
+    return True
 
 
 def exe_path(onedir: bool) -> Path:
@@ -79,6 +169,8 @@ def package(version: str, onedir: bool) -> Path:
         out = rel / f"{base}.tar.gz"
         with tarfile.open(out, "w:gz") as t:
             t.add(ROOT / "dist" / NAME, arcname=NAME)
+    if out.suffix == ".dmg":
+        print("notarização:", "ok" if notarize(out) else "pulada (DTV_NOTARY_* não definidas)")
     digest = hashlib.sha256(out.read_bytes()).hexdigest()
     (rel / f"{base}.sha256").write_text(f"{digest}  {out.name}\n")
     print("pacote:", out, f"({out.stat().st_size / 1e6:.1f} MB)")
@@ -91,6 +183,7 @@ def main() -> int:
     ap.add_argument("--tools", help="pasta com programas a embutir (opcional; por padrão nada é embutido)")
     ap.add_argument("--onedir", action="store_true", help="pasta com _internal/ em vez de arquivo único (Windows/Linux)")
     ap.add_argument("--no-test", action="store_true")
+    ap.add_argument("--require-signing", action="store_true", help="falha se nenhum certificado de assinatura estiver configurado")
     ap.add_argument("--no-package", action="store_true")
     ap.add_argument("--keep", action="store_true", help="não apaga build/ e dist/ antes")
     a = ap.parse_args()
@@ -100,6 +193,9 @@ def main() -> int:
         import PySide6  # noqa: F401
     except ImportError:
         print("Instale antes:  pip install -r gui/requirements.txt pyinstaller", file=sys.stderr)
+        return 2
+    if a.require_signing and not sign_configured():
+        print("--require-signing: nenhum certificado configurado (veja a ajuda: DTV_SIGN_*, DTV_MAC_IDENTITY).", file=sys.stderr)
         return 2
     if not a.keep:
         for d in ("build", "dist"):
@@ -116,7 +212,8 @@ def main() -> int:
     if not exe.exists():
         print("executável não encontrado:", exe, file=sys.stderr)
         return 1
-    if not a.no_test:
+    print("assinatura:", "ok" if sign_app(exe) else "nenhum certificado configurado: executável sem assinatura")
+    if not a.no_test:                                                  # depois de assinar: garante que a assinatura não quebrou o executável
         smoke(exe)
     if not a.no_package:
         package(a.version, a.onedir)

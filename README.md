@@ -371,6 +371,25 @@ Para qualquer programa que controle o script, `--json` imprime **somente** event
 etapas e seus pesos, `progress` com a etapa e sua fração, `log`, `result`, `error`), `--control` permite parar a execução pelo
 stdin e `describe` imprime comandos, opções, ferramentas, formatos e layouts em JSON. Os campos só são acrescentados.
 
+### Gerar o executável e assiná-lo
+
+`python gui/packaging/build.py` gera o executável (arquivo único no Windows e no Linux, `.app` no macOS), testa e empacota em `release/`. O
+workflow do GitHub faz o mesmo nos quatro sistemas e, numa tag `v*`, publica a Release. **A assinatura é opcional**: sem certificado, o
+executável sai sem assinatura (o Windows mostra o aviso do SmartScreen e o macOS pede para liberar o app).
+
+| Sistema | O que é preciso | Onde configurar no GitHub (Settings → Secrets and variables → Actions) |
+|---|---|---|
+| Windows | Certificado de assinatura de código (`.pfx`) de uma autoridade certificadora | Segredos `WINDOWS_CERT_PFX_BASE64` (o `.pfx` em base64: `base64 -w0 cert.pfx`) e `WINDOWS_CERT_PASSWORD` |
+| macOS | Conta Apple Developer (paga) e certificado *Developer ID Application* exportado como `.p12` | Segredos `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_NOTARY_APPLE_ID`, `MACOS_NOTARY_TEAM_ID`, `MACOS_NOTARY_PASSWORD` (senha específica de app); variável `MACOS_SIGN_IDENTITY` (`Developer ID Application: Nome (TIMEID)`) |
+| Linux | Nada: não há assinatura de executável | — |
+
+O macOS é assinado com Hardened Runtime, o `.dmg` é notarizado pela Apple e o resultado é grampeado (`stapler`). No Windows, o executável é
+assinado com SHA-256 e carimbo de tempo (`DTV_SIGN_TIMESTAMP` troca o servidor) e a assinatura é verificada. Para outra ferramenta de assinatura
+(Azure Trusted Signing, SignPath, token de hardware), defina `DTV_SIGN_COMMAND` com o comando, usando `{file}` no lugar do arquivo.
+A variável `REQUIRE_SIGNING = true` faz as Releases do Windows e do macOS falharem se faltar o certificado. Em tags, o workflow também gera um
+atestado de procedência do GitHub para cada arquivo (`gh attestation verify ARQUIVO --repo DONO/REPOSITORIO`). A assinatura é feita antes do teste
+de fumaça, então um executável que parou de abrir por causa dela é pego no próprio build.
+
 ## Aviso legal
  
 - **Software de terceiros.** As ferramentas MPEG-H (Fraunhofer) e LCEVC (V-Nova), o MP4Box (GPAC) e o ffmpeg têm licenças e termos de patente próprios. Este projeto não os contém nem os redistribui; você os instala por conta própria e é responsável por cumprir os termos deles.
