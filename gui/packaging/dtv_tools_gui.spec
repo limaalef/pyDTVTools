@@ -2,6 +2,7 @@
 # PyInstaller (a partir da raiz do projeto): pyinstaller gui/packaging/dtv_tools_gui.spec --noconfirm
 #   DTV_TOOLS_SRC=<pasta>   (opcional) pasta com MP4Box/ffmpeg/mpegh* a embutir como tools/
 #   DTV_VERSION=1.0.0       (opcional) versão exibida no bundle do macOS
+#   DTV_ONEDIR=1            (opcional) pasta com _internal/ em vez de um único arquivo (Windows/Linux; o macOS sempre gera .app)
 import os
 import sys
 from pathlib import Path
@@ -9,7 +10,8 @@ from pathlib import Path
 GUI = Path(SPECPATH).resolve().parent      # gui/
 ROOT = GUI.parent                           # raiz do projeto (dtv_tools.py)
 NAME = "DTV-Tools"
-VERSION = os.environ.get("DTV_VERSION", "1.2.1")
+VERSION = os.environ.get("DTV_VERSION", "1.2.2")
+ONEFILE = sys.platform != "darwin" and os.environ.get("DTV_ONEDIR", "") not in ("1", "true", "yes")
 
 datas = [(str(GUI / "packaging" / "icon.png"), "packaging"), (str(GUI / "icons"), "icons")]
 tools_src = os.environ.get("DTV_TOOLS_SRC", "")
@@ -29,15 +31,26 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
-exe = EXE(
-    pyz, a.scripts, [],
-    exclude_binaries=True,
-    name=NAME,
-    console=False,            # GUI sem janela de terminal; o modo --cli reabre stdout/stdin (dtv_tools._fix_stdio)
-    icon=icon,
-    upx=False,
-)
-coll = COLLECT(exe, a.binaries, a.datas, name=NAME, upx=False)
+if ONEFILE:
+    # Arquivo único: tudo vai dentro do executável e é extraído numa pasta temporária ao abrir. O PyInstaller 6.9+ reaproveita
+    # essa extração nos processos filhos que são o próprio executável (--cli), então as tarefas não reextraem a cada execução.
+    exe = EXE(
+        pyz, a.scripts, a.binaries, a.datas, [],
+        name=NAME,
+        console=False,        # GUI sem janela de terminal; o modo --cli reabre stdout/stdin (dtv_tools._fix_stdio)
+        icon=icon,
+        upx=False,
+    )
+else:
+    exe = EXE(
+        pyz, a.scripts, [],
+        exclude_binaries=True,
+        name=NAME,
+        console=False,
+        icon=icon,
+        upx=False,
+    )
+    coll = COLLECT(exe, a.binaries, a.datas, name=NAME, upx=False)
 
 if sys.platform == "darwin":
     app = BUNDLE(

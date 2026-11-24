@@ -5,10 +5,12 @@ Uso (a partir de qualquer pasta):
     python gui/packaging/build.py              # build + teste de fumaça + pacote em release/
     python gui/packaging/build.py --no-test    # pula o teste de fumaça
     python gui/packaging/build.py --no-package # só gera dist/
-    python gui/packaging/build.py --version 1.2.1
+    python gui/packaging/build.py --version 1.2.2
+    python gui/packaging/build.py --onedir     # pasta DTV-Tools/ com _internal/ em vez de um único arquivo
     python gui/packaging/build.py --tools DIR  # (opcional) embute os programas de DIR como tools/
 
-Saída: dist/DTV-Tools[.app]  e  release/DTV-Tools-<versão>-<plataforma>.{zip,tar.gz,dmg} + .sha256
+Windows/Linux: um único arquivo (dist/DTV-Tools.exe ou dist/DTV-Tools); macOS: DTV-Tools.app (sempre uma pasta por dentro).
+Saída: dist/…  e  release/DTV-Tools-<versão>-<plataforma>.{exe,zip,tar.gz,dmg} + .sha256
 Os programas externos são configurados pelo usuário na tela "Ferramentas e pastas" (ou ficam em tools/ ao lado do app).
 """
 from __future__ import annotations
@@ -33,12 +35,11 @@ def run(cmd, **kw):
     return subprocess.run(cmd, check=True, cwd=ROOT, **kw)
 
 
-def exe_path() -> Path:
-    if sys.platform == "win32":
-        return ROOT / "dist" / NAME / f"{NAME}.exe"
+def exe_path(onedir: bool) -> Path:
     if sys.platform == "darwin":
         return ROOT / "dist" / f"{NAME}.app" / "Contents" / "MacOS" / NAME
-    return ROOT / "dist" / NAME / NAME
+    ext = ".exe" if sys.platform == "win32" else ""
+    return ROOT / "dist" / (NAME if onedir else "") / f"{NAME}{ext}"
 
 
 def smoke(exe: Path) -> None:
@@ -55,11 +56,18 @@ def smoke(exe: Path) -> None:
     print("teste de fumaça: ok")
 
 
-def package(version: str) -> Path:
+def package(version: str, onedir: bool) -> Path:
     rel = ROOT / "release"
     rel.mkdir(exist_ok=True)
     base = f"{NAME}-{version}-{plat()}"
-    if sys.platform == "win32":
+    if not onedir and sys.platform == "win32":
+        out = rel / f"{base}.exe"                                      # arquivo único: entregue como está
+        shutil.copy2(exe_path(False), out)
+    elif not onedir and sys.platform != "darwin":
+        out = rel / f"{base}.tar.gz"                                   # no Linux o tar.gz preserva a permissão de execução
+        with tarfile.open(out, "w:gz") as t:
+            t.add(exe_path(False), arcname=NAME)
+    elif sys.platform == "win32":
         out = rel / f"{base}.zip"
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             for p in (ROOT / "dist" / NAME).rglob("*"):
@@ -79,8 +87,9 @@ def package(version: str) -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--version", default=os.environ.get("DTV_VERSION", "1.2.1"))
+    ap.add_argument("--version", default=os.environ.get("DTV_VERSION", "1.2.2"))
     ap.add_argument("--tools", help="pasta com programas a embutir (opcional; por padrão nada é embutido)")
+    ap.add_argument("--onedir", action="store_true", help="pasta com _internal/ em vez de arquivo único (Windows/Linux)")
     ap.add_argument("--no-test", action="store_true")
     ap.add_argument("--no-package", action="store_true")
     ap.add_argument("--keep", action="store_true", help="não apaga build/ e dist/ antes")
@@ -97,17 +106,20 @@ def main() -> int:
             shutil.rmtree(ROOT / d, ignore_errors=True)
     env = dict(os.environ, DTV_VERSION=a.version)
     env.pop("DTV_TOOLS_SRC", None)
+    env.pop("DTV_ONEDIR", None)
+    if a.onedir:
+        env["DTV_ONEDIR"] = "1"
     if a.tools:
         env["DTV_TOOLS_SRC"] = str(Path(a.tools).resolve())
     run([sys.executable, "-m", "PyInstaller", str(SPEC), "--noconfirm", "--distpath", "dist", "--workpath", "build"], env=env)
-    exe = exe_path()
+    exe = exe_path(a.onedir)
     if not exe.exists():
         print("executável não encontrado:", exe, file=sys.stderr)
         return 1
     if not a.no_test:
         smoke(exe)
     if not a.no_package:
-        package(a.version)
+        package(a.version, a.onedir)
     return 0
 
 

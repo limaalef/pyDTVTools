@@ -40,7 +40,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 PROTOCOL_VERSION = 2
 # What a controlling program (the GUI) may rely on; listed by `describe`, `doctor` and the `hello` event.
 FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation")
