@@ -75,6 +75,8 @@ for theme in THEMES:
     # --- transcodificar em execução e interrompido
     win.nav_to("transcode"); pg = win.pages["transcode"]; pg.files.add_item("capture_20261122_004629.mp4   —   " + tmp, vid); pg.files.add_item("jogo_2.mp4   —   " + tmp, vid2)
     pg.scan(); idle(win)
+    pg.preset_cb.setCurrentIndex(pg.preset_cb.findData("AV1 · arquivo (SVT-AV1)")); pg._preset_chosen(); pg.crf.setValue(31); snap("04b_transcode_presets")
+    pg.preset_cb.setCurrentIndex(0); pg._preset_chosen()
     os.environ["FAKE_HOLD"] = "49"; win.runner.env_extra["FAKE_HOLD"] = "49"
     pg.run_built(lambda: pg.build_jobs(False)); wait_until(lambda: win.panel._pct >= 45); wait(400)
     win.resize(1360, 1700); wait(300); snap("05_transcode_running_full"); win.resize(1360, 860); wait(200); snap("06_transcode_running")

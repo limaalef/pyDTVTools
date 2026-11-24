@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
                                QMessageBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
                                QStackedWidget, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QTimeEdit, QTreeWidget,
-                               QTreeWidgetItem, QVBoxLayout, QWidget, QListWidget, QListWidgetItem)
+                               QTreeWidgetItem, QVBoxLayout, QWidget, QListWidget, QListWidgetItem, QFileDialog, QInputDialog, QMenu)
 
 import cutmath  # noqa: E402
 from dtv_gui_notify import Notifier, summarize
@@ -77,6 +77,10 @@ def bundled_tools_dir() -> Path:
     else:
         cands = [Path(__file__).resolve().parent.parent / "tools"]      # modo fonte: tools/ na raiz do projeto, ao lado do dtv_tools.py
     return next((c for c in cands if c.is_dir()), cands[0])
+
+
+def presets_path() -> Path:
+    return config_path().parent / "transcode_presets.json"
 
 
 def config_path() -> Path:
@@ -934,6 +938,35 @@ class TranscodePage(Page):
         gl.addWidget(self.files)
         lay.addWidget(g)
 
+        gp, fp = self.group("Predefinição")
+        self.store = PresetStore(presets_path())
+        self.preset_cb = QComboBox()
+        self.preset_cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.preset_cb.setMinimumContentsLength(24)
+        self.preset_state = muted_label("")
+        self.preset_state.setWordWrap(False)
+        self.preset_save = QPushButton("Salvar como…")
+        self.preset_del = QPushButton("Excluir")
+        self.preset_more = QPushButton("Mais…")
+        menu = QMenu(self.preset_more)
+        menu.addAction("Exportar minhas predefinições…", self._export_presets)
+        menu.addAction("Importar predefinições…", self._import_presets)
+        self.preset_more.setMenu(menu)
+        prow = QHBoxLayout()
+        prow.setContentsMargins(0, 0, 0, 0)
+        prow.addWidget(self.preset_cb, 1)
+        prow.addSpacing(4)
+        prow.addWidget(self.preset_state)
+        prow.addSpacing(4)
+        for b in (self.preset_save, self.preset_del, self.preset_more):
+            prow.addWidget(b)
+        fp.addRow("Usar", prow)
+        fp.addRow("", muted_label("Guarda o codificador, a qualidade, o contêiner, o áudio e os demais ajustes desta tela (não os arquivos nem a seleção de faixas)."))
+        lay.addWidget(gp)
+        self.preset_cb.activated.connect(self._preset_chosen)
+        self.preset_save.clicked.connect(self._save_preset)
+        self.preset_del.clicked.connect(self._delete_preset)
+
         gv, fv = self.group("Vídeo")
         self.encs = (self.win.core_info or {}).get("encoders") or FALLBACK_ENCODERS     # tabela do dtv_tools (describe)
         self.crf = self.spin(0, 63, 18, 0.5, 1)
@@ -953,6 +986,9 @@ class TranscodePage(Page):
         fv.addRow("Codificador", self.encoder)
         self.crf_lb = QLabel("Qualidade (CRF)")
         fv.addRow(self.crf_lb, self.crf)
+        self.maxrate = self.spin(0, 500, 0, 1, 1, special="Sem limite", suffix=" Mbps")
+        fv.addRow("Limite de bitrate (pico)", self.maxrate)
+        self._encoder_changed()                                      # agora que o campo existe: dica com a referência do codec
         fv.addRow("Velocidade (preset)", self.preset)
         fv.addRow("Contêiner", self.container)
         fv.addRow("Tamanho de saída", self.size)
@@ -1012,6 +1048,7 @@ class TranscodePage(Page):
         fo.addRow("", self.overwrite)
         lay.addWidget(go)
         self.files.changed.connect(lambda: self.output.setEnabled(len(self.files.values()) <= 1))
+        self._preset_wire()
         self.primary("Transcodificar", lambda: self.run_built(lambda: self.build_jobs(False)))
         dry = QPushButton("Mostrar comando")
         dry.clicked.connect(lambda: self.run_built(lambda: self.build_jobs(True)))
@@ -1042,6 +1079,10 @@ class TranscodePage(Page):
         self.crf.setRange(*e["crf_range"])
         self.crf.setSingleStep(e["step"])
         self.crf.setValue(e["crf"])
+        if hasattr(self, "maxrate"):
+            ref = e.get("ref_mbps")
+            self.maxrate.setToolTip("Mantém a qualidade escolhida, mas não deixa o bitrate passar deste valor (pico)."
+                                    + (f" Referência para este codec: {ref} Mbps." if ref else ""))
         if hasattr(self, "x265"):
             self.x265.clear()
             self.x265.setPlaceholderText(e["params_hint"])
@@ -1066,6 +1107,184 @@ class TranscodePage(Page):
         if have is not None and not have.get(self.encoder.currentData(), True):
             self.encoder.setCurrentIndex(next((i for i in range(self.encoder.count()) if have.get(self.encoder.itemData(i), True)), 0))
 
+    # ── predefinições ──────────────────────────────────────────────────────────
+    def settings(self) -> dict:
+        """Os ajustes da tela, no formato das predefinições (dtv_gui_presets.KEYS)."""
+        return {"encoder": self.encoder.currentData(), "crf": float(self.crf.value()), "max_bitrate": float(self.maxrate.value()), "preset": self.preset.currentData() or "",
+                "container": self.container.currentData(), "size": self.size.text().strip(), "limit": int(self.limit.value()),
+                "no_lcevc": self.nolcevc.isChecked(), "params": self.x265.text().strip(), "verify": int(self.verify.value()),
+                "audio_mode": self.audio_mode.currentData(), "keep_orig": self.keep_orig.isChecked(), "audio_format": self.afmt.currentData(),
+                "audio_delay": self.adelay.text().strip() or "auto", "native_layout": int(self.layout_cb.currentData()),
+                "compat_51": self.compat.isChecked()}
+
+    def apply_settings(self, s: dict) -> list:
+        """Aplica uma predefinição; o que não existe neste computador (codificador, por exemplo) é ignorado e devolvido na lista de avisos."""
+        warn = []
+        self._applying = True
+        try:
+            def pick(cb, val):
+                i = cb.findData(val)
+                if i >= 0:
+                    cb.setCurrentIndex(i)
+                return i >= 0
+            if "encoder" in s and not pick(self.encoder, s["encoder"]):
+                warn.append(f"codificador “{s['encoder']}”")
+            elif "encoder" in s and not (self.encoder.model().item(self.encoder.currentIndex()).isEnabled()):
+                warn.append(f"o ffmpeg configurado não tem o codificador “{s['encoder']}”")
+            if "crf" in s:
+                self.crf.setValue(s["crf"])
+            if "max_bitrate" in s:
+                self.maxrate.setValue(s["max_bitrate"])
+            if "preset" in s and s["preset"] and not pick(self.preset, s["preset"]):
+                warn.append(f"preset “{s['preset']}”")
+            if "preset" in s and not s["preset"]:
+                self.preset.setCurrentIndex(0)
+            for key, cb in (("container", self.container), ("audio_mode", self.audio_mode), ("audio_format", self.afmt), ("native_layout", self.layout_cb)):
+                if key in s:
+                    pick(cb, s[key])
+            if "size" in s:
+                self.size.setText(s["size"])
+            if "limit" in s:
+                self.limit.setValue(s["limit"])
+            if "no_lcevc" in s:
+                self.nolcevc.setChecked(s["no_lcevc"])
+            if "params" in s:
+                self.x265.setText(s["params"])
+            if "verify" in s:
+                self.verify.setValue(s["verify"])
+            if "keep_orig" in s:
+                self.keep_orig.setChecked(s["keep_orig"])
+            if "audio_delay" in s:
+                self.adelay.setText(s["audio_delay"])
+            if "compat_51" in s:
+                self.compat.setChecked(s["compat_51"])
+        finally:
+            self._applying = False
+        return warn
+
+    def _preset_wire(self):
+        self._applying = False
+        for sig in (self.encoder.currentIndexChanged, self.crf.valueChanged, self.maxrate.valueChanged, self.preset.currentIndexChanged, self.container.currentIndexChanged,
+                    self.size.textChanged, self.limit.valueChanged, self.nolcevc.toggled, self.x265.textChanged, self.verify.valueChanged,
+                    self.audio_mode.currentIndexChanged, self.keep_orig.toggled, self.afmt.currentIndexChanged, self.adelay.textChanged,
+                    self.layout_cb.currentIndexChanged, self.compat.toggled):
+            sig.connect(self._preset_dirty)
+        self._fill_presets(QSettings().value("tc_preset_last", "", str))
+        name = self.preset_cb.currentData()
+        if name:
+            self.apply_settings(self.store.get(name) or {})
+        self._preset_dirty()
+        if self.store.error:
+            self.preset_state.setText("lista recomeçou vazia")
+            self.preset_state.setToolTip(self.store.error)
+
+    def _fill_presets(self, select: str = ""):
+        cb = self.preset_cb
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItem("Configuração atual (sem predefinição)", "")
+        cb.insertSeparator(cb.count())
+        for n in self.store.builtin_names():
+            cb.addItem(n, n)
+            cb.setItemData(cb.count() - 1, "Já vem no programa", Qt.ItemDataRole.ToolTipRole)
+        if self.store.user_names():
+            cb.insertSeparator(cb.count())
+            for n in self.store.user_names():
+                cb.addItem(n, n)
+        i = cb.findData(select) if select else 0
+        cb.setCurrentIndex(max(0, i))
+        cb.blockSignals(False)
+        self._preset_buttons()
+
+    def _preset_buttons(self):
+        name = self.preset_cb.currentData() or ""
+        self.preset_del.setEnabled(bool(name) and not self.store.is_builtin(name))
+        self.preset_del.setToolTip("" if self.preset_del.isEnabled() else "As predefinições que já vêm no programa não podem ser excluídas")
+
+    def _preset_dirty(self, *_):
+        """Diz se a tela ainda corresponde à predefinição escolhida."""
+        if getattr(self, "_applying", False) or not hasattr(self, "store"):
+            return
+        name = self.preset_cb.currentData() or ""
+        saved = self.store.get(name) if name else None
+        if saved is None:
+            self.preset_state.setText("")
+            return
+        cur = self.settings()
+        self.preset_state.setText("modificada" if any(cur.get(k) != v for k, v in saved.items()) else "")
+
+    def _preset_chosen(self, *_):
+        name = self.preset_cb.currentData() or ""
+        QSettings().setValue("tc_preset_last", name)
+        self._preset_buttons()
+        if not name:
+            self._preset_dirty()
+            return
+        warn = self.apply_settings(self.store.get(name) or {})
+        self._preset_dirty()
+        if warn:
+            self.show_error("Parte da predefinição não pôde ser aplicada neste computador: " + "; ".join(warn) + ".")
+
+    def save_preset_as(self, name: str) -> str:
+        """Guarda os ajustes atuais com este nome (sem perguntar nada) e a seleciona. ValueError se o nome não servir."""
+        n = self.store.put(name, self.settings())
+        QSettings().setValue("tc_preset_last", n)
+        self._fill_presets(n)
+        self._preset_dirty()
+        return n
+
+    def _save_preset(self):
+        cur = self.preset_cb.currentData() or ""
+        suggest = cur if cur and not self.store.is_builtin(cur) else ""
+        name, ok = QInputDialog.getText(self, "Salvar predefinição", "Nome da predefinição:", text=suggest)
+        if not ok:
+            return
+        try:
+            from dtv_gui_presets import check_name
+            n = check_name(name)
+            if n in self.store.user and QMessageBox.question(self, "Substituir predefinição", f"Já existe a predefinição “{n}”. Substituir?") != QMessageBox.StandardButton.Yes:
+                return
+            self.save_preset_as(n)
+        except ValueError as e:
+            self.show_error(str(e))
+
+    def delete_preset(self, name: str) -> bool:
+        ok = self.store.delete(name)
+        if ok:
+            QSettings().setValue("tc_preset_last", "")
+            self._fill_presets("")
+            self._preset_dirty()
+        return ok
+
+    def _delete_preset(self):
+        name = self.preset_cb.currentData() or ""
+        if not name or self.store.is_builtin(name):
+            return
+        if QMessageBox.question(self, "Excluir predefinição", f"Excluir a predefinição “{name}”?") == QMessageBox.StandardButton.Yes:
+            self.delete_preset(name)
+
+    def _export_presets(self):
+        if not self.store.user:
+            self.show_error("Você ainda não salvou nenhuma predefinição.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Exportar predefinições", "predefinicoes_dtv_tools.json", "Predefinições (*.json)")
+        if path:
+            try:
+                self.store.export_to(path)
+            except OSError as e:
+                self.show_error(f"Não consegui gravar o arquivo: {e}")
+
+    def _import_presets(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Importar predefinições", "", "Predefinições (*.json)")
+        if path:
+            try:
+                added = self.store.import_from(path)
+            except ValueError as e:
+                self.show_error(str(e))
+                return
+            self._fill_presets(self.preset_cb.currentData() or "")
+            self.preset_state.setText(f"{len(added)} importada(s)")
+
     def build_jobs(self, dry: bool):
         files = self.files.values()
         if not files:
@@ -1085,6 +1304,8 @@ class TranscodePage(Page):
                 a += ["--size", self.size.text().strip()]
             if self.x265.text().strip():
                 a += ["--encoder-params", self.x265.text().strip()]
+            if self.maxrate.value():
+                a += ["--max-bitrate", str(self.maxrate.value())]
             if self.limit.value():
                 a += ["--limit", str(self.limit.value())]
             if self.nolcevc.isChecked():

@@ -1,5 +1,6 @@
 """Testes funcionais da GUI: fila, erro, parada suave/forçada e integração real com o dtv_tools.py (protocolo v2)."""
 import os, sys, tempfile, json
+from pathlib import Path
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "gui"))
@@ -170,6 +171,54 @@ w.on_tools = None
 w.set_tools_status({"version": _dtv.__version__, "protocol": 2, "tools": [{"key": "ffmpeg", "ok": True, "name": "ffmpeg", "path": "ff", "source": "x", "version": "",
                      "caps": {"lcevc_filter": True, "encoders": {"x265": True, "nvenc": False, "av1": True, "av1-nvenc": False}}}]})
 check("encoders: sem hevc_nvenc/av1_nvenc no ffmpeg -> itens desabilitados", not tp.encoder.model().item(1).isEnabled() and tp.encoder.model().item(2).isEnabled())
+w.close()
+
+# --- predefinições de transcodificação
+import tempfile as _tf
+_pp = os.path.join(_tf.mkdtemp(), "transcode_presets.json")
+G.presets_path = lambda: Path(_pp)
+QSettings().setValue("tc_preset_last", "")
+w = G.MainWindow(); w.show(); done(w)
+w.nav_to("transcode"); tp = w.pages["transcode"]
+names = [tp.preset_cb.itemData(i) for i in range(tp.preset_cb.count()) if tp.preset_cb.itemData(i) is not None]
+check("predefinições: as embutidas aparecem, depois a 'configuração atual'", names[0] == "" and "AV1 · arquivo (SVT-AV1)" in names and not tp.preset_del.isEnabled())
+tp.preset_cb.setCurrentIndex(tp.preset_cb.findData("AV1 · arquivo (SVT-AV1)")); tp._preset_chosen()
+check("predefinições: aplicar AV1 muda codificador, CRF e preset", tp.encoder.currentData() == "av1" and tp.crf.value() == 30 and tp.preset.currentData() == "6")
+check("predefinições: embutida não pode ser excluída", not tp.preset_del.isEnabled() and tp.preset_state.text() == "")
+tp.crf.setValue(33)
+check("predefinições: mexer na tela marca como modificada", tp.preset_state.text() == "modificada")
+tp.limit.setValue(45); tp.nolcevc.setChecked(True); tp.container.setCurrentIndex(tp.container.findData("mkv")); tp.size.setText("1920x1080")
+n = tp.save_preset_as("  Meu   teste ")
+check("predefinições: salvar com nome normalizado, selecionada e sem 'modificada'", n == "Meu teste" and tp.preset_cb.currentData() == "Meu teste" and tp.preset_state.text() == "" and tp.preset_del.isEnabled())
+check("predefinições: gravada em disco", "Meu teste" in json.load(open(_pp, encoding="utf-8"))["presets"])
+try:
+    tp.save_preset_as("AV1 · arquivo (SVT-AV1)"); bad = False
+except ValueError:
+    bad = True
+check("predefinições: nome de embutida é recusado", bad)
+tp.preset_cb.setCurrentIndex(tp.preset_cb.findData("HEVC 10 bits · qualidade (x265)")); tp._preset_chosen()
+check("predefinições: trocar de predefinição volta ao x265", tp.encoder.currentData() == "x265" and tp.crf.value() == 18)
+tp.preset_cb.setCurrentIndex(tp.preset_cb.findData("Meu teste")); tp._preset_chosen()
+tp.files.add_item("a", f1); a = tp.build_jobs(True)[0].args
+tp.maxrate.setValue(15)
+a = tp.build_jobs(True)[0].args
+check("limite de bitrate vai para o comando e some quando em 'Sem limite'", a[a.index("--max-bitrate") + 1] == "15.0")
+tp.maxrate.setValue(0); check("limite 0 = não passa --max-bitrate", "--max-bitrate" not in tp.build_jobs(True)[0].args)
+tp.maxrate.setValue(0)
+tp.preset_cb.setCurrentIndex(tp.preset_cb.findData("AV1 · arquivo (SVT-AV1)")); tp._preset_chosen()
+check("predefinição AV1 traz o limite de referência de 15 Mbps", tp.maxrate.value() == 15 and "15" in tp.maxrate.toolTip())
+tp.preset_cb.setCurrentIndex(tp.preset_cb.findData("Meu teste")); tp._preset_chosen()
+check("predefinições: aplicar a salva restaura tudo e vai para o comando",
+      tp.encoder.currentData() == "av1" and tp.crf.value() == 33 and tp.limit.value() == 45 and tp.nolcevc.isChecked() and tp.size.text() == "1920x1080"
+      and a[a.index("--encoder") + 1] == "av1" and a[a.index("--limit") + 1] == "45" and "--no-lcevc" in a and a[a.index("--container") + 1] == "mkv")
+w.close()
+w = G.MainWindow(); w.show(); done(w); tp = w.pages["transcode"]
+check("predefinições: a última usada volta ao abrir o programa", tp.preset_cb.currentData() == "Meu teste" and tp.encoder.currentData() == "av1" and tp.crf.value() == 33)
+check("predefinições: excluir", tp.delete_preset("Meu teste") and tp.preset_cb.findData("Meu teste") < 0 and tp.preset_cb.currentData() == "" and not tp.delete_preset("Meu teste"))
+# predefinição com um codificador que este computador não conhece: aplica o resto e avisa
+tp.store.user["de outra versão"] = {"encoder": "vp9", "crf": 25.0, "limit": 12}; tp._fill_presets("de outra versão")
+warn = tp.apply_settings(tp.store.get("de outra versão"))
+check("predefinições: codificador desconhecido é avisado e o resto é aplicado", bool(warn) and "vp9" in warn[0] and tp.limit.value() == 12)
 w.close()
 print("RESULTADO:", sum(ok), "/", len(ok))
 sys.exit(0 if all(ok) else 1)

@@ -1,11 +1,16 @@
 import argparse
 import math
+import shutil
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from conftest import HAVE_FFMPEG, need_ffmpeg
 import dtv_tools as d
+
+ROOT = Path(__file__).resolve().parent.parent
 
 pytestmark = pytest.mark.filterwarnings("ignore")
 
@@ -179,3 +184,56 @@ def test_old_param_options_still_work():
 
 def test_describe_lists_the_encoders():
     assert set(d.describe()["encoders"]) == {"x265", "nvenc", "av1", "av1-nvenc"}
+
+
+# --- limite de bitrate (--max-bitrate)
+def test_max_bitrate_in_each_encoder():
+    x = _tc_cmd(_tc_args("--max-bitrate", "20"))
+    xp = x[x.index("-x265-params") + 1]
+    assert "vbv-maxrate=20000" in xp and "vbv-bufsize=40000" in xp
+    s = _tc_cmd(_tc_args("--encoder", "av1", "--max-bitrate", "15"))
+    assert "mbr=15000" in s[s.index("-svtav1-params") + 1]
+    for enc in ("nvenc", "av1-nvenc"):
+        n = _tc_cmd(_tc_args("--encoder", enc, "--max-bitrate", "12.5"))
+        assert n[n.index("-maxrate") + 1] == "12500k" and n[n.index("-bufsize") + 1] == "25000k" and n[n.index("-b:v") + 1] == "0"
+        assert n.index("-cq") < n.index("-maxrate")
+
+
+def test_no_cap_by_default():
+    for enc in d.ENCODERS:
+        c = _tc_cmd(_tc_args("--encoder", enc))
+        assert "-maxrate" not in c and not any("vbv-maxrate" in x or "mbr=" in x for x in c), enc
+
+
+def test_max_bitrate_validation():
+    for bad in ("-1", "0.05"):
+        with pytest.raises(d.Fail):
+            _tc_cmd(_tc_args("--max-bitrate", bad))
+
+
+def test_reference_bitrates_are_in_the_table():
+    assert d.ENCODERS["x265"]["ref_mbps"] == 20 and d.ENCODERS["nvenc"]["ref_mbps"] == 20
+    assert d.ENCODERS["av1"]["ref_mbps"] == 15 and d.ENCODERS["av1-nvenc"]["ref_mbps"] == 15
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="sem ffmpeg")
+@pytest.mark.parametrize("enc,args,cap", [("x265", ["--preset", "ultrafast", "--crf", "10"], 2.0), ("av1", ["--preset", "12", "--crf", "20"], 2.0)])
+def test_the_cap_really_limits_the_bitrate(tmp_path, enc, args, cap):
+    import subprocess
+    have = d.ffmpeg_encoders(shutil.which("ffmpeg"))
+    if d.ENCODERS[enc]["ffmpeg"] not in have:
+        pytest.skip("o ffmpeg não tem " + d.ENCODERS[enc]["ffmpeg"])
+    src = tmp_path / "noise.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=3,noise=alls=30:allf=t",
+                    "-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-crf", "10", "-x265-params", "log-level=error", str(src)], check=True)
+    rates = {}
+    for mb in (0, cap):
+        out = tmp_path / f"o{mb}"
+        r = subprocess.run([sys.executable, str(ROOT / "dtv_tools.py"), "transcode", str(src), "--no-lcevc", "--audio", "none", "--encoder", enc,
+                            *args, "--max-bitrate", str(mb), "--outdir", str(out), "--overwrite"], capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        f = next(out.glob("*.mp4"))
+        rates[mb] = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=bit_rate", "-of", "default=nw=1:nk=1", str(f)],
+                                         capture_output=True, text=True).stdout) / 1e6
+    assert rates[0] > cap * 4                                          # without a cap the clip is far above the limit
+    assert rates[cap] < cap * 1.4, rates                               # with it, close to (or under) the cap: an average over 3 s is approximate

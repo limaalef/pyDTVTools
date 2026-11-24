@@ -5480,20 +5480,31 @@ MUX_FORMATS = {".mp4": "mp4", ".m4v": "mp4", ".mov": "mov", ".mkv": "matroska"} 
 ENCODERS = {
     "x265":      {"label": "x265 (CPU)", "ffmpeg": "libx265", "codec": "hevc", "crf": 18, "crf_range": [0, 51], "step": 0.5,
                   "presets": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
-                  "preset_default": "", "params_hint": "key=value:key=value"},
+                  "preset_default": "", "params_hint": "key=value:key=value", "ref_mbps": 20},
     "nvenc":     {"label": "HEVC NVENC (GPU NVIDIA)", "ffmpeg": "hevc_nvenc", "codec": "hevc", "crf": 22, "crf_range": [0, 51], "step": 1,
-                  "presets": [f"p{i}" for i in range(1, 8)], "preset_default": "p5", "params_hint": "-spatial-aq 1 -rc-lookahead 32"},
+                  "presets": [f"p{i}" for i in range(1, 8)], "preset_default": "p5", "params_hint": "-spatial-aq 1 -rc-lookahead 32", "ref_mbps": 20},
     "av1":       {"label": "AV1 SVT-AV1 (CPU)", "ffmpeg": "libsvtav1", "codec": "av1", "crf": 28, "crf_range": [0, 63], "step": 1,
-                  "presets": [str(i) for i in range(0, 14)], "preset_default": "6", "params_hint": "tune=0:film-grain=8"},
+                  "presets": [str(i) for i in range(0, 14)], "preset_default": "6", "params_hint": "tune=0:film-grain=8", "ref_mbps": 15},
     "av1-nvenc": {"label": "AV1 NVENC (GPU NVIDIA RTX 40+)", "ffmpeg": "av1_nvenc", "codec": "av1", "crf": 28, "crf_range": [0, 63], "step": 1,
-                  "presets": [f"p{i}" for i in range(1, 8)], "preset_default": "p5", "params_hint": "-spatial-aq 1 -rc-lookahead 32"},
+                  "presets": [f"p{i}" for i in range(1, 8)], "preset_default": "p5", "params_hint": "-spatial-aq 1 -rc-lookahead 32", "ref_mbps": 15},
 }
+# Peak-bitrate cap (--max-bitrate, Mbit/s) with quality-based rate control, how each encoder takes it:
+#   x265 vbv-maxrate + vbv-bufsize (x265-params) · SVT-AV1 mbr (svtav1-params, kbit/s; CRF mode only) · hevc_nvenc / av1_nvenc -maxrate + -bufsize
+# ref_mbps is a reference value (HEVC 20, AV1 15 Mbit/s), only a suggestion shown by front ends; the cap is off unless asked for.
 CODEC_NAMES = {"hevc": "HEVC", "av1": "AV1"}
 
 
 def enc_crf(a):
     """--crf, or the default quality of the chosen encoder (the scales differ: x265 18, NVENC 22, SVT-AV1 28)."""
     return a.crf if getattr(a, "crf", None) is not None else ENCODERS[getattr(a, "encoder", "x265")]["crf"]
+
+
+def enc_maxrate_kbps(a):
+    """--max-bitrate in kbit/s (0 = no cap)."""
+    mb = getattr(a, "max_bitrate", 0) or 0
+    if mb < 0 or (0 < mb < 0.1):
+        raise Fail("--max-bitrate deve ser 0 (sem limite) ou, no mínimo, 0.1 (Mbit/s).")
+    return int(round(mb * 1000))
 
 
 def enc_preset(a):
@@ -5649,7 +5660,10 @@ def split_options(a):
 
 def track_label(o):
     lay = CICP_NAME.get(o["src_cicp"], "?")
-    return f"{o['title']} ({lay})"
+    orig = o.get("layout_orig", o["src_cicp"])
+    if orig != o["src_cicp"]:
+        lay += f" de {CICP_NAME.get(orig, '?')}"                        # e.g. "2.0 de 5.1": the track was rendered in a layout other than its own
+    return f"{'P' if o['group'] == 'presets' else 'G'}{str(o['id']).split(':')[-1]} - {o['title']} ({lay})"
 
 
 def audio_offset(ff, src, a):
@@ -5691,18 +5705,22 @@ def build_transcode_cmd(ff, src, out, a, hdr, size, use_lcevc, n_src_audio, item
     if size:
         cmd += ["-s", size]
     crf, preset = enc_crf(a), enc_preset(a)
+    mrk = enc_maxrate_kbps(a)
+    cap = ["-maxrate", f"{mrk}k", "-bufsize", f"{2 * mrk}k"] if mrk else []          # NVENC: the cap goes with vbr + -cq + -b:v 0
     if enc == "nvenc":                                                 # GPU: no x265 params; HDR10 SEI depends on frame side data
         cmd += ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le", "-preset", preset, "-tune", "hq",
                 "-rc", "vbr", "-cq", str(int(round(crf))), "-b:v", "0", "-multipass", "fullres",
-                "-bf", "3", "-b_ref_mode", "middle", "-tag:v", "hvc1"]
+                "-bf", "3", "-b_ref_mode", "middle", "-tag:v", "hvc1"] + cap
         cmd += shlex.split(extra)
     elif enc == "av1-nvenc":
         cmd += ["-c:v", "av1_nvenc", "-pix_fmt", "p010le", "-preset", preset, "-tune", "hq",
-                "-rc", "vbr", "-cq", str(int(round(crf))), "-b:v", "0", "-multipass", "fullres"]
+                "-rc", "vbr", "-cq", str(int(round(crf))), "-b:v", "0", "-multipass", "fullres"] + cap
         cmd += shlex.split(extra)
     elif enc == "av1":                                                 # SVT-AV1 takes the HDR10 metadata as OBUs through its own parameters
         sp = ["color-primaries=9", "transfer-characteristics=16", "matrix-coefficients=9", "color-range=0",
               f"mastering-display={svtav1_master(hdr)}", f"content-light={hdr['maxcll']},{hdr['maxfall']}"]
+        if mrk:
+            sp.append(f"mbr={mrk}")                                      # maximum bitrate in kbit/s (CRF mode)
         if extra:
             sp.append(extra)
         cmd += ["-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le", "-crf", str(int(round(crf))), "-preset", preset,
@@ -5710,6 +5728,8 @@ def build_transcode_cmd(ff, src, out, a, hdr, size, use_lcevc, n_src_audio, item
     else:
         xp = ["hdr10=1", "repeat-headers=1", "colorprim=bt2020", "transfer=smpte2084", "colormatrix=bt2020nc",
               f"master-display={x265_master(hdr)}", f"max-cll={hdr['maxcll']},{hdr['maxfall']}"]
+        if mrk:
+            xp += [f"vbv-maxrate={mrk}", f"vbv-bufsize={2 * mrk}"]       # capped CRF
         if extra:
             xp.append(extra)
         cmd += ["-c:v", "libx265"]
@@ -5751,6 +5771,7 @@ def cmd_transcode(a):
     say(f"Entrada: {v['codec']} {v['size'] or '?'} @ {v['fps'] or '?'} fps · {len(info['audio'])} trilha(s) de áudio "
         f"({', '.join(x['codec'] for x in info['audio']) or 'nenhuma'}) · {fmt_hms(info['duration'] or 0)}")
     E = ENCODERS[a.encoder]
+    enc_maxrate_kbps(a)                                                # validates --max-bitrate before any long work
     if E["ffmpeg"] not in ffmpeg_encoders(ff):
         gpu = " (precisa de GPU NVIDIA compatível e driver)" if "nvenc" in a.encoder else ""
         raise Fail(f"Este ffmpeg não tem o codificador {E['ffmpeg']}{gpu}. Escolha outro com --encoder ({', '.join(ENCODERS)}) ou use um ffmpeg que o tenha.")
@@ -5835,7 +5856,8 @@ def cmd_transcode(a):
         progress("encode", 1.0, force=True)
 
         step("report", "running")
-        rows = [["Entrada", src.name], ["Vídeo", f"{CODEC_NAMES[E['codec']]} 10-bit HDR10 ({E['label']}) · {size or v['size'] or '?'} · CRF {enc_crf(a):g}" + (f" · preset {enc_preset(a)}" if enc_preset(a) else "")],
+        rows = [["Entrada", src.name], ["Vídeo", f"{CODEC_NAMES[E['codec']]} 10-bit HDR10 ({E['label']}) · {size or v['size'] or '?'} · CRF {enc_crf(a):g}" + (f" · preset {enc_preset(a)}" if enc_preset(a) else "")
+                + (f" · máx. {a.max_bitrate:g} Mbps" if enc_maxrate_kbps(a) else "")],
                 ["HDR10", hdr10_summary(hdr)], ["Duração", fmt_hms(got or 0)], ["Contêiner", out.suffix.lstrip(".").upper()],
                 ["Trilhas de áudio", (f"{len(items)} renderizada(s): " + ", ".join(i['title'] for i in items) +
                                       (f" + {len(final['audio']) - len(items)} original(is)" if len(final['audio']) > len(items) else ""))
@@ -6346,6 +6368,9 @@ def build_parser():
                       help="video encoder: x265 (CPU, default), nvenc (HEVC, NVIDIA GPU), av1 (SVT-AV1, CPU) or av1-nvenc (AV1, NVIDIA RTX 40+)")
     s_tc.add_argument("--crf", type=float, default=None, help="quality: x265 CRF (default 18), NVENC CQ (22), SVT-AV1 CRF (28)")
     s_tc.add_argument("--preset", default="", help="x265: ultrafast..placebo; NVENC: p1..p7; SVT-AV1: 0..13 (default: x265 decides, NVENC p5, SVT-AV1 6)")
+    s_tc.add_argument("--max-bitrate", type=float, default=0, metavar="MBPS",
+                      help="cap the peak video bitrate, in Mbit/s, keeping the --crf quality target (0 = no cap; reference: HEVC 20, AV1 15). "
+                           "All four encoders support it")
     s_tc.add_argument("--encoder-params", default="", metavar="PARAMS",
                       help="extra encoder parameters: x265 'k=v:k=v', SVT-AV1 'k=v:k=v', NVENC '-opt val ...' (appended as-is)")
     s_tc.add_argument("--nvenc-params", default="", metavar="'-opt val ...'", help="same as --encoder-params with an NVENC encoder (older name)")

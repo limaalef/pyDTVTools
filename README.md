@@ -275,6 +275,7 @@ python dtv_tools.py transcode ENTRADA.mp4 [-o SAIDA.mp4] [--audio render|copy|no
 | `--option`, `--audio-format`, `--audio-delay`, `--original-audio`, `--native-layout`, `--jobs` | Mesmo significado de `mpegh-audio`; `--original-audio keep` acrescenta a trilha original MPEG-H no fim |
 | `--container` | `auto`, `mp4` ou `mkv` |
 | `--crf`, `--preset`, `--encoder-params` | Ajustes do encoder. Os padrões e as escalas dependem do codificador (veja abaixo). Parâmetros extras são anexados aos do HDR10. `--x265-params` e `--nvenc-params` são nomes antigos de `--encoder-params` |
+| `--max-bitrate MBPS` | Limita o **pico** de bitrate do vídeo, em Mbit/s, mantendo a qualidade de `--crf` (0 = sem limite, o padrão). Funciona nos quatro codificadores (tabela abaixo). Referência: HEVC 20 Mbps, AV1 15 Mbps. O limite é aproximado: a média de um trecho curto pode passar um pouco dele |
 | `--encoder` | `x265` (CPU, padrão), `nvenc` (HEVC na GPU NVIDIA), `av1` (SVT-AV1, CPU) ou `av1-nvenc` (AV1 na GPU NVIDIA RTX 40 ou mais nova). Veja a tabela abaixo |
 | `--no-lcevc` | A origem não tem LCEVC (arquivo HDR10 comum): não usa o filtro |
 | `--size WxH`, `--no-size-fix` | Tamanho da saída. Por padrão só se usa um tamanho medido pela verificação LCEVC |
@@ -294,6 +295,8 @@ Salva um quadro do mesmo tipo de arquivo como imagem: HDR (PNG 16 bits, AVIF 10 
 | `nvenc` | `hevc_nvenc` | 22 (0–51), valor CQ | `p1`…`p7` (`p5`) | `-opção valor …` |
 | `av1` | `libsvtav1` | 28 (0–63) | `0`…`13` (`6`) | `chave=valor:chave=valor` |
 | `av1-nvenc` | `av1_nvenc` | 28 (0–63), valor CQ | `p1`…`p7` (`p5`) | `-opção valor …` |
+
+Como `--max-bitrate` chega a cada codificador: x265 usa `vbv-maxrate` e `vbv-bufsize` (CRF limitado); SVT-AV1 usa `mbr` (só no modo CRF); os NVENC usam `-maxrate` e `-bufsize` com `-rc vbr -cq … -b:v 0`. O buffer é sempre o dobro do limite. Testado com x265 e SVT-AV1 em codificações reais; nos NVENC o comando é o recomendado pela NVIDIA, mas não foi testado sem GPU.
 
 Os valores de qualidade não são equivalentes entre codificadores. No AV1, o mastering display e o MaxCLL/MaxFALL vão pelos parâmetros do SVT-AV1 (precisa da versão 1.2 ou mais nova). Nos codificadores NVENC eles só saem no arquivo se vierem nos quadros de entrada: confira a saída com `ffprobe -show_frames`. AV1 não é aceito em `.mov`. O `doctor` mostra quais codificadores o seu ffmpeg tem, e o `transcode` recusa, antes de começar, um que ele não tenha.
 
