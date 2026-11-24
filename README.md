@@ -365,7 +365,10 @@ Eles **não estão incluídos**. Eles podem ser disponibilizados para utilizaç�
 
 ## Interface gráfica e protocolo para máquinas
 
-A pasta `gui/` tem uma interface desktop nativa (Qt 6 / PySide6) que executa estes mesmos comandos.
+A pasta `gui/` tem uma interface desktop nativa (Qt 6 / PySide6) que executa estes mesmos comandos. Quando uma fila de tarefas termina (com sucesso,
+com erro ou interrompida), ela mostra um **aviso nativo do sistema** (central de notificações do Windows, Central de Notificações do macOS ou o
+serviço de notificações do desktop no Linux); clicar no aviso traz a janela para a frente. Em **Exibir → Aviso ao terminar** dá para desligá-lo,
+limitá-lo a quando a janela não está em foco (o padrão) ou enviar um aviso de teste. Análises e a verificação silenciosa do início não avisam.
 
 Para qualquer programa que controle o script, `--json` imprime **somente** eventos JSON Lines no stdout (`hello`, `begin` com as
 etapas e seus pesos, `progress` com a etapa e sua fração, `log`, `result`, `error`), `--control` permite parar a execução pelo

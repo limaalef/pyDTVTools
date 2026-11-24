@@ -13,7 +13,7 @@ import os
 import sys
 
 APP_NAME = "DTV Tools"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--cli":
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QTreeWidgetItem, QVBoxLayout, QWidget, QListWidget, QListWidgetItem)
 
 import cutmath  # noqa: E402
+from dtv_gui_notify import Notifier, summarize
 from dtv_gui_runner import PROTOCOL, Job, Runner, program_and_prefix  # noqa: E402
 from dtv_gui_style import AccentButton, FluentStyle, accent_of, apply_backdrop, apply_fluent, mica_supported  # noqa: E402
 from dtv_gui_widgets import (CardBox, WheelGuard, svg_icon, fit_view, AvailabilityChart, Collapsible, Colors, CutTimeline, FileEdit, ImagePreview, ItemList,  # noqa: E402
@@ -1389,6 +1390,9 @@ class MainWindow(QMainWindow):
         env = {"DTV_TOOLS_DIR": str(bundled_tools_dir()), "DTV_TOOLS_CONFIG": str(config_path())}
         self.runner = Runner(env, self)
         self.bg_runner = Runner(env, self)
+        self._q_jobs = []
+        self.notifier = Notifier(self)
+        self.notifier.clicked.connect(self._bring_to_front)
         self.panel = TaskPanel()
         self._last_err = ""
         self._tools_res: dict | None = None
@@ -1507,6 +1511,20 @@ class MainWindow(QMainWindow):
             grp.addAction(a)
             sub.addAction(a)
         self.set_theme(cur, save=False)
+        v.addSeparator()
+        nt = v.addMenu("Notificações")
+        self.notify_act = QAction("Notificar quando as tarefas terminarem", self, checkable=True)
+        self.notify_act.setChecked(self.settings.value("notify/enabled", True, bool))
+        self.notify_act.toggled.connect(lambda on: self.settings.setValue("notify/enabled", on))
+        self.notify_bg_act = QAction("Apenas quando a janela não estiver em foco", self, checkable=True)
+        self.notify_bg_act.setChecked(self.settings.value("notify/only_background", True, bool))
+        self.notify_bg_act.toggled.connect(lambda on: self.settings.setValue("notify/only_background", on))
+        test = QAction("Enviar um aviso de teste", self)
+        test.triggered.connect(self.notify_test)
+        for a in (self.notify_act, self.notify_bg_act):
+            nt.addAction(a)
+        nt.addSeparator()
+        nt.addAction(test)
         if mica_supported():
             v.addSeparator()
             self.mica_act = QAction("Fundo translúcido (nativo Windows)", self, checkable=True)
@@ -1643,6 +1661,7 @@ class MainWindow(QMainWindow):
 
     def _queue_started(self, n):
         self._last_err = ""
+        self._q_jobs = []
         self.panel.begin_queue(n)
         for pg in self.pages.values():
             pg.set_busy(True)
@@ -1666,6 +1685,7 @@ class MainWindow(QMainWindow):
             job.page.handle_log(job, line)
 
     def _job_finished(self, job, code, ok):
+        self._q_jobs.append({"title": job.title, "ok": ok, "quiet": self._quiet(job), "err": "" if ok or code == 130 else self._last_err})
         self.panel.end_job(job, code, ok)
         if not ok and code == 130:
             self.panel.result.set_banner(StatusIcon.SKIPPED, "Interrompido pelo usuário.")
@@ -1685,6 +1705,28 @@ class MainWindow(QMainWindow):
 
         if not self.isActiveWindow():
             QApplication.alert(self)
+        self._notify_done(all_ok, stopped)
+
+    # ── aviso nativo do sistema ──
+    def _notify_done(self, all_ok: bool, stopped: bool):
+        if not self.settings.value("notify/enabled", True, bool):
+            return
+        if self.settings.value("notify/only_background", True, bool) and self.isActiveWindow():
+            return
+        msg = summarize(getattr(self, "_q_jobs", []), all_ok, stopped)
+        if msg:
+            self.notifier.notify(*msg)
+
+    def _bring_to_front(self):
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def notify_test(self):
+        if not self.notifier.notify("Aviso de teste", "É assim que você será avisado quando as tarefas terminarem.", "info"):
+            QMessageBox.information(self, "Aviso ao terminar", "Este sistema não oferece notificações para o programa "
+                                    "(sem área de notificação ou sem o serviço de notificações do desktop).")
 
     # ── ferramentas ──
     def startup_check(self):
