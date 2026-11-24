@@ -45,7 +45,7 @@ def outputs(*names, folder="/home/usuario/Vídeos"):
 
 def scan_audio():
     L = T.catalog_public()
-    F = {k: {"label": v["label"], "br": v["br"]} for k, v in T.FORMATS.items()}
+    F = {k: {"label": v["label"], "br": v["br"], "max": v["max"]} for k, v in T.FORMATS.items()}
     presets = [{"id": 0, "name": "Padrão"}, {"id": 1, "name": "Campo"}, {"id": 2, "name": "Torcida Palmeiras"}, {"id": 3, "name": "Torcida Flamengo"}]
     groups = [{"id": 0, "name": "Futebol na Globo"}, {"id": 1, "name": "Ambiente"}, {"id": 2, "name": "CAMPO L"}, {"id": 3, "name": "CAMPO R"}, {"id": 4, "name": "TORCIDA MANDANTE"}]
     f51 = [k for k in F][:3]
@@ -60,6 +60,9 @@ def scan_audio():
                      "formats": list(F), "isolation": "preset" if iso else "edit", "highlight": [[0, 1]]})
     opts.append({"id": "pair:2+3", "group": "groups", "title": "CAMPO (L+R)", "desc": "Par L/R", "layout": 2, "out_ch": 2, "composition": "2 objetos", "fmt": "aac",
                  "formats": list(F), "isolation": "mute", "elements": [2, 3], "highlight": [[0, 1]]})
+    for o in opts:                                     # como o dtv_tools: layout original da trilha e os que podem ser escolhidos
+        o["layout_orig"] = o["layout"]
+        o["layout_choices"] = [2] if o["id"].startswith("pair:") else sorted({2, 6, o["layout"]})
     tl = [{"start_s": 0, "end_s": 600, "has_scene": True, "presets": {"0": "Padrão", "1": "Campo", "2": "Torcida Palmeiras", "3": "Torcida Flamengo"}, "groups": {"0": "", "1": "", "2": "", "3": "", "4": ""}},
           {"start_s": 600, "end_s": 780, "has_scene": True, "presets": {"0": "Padrão", "1": "Campo"}, "groups": {"0": "", "1": "", "2": "", "3": ""}},
           {"start_s": 780, "end_s": 1500, "has_scene": True, "presets": {"0": "Padrão", "1": "Campo", "2": "Torcida Palmeiras", "3": "Torcida Flamengo"}, "groups": {"0": "", "1": "", "2": "", "3": "", "4": ""}}]

@@ -40,7 +40,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.2.3"
+__version__ = "1.3.0"
 PROTOCOL_VERSION = 2
 # What a controlling program (the GUI) may rely on; listed by `describe`, `doctor` and the `hello` event.
 FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation")
@@ -2560,6 +2560,8 @@ def build_catalog(info, native=2, stream=None, forced=False, compat=False):
         ch = o["out_ch"]
         o.setdefault("fmt", default_fmt(ch))
         o["formats"] = allowed_fmts(ch)
+        o["layout_orig"] = o["layout"]                              # the track's own layout: always shown as "original"
+        o["layout_choices"] = [o["layout"]] if o["id"].startswith("pair:") else sorted({2, 6, o["layout"]})
         opts.append(o)
 
     for p in pres:
@@ -2630,7 +2632,7 @@ def build_catalog(info, native=2, stream=None, forced=False, compat=False):
             composition="par estéreo L+R",
             layout=2,
             heuristic=False,
-            title=f"{base} (L+R)",
+            title=f"{base}",
             desc=f"Par estéreo: G{lid} (L) + G{rid} (R)" + ISO_TEXT[plan["method"]],
             inputs=[[f"m{lid}-{rid}", 2]],
             expr=None,
@@ -3139,7 +3141,7 @@ def do_scan(a):
                           "text": describe_stream_config(det["config"])},
         "warnings": warns,
         "layouts": catalog_public(),
-        "formats": {k: {"label": v["label"], "br": v["br"]} for k, v in FORMATS.items()},
+        "formats": {k: {"label": v["label"], "br": v["br"], "max": v["max"]} for k, v in FORMATS.items()},
     }
     (d / "catalog.json").write_text(json.dumps(scan, ensure_ascii=False), encoding="utf-8")
     progress("catalog", 1.0, f"{len(cat['options'])} opções prontas", force=True)
@@ -3159,7 +3161,9 @@ def print_catalog(scan):
         if not o:
             return ""
         comp = f"; origem: {o['composition']}" if o.get("composition") else ""
-        return f" · saída {CICP_NAME.get(o['layout'], '?')} ({o['out_ch']} canais{comp})"
+        others = [CICP_NAME[x] for x in o.get("layout_choices", []) if x != o["layout"]]
+        return (f" · saída {CICP_NAME.get(o['layout'], '?')} original ({o['out_ch']} canais{comp})"
+                + (f"; também {', '.join(others)}: --option {oid}@{others[0]}" if others else ""))
 
     say(bold("Presets encontrados no vídeo:"))
     for p in scan.get("presets", []):
@@ -3509,12 +3513,44 @@ def decode_one(dec, ffmpeg, mp4box, audio, wav, cicp, script, states, target_kin
     raise Fail(f"O mpeghDecoder falhou ({Path(wav).name}): {tail}")
 
 
+def parse_layout_name(text):
+    """'5.1', '2.0' or a CICP number (2, 6, 16, 19) -> CICP, or None."""
+    t = str(text).strip()
+    for k, v in CICP_NAME.items():
+        if t == v or t == str(k):
+            return k
+    return None
+
+
 def parse_opt_spec(spec: str):
-    """Aceita 'preset:0=eac3:640k' ou 'group:5=aac'."""
-    m = re.fullmatch(r"([A-Za-z0-9:_.+-]+?)(?:=([a-z0-9]+)(?::(\d{2,4}k))?)?", spec.strip())
+    """Aceita 'preset:0=eac3:640k', 'group:5=aac' e, no fim, '@LAYOUT' (group:5@2.0, preset:1=eac3:448k@5.1).
+    -> (id, formato, bitrate, layout CICP ou None)."""
+    m = re.fullmatch(r"([A-Za-z0-9:_.+-]+?)(?:=([a-z0-9]+)(?::(\d{2,4}k))?)?(?:@([0-9.]+))?", spec.strip())
     if not m:
         raise Fail(f"Opção inválida: {spec}")
-    return m.group(1), m.group(2), m.group(3)
+    lay = None
+    if m.group(4):
+        lay = parse_layout_name(m.group(4))
+        if lay is None:
+            raise Fail(f"Layout inválido em '{spec}': use {', '.join(CICP_NAME.values())}.")
+    return m.group(1), m.group(2), m.group(3), lay
+
+
+def set_option_layout(o, lay):
+    """Render this option in another layout (2.0 / 5.1 ...): decode target, channel count, formats, highlight and file name follow."""
+    old = o["layout"]
+    if lay == old:
+        return o
+    o["layout"] = lay
+    o["inputs"] = [[tag, lay] for tag, _ in o["inputs"]]
+    o["src_cicp"] = lay
+    o["out_ch"] = CICP_CH[lay]
+    o["formats"] = allowed_fmts(o["out_ch"])
+    o["fmt"] = default_fmt(o["out_ch"])
+    o["highlight"] = [list(range(CICP_CH[lay]))]
+    suffix = "_" + CICP_NAME[old]
+    o["stem"] = (o["stem"][:-len(suffix)] if o["stem"].endswith(suffix) else o["stem"]) + "_" + CICP_NAME[lay]
+    return o
 
 
 def encode_audio(ffmpeg, wav_path, out_path, fmt_key, br, dur, cut_warn=False, on_pct=None):
@@ -3564,11 +3600,19 @@ def pick_options(cat, raw_opts, fmt_override=None):
         raw_opts = [o["id"] for o in cat["options"] if o["group"] == "presets"]
     chosen = []
     for spec in raw_opts:
-        oid, fmt, br = parse_opt_spec(spec)
+        oid, fmt, br, lay = parse_opt_spec(spec)
         if oid not in by_id:
             avail = ", ".join(by_id.keys())
             raise Fail(f"A opção '{oid}' não existe neste arquivo. Disponíveis: {avail}")
         base_o = dict(by_id[oid])
+        if lay is not None:
+            ok_lay = base_o.get("layout_choices") or [base_o["layout"]]
+            if lay not in ok_lay:
+                raise Fail(f"{oid} não pode ser renderizado em {CICP_NAME[lay]} (original {CICP_NAME[base_o['layout']]}; "
+                           f"opções: {', '.join(CICP_NAME[x] for x in ok_lay)}).")
+            if lay != base_o["layout"]:
+                note(f"{oid}: renderizado em {CICP_NAME[lay]} (o original é {CICP_NAME[base_o['layout']]}).")
+            set_option_layout(base_o, lay)
         use_fmt = fmt or base_o["fmt"]
         if not fmt and fmt_override:
             if fmt_override in base_o["formats"]:
@@ -3786,7 +3830,7 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
         wav = wav_paths[(tag, cicp)]
         ext = FORMATS[o["fmt"]]["ext"]
         target_dir = outdir if keep_audio_files else tmp
-        plan_key = f"{o['id']}|{o['fmt']}|{o.get('br') or ''}"
+        plan_key = f"{o['id']}|{o['fmt']}|{o.get('br') or ''}|{cicp}"
         enc_done = tmp / f"enc_{slug(plan_key)}.done"
 
         if plan_key in enc_plan:
@@ -5547,7 +5591,8 @@ def split_options(a):
 
 
 def track_label(o):
-    return f"{'P' if o['group'] == 'presets' else 'G'}{str(o['id']).split(':')[-1]} - {o['title']} ({CICP_NAME.get(o['src_cicp'], '?')})"
+    lay = CICP_NAME.get(o["src_cicp"], "?")
+    return f"{o['title']} ({lay})"
 
 
 def audio_offset(ff, src, a):
@@ -6063,7 +6108,7 @@ HELP_TEXTS = {
                "--lcevc-size": "frame size written in the lvc1 track of the dual-track file (default: 3840x2160)",
                "--outdir": "output folder (default: the folder of the input)", "--name": "base name of the outputs (default: the input name)",
                "--dry-run": "only list the programs, PIDs and stream types; write nothing"},
-    "mpegh-audio": {"--option": "preset:ID or group:ID, optionally =FORMAT[:BITRATE] (repeatable; default: all presets)",
+    "mpegh-audio": {"--option": "preset:ID or group:ID, optionally =FORMAT[:BITRATE] and @LAYOUT (2.0 or 5.1; the track's own layout is the default), e.g. group:3=aac@2.0 (repeatable; default: all presets)",
                     "--jobs": "parallel decoders (0 = automatic)",
                     "--mux": "none (audio files only), add (files and a copy of the MP4 with the audio tracks) or only (just the MP4)",
                     "--audio-delay": "delay in ms for the tracks added by --mux (default 0)", **_MP_HELP},
@@ -6233,7 +6278,7 @@ def build_parser():
     s_tc.add_argument("--audio", choices=("render", "copy", "none"), default="render",
                       help="render = every preset as its own track (like mpegh-audio); copy = original track(s) only; none")
     s_tc.add_argument("--option", action="append", default=[], metavar="SPEC",
-                      help="what to render, e.g. preset:1 or group:3=aac:192k (repeat or comma list; default: all presets, no groups)")
+                      help="what to render, e.g. preset:1 or group:3=aac:192k@2.0 (@LAYOUT = 2.0 or 5.1; repeat or comma list; default: all presets, no groups)")
     s_tc.add_argument("--audio-format", choices=("auto", "aac", "eac3", "flac", "wav"), default="auto", help="auto = AAC for 2.0, E-AC-3 for 5.1, WAV above (per option)")
     s_tc.add_argument("--audio-delay", default="auto", metavar="auto|MS", help="rendered audio offset; auto = start of the original track")
     s_tc.add_argument("--original-audio", choices=("keep", "drop"), default="keep", help="also keep the original MPEG-H track (last)")

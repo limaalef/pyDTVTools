@@ -13,7 +13,7 @@ import os
 import sys
 
 APP_NAME = "DTV Tools"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.3.0"
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--cli":
@@ -348,7 +348,7 @@ class CatalogView(QWidget):
         h.setStretchLastSection(False)
         h.setMinimumSectionSize(80)
         h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for c_, w_ in ((1, 56), (2, 104), (3, 78)):
+        for c_, w_ in ((1, 108), (2, 104), (3, 78)):
             h.setSectionResizeMode(c_, QHeaderView.ResizeMode.Fixed)
             h.resizeSection(c_, w_)
         self.tree.setTextElideMode(Qt.TextElideMode.ElideRight)
@@ -407,9 +407,11 @@ class CatalogView(QWidget):
                 self.tree.addTopLevelItem(top)
                 top.setExpanded(True)
                 tops[sec] = top
-            lay_name = layouts.get(str(o["layout"]), {}).get("name", "?")
-            it = QTreeWidgetItem(tops[sec], [o["title"], lay_name, "", ""])
-            it.setToolTip(1, f"{lay_name} · {o['out_ch']} canais" + (f"\n{o['composition']}" if o.get("composition") else ""))
+            lname = lambda c: layouts.get(str(c), {}).get("name", "?")                          # noqa: E731
+            orig = o.get("layout_orig", o["layout"])
+            choices = o.get("layout_choices") or [o["layout"]]
+            it = QTreeWidgetItem(tops[sec], [o["title"], f"{lname(o['layout'])} · original" if len(choices) < 2 else "", "", ""])
+            it.setToolTip(1, f"{lname(o['layout'])} · {o['out_ch']} canais" + (f"\n{o['composition']}" if o.get("composition") else ""))
             it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
             it.setCheckState(0, Qt.CheckState.Checked if sec == "presets" else Qt.CheckState.Unchecked)
             it.setToolTip(0, o["desc"])
@@ -432,9 +434,47 @@ class CatalogView(QWidget):
             self.tree.setItemWidget(it, 3, bcb)
             fcb.currentIndexChanged.connect(lambda *_, a=fcb, b=bcb, fm=fmts: self._fmt_changed(a, b, fm))
             self._fmt_changed(fcb, bcb, fmts)
-            self._rows[o["id"]] = {"item": it, "opt": o, "fmt": fcb, "br": bcb}
+            row = {"item": it, "opt": o, "fmt": fcb, "br": bcb, "lay": None, "orig": orig, "deffmt": o["fmt"]}
+            if len(choices) > 1:
+                # Layout de saída da trilha: 2.0 / 5.1 (…), sempre dizendo qual é o original da trilha
+                lcb = QComboBox()
+                for c in choices:
+                    lcb.addItem(f"{lname(c)} · original" if c == orig else f"{lname(c)}", c)
+                    lcb.setItemData(lcb.count() - 1, "Layout original da trilha" if c == orig else f"A trilha é {lname(orig)}; será renderizada em {lname(c)}",
+                                    Qt.ItemDataRole.ToolTipRole)
+                lcb.setCurrentIndex(max(0, lcb.findData(o["layout"])))
+                lcb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+                lcb.setMinimumContentsLength(6)
+                self.tree.setItemWidget(it, 1, lcb)
+                lcb.currentIndexChanged.connect(lambda *_, oid=o["id"]: self._layout_changed(oid))
+                row["lay"] = lcb
+            self._rows[o["id"]] = row
         self._updating = False
         self._changed()
+
+    def _layout_changed(self, oid):
+        """Trocou o layout da trilha: os formatos aceitos e o padrão dependem do número de canais."""
+        r = self._rows[oid]
+        lay = r["lay"].currentData()
+        n = len(self.scan["layouts"][str(lay)]["channels"])
+        fmts = self.scan["formats"]
+        fcb = r["fmt"]
+        fcb.blockSignals(True)
+        fcb.clear()
+        for k, f in fmts.items():
+            if n <= f.get("max", 64):
+                fcb.addItem(f["label"].split(" (")[0], k)
+                fcb.setItemData(fcb.count() - 1, f["label"], Qt.ItemDataRole.ToolTipRole)
+        r["deffmt"] = "aac" if n <= 2 else ("eac3" if n <= 6 else "wav")
+        fcb.setCurrentIndex(max(0, fcb.findData(r["deffmt"])))
+        fcb.blockSignals(False)
+        self._fmt_changed(fcb, r["br"], fmts)
+        if self.tree.currentItem() is r["item"]:
+            self._current(r["item"], None)
+
+    def layout_of(self, oid) -> int:
+        r = self._rows[oid]
+        return r["lay"].currentData() if r["lay"] is not None else r["opt"]["layout"]
 
     @staticmethod
     def _fmt_changed(fcb, bcb, fmts):
@@ -462,7 +502,14 @@ class CatalogView(QWidget):
             fn()
 
     def _current(self, it, _prev):
-        opt = next((r["opt"] for r in self._rows.values() if r["item"] is it), None)
+        row = next((r for r in self._rows.values() if r["item"] is it), None)
+        opt = None
+        if row:
+            opt = dict(row["opt"])
+            lay = self.layout_of(opt["id"])
+            if lay != opt["layout"] and self.scan:                  # mostra no diagrama de caixas o layout escolhido
+                opt["layout"] = lay
+                opt["highlight"] = [list(range(len(self.scan["layouts"][str(lay)]["channels"])))]
         for fn in self._cb_cur:
             fn(opt)
 
@@ -488,8 +535,11 @@ class CatalogView(QWidget):
             if br and not re.fullmatch(r"\d{2,4}k", br):
                 raise UserError(f"Bitrate inválido em “{o['title']}”: use algo como 192k.")
             spec = o["id"]
-            if fmt != o["fmt"] or br:
+            if fmt != r["deffmt"] or br:
                 spec += f"={fmt}" + (f":{br}" if br else "")
+            lay = self.layout_of(k)
+            if lay != r["orig"]:
+                spec += "@" + self.scan["layouts"][str(lay)]["name"]
             out.append(spec)
         return out
 
@@ -1512,11 +1562,11 @@ class MainWindow(QMainWindow):
             sub.addAction(a)
         self.set_theme(cur, save=False)
         v.addSeparator()
-        nt = v.addMenu("Notificações")
-        self.notify_act = QAction("Notificar quando as tarefas terminarem", self, checkable=True)
+        nt = v.addMenu("Aviso ao terminar")
+        self.notify_act = QAction("Avisar quando as tarefas terminarem", self, checkable=True)
         self.notify_act.setChecked(self.settings.value("notify/enabled", True, bool))
         self.notify_act.toggled.connect(lambda on: self.settings.setValue("notify/enabled", on))
-        self.notify_bg_act = QAction("Apenas quando a janela não estiver em foco", self, checkable=True)
+        self.notify_bg_act = QAction("Só quando a janela não estiver em foco", self, checkable=True)
         self.notify_bg_act.setChecked(self.settings.value("notify/only_background", True, bool))
         self.notify_bg_act.toggled.connect(lambda on: self.settings.setValue("notify/only_background", on))
         test = QAction("Enviar um aviso de teste", self)

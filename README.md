@@ -137,7 +137,7 @@ python dtv_tools.py mpegh-audio ENTRADA [--option preset:0 --option group:3=flac
  
 | Opção | Descrição |
 |---|---|
-| `--option ESCOLHA` | Repetível. `preset:ID` ou `group:ID`, opcionalmente com `=FORMATO` e `:BITRATE`: `preset:0`, `preset:0=eac3:640k`, `group:5=flac`. Sem nenhum `--option`, **todos os presets** são gerados. Os IDs vêm do `mpegh-scan` |
+| `--option ESCOLHA` | Repetível. `preset:ID` ou `group:ID`, opcionalmente com `=FORMATO` e `:BITRATE`: `preset:0`, `preset:0=eac3:640k`, `group:5=flac`. No fim, `@LAYOUT` renderiza a trilha em outro layout (`2.0` ou `5.1`): `group:3@2.0`, `preset:1=eac3:448k@5.1`. Sem `@`, vale o layout original da trilha (o `mpegh-scan` indica qual é e quais outros são possíveis; um par L/R é sempre 2.0). Mudar o layout muda o formato padrão (AAC em 2.0, E-AC-3 em 5.1) e o nome do arquivo, e, no `transcode`, o título da trilha (`2.0 de 5.1`). Sem nenhum `--option`, **todos os presets** são gerados. Os IDs vêm do `mpegh-scan` |
 | formatos | `aac` (até 8 canais, 256k), `eac3` (até 6 canais, 640k), `flac` (até 8 canais), `wav` (24 bits). Padrão por opção: AAC com 2 canais, E-AC-3 até 6 canais, WAV acima disso |
 | `--native-layout` | `0` automático (padrão), `2`, `6`, `19` |
 | `--jobs N` | Decodificações em paralelo. Padrão: metade dos núcleos da CPU |

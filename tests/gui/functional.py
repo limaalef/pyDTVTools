@@ -44,7 +44,7 @@ w.close()
 R.program_and_prefix = lambda: (sys.executable, [os.path.join(ROOT, "tests", "gui", "old_dtv.py")])
 w = G.MainWindow(); w.show(); wait(500); done(w); wait(200)
 txt = [r["status"].text() for r in w.pages["tools"].rows.values()]
-check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.2.3" in t and "unrecognized" in t for t in txt))
+check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.3.0" in t and "unrecognized" in t for t in txt))
 w.close()
 
 # --- 1c. ferramentas escolhidas na tela vão como opção explícita, sem precisar "Salvar"
@@ -129,6 +129,18 @@ cat._mark(lambda o: False); check("catálogo: desmarcar tudo", len(cat.selected_
 cat._rows["group:2"]["item"].setCheckState(0, Qt.CheckState.Checked); check("catálogo: botão gerar habilita com 1 item", pg.gen_btn.isEnabled())
 spec = cat.specs(); check("catálogo: spec do item marcado", spec == ["group:2"])
 cat._rows["group:2"]["br"].setCurrentText("192k"); check("catálogo: bitrate vira spec", cat.specs() == ["group:2=aac:192k"] or cat.specs()[0].startswith("group:2="))
+# --- layout por trilha (2.0 / 5.1), sempre indicando o original
+cat._rows["group:2"]["br"].setCurrentText("")
+lcb = cat._rows["group:2"]["lay"]
+check("layout: seletor com o original indicado", lcb is not None and [lcb.itemText(i) for i in range(lcb.count())] == ["2.0 · original", "5.1 · de 2.0"])
+check("layout: par L/R não tem seletor (só 2.0)", cat._rows["pair:2+3"]["lay"] is None and "original" in cat._rows["pair:2+3"]["item"].text(1))
+lcb.setCurrentIndex(lcb.findData(6))
+check("layout: trocar para 5.1 vira @5.1 e o formato padrão passa a E-AC-3", cat.specs() == ["group:2@5.1"] and cat._rows["group:2"]["fmt"].currentData() == "eac3")
+cat.tree.setCurrentItem(cat._rows["group:2"]["item"])
+seen_lay = []; cat.on_current(lambda o: seen_lay.append((o["layout"], len(o["highlight"][0]))) if o else None)
+lcb.setCurrentIndex(lcb.findData(2)); check("layout: voltar ao original remove o @ e o diagrama acompanha", cat.specs() == ["group:2"] and seen_lay and seen_lay[-1] == (2, 2))
+p0 = cat._rows["preset:0"]["lay"]
+check("layout: preset 5.1 oferece 2.0 e 5.1", [p0.itemText(i) for i in range(p0.count())] == ["2.0 · de 5.1", "5.1 · original"])
 pair = cat._rows["pair:2+3"]["item"]; check("catálogo: par L/R selecionável", bool(pair.flags() & Qt.ItemFlag.ItemIsUserCheckable))
 check("catálogo: isolamento por edição sinalizado", not cat._rows["group:0"]["item"].icon(0).isNull())
 w.nav_to("cut"); cg = w.pages["cut"]; cg.input.setText(f1); cg.read_points(); done(w)

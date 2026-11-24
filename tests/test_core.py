@@ -164,4 +164,4 @@ def test_plan_isolation_methods():
 
 
 def test_option_spec_accepts_pairs():
-    assert d.parse_opt_spec("pair:1+2=aac:128k") == ("pair:1+2", "aac", "128k")
+    assert d.parse_opt_spec("pair:1+2=aac:128k") == ("pair:1+2", "aac", "128k", None)
