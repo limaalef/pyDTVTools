@@ -41,10 +41,10 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 PROTOCOL_VERSION = 2
 # What a controlling program (the GUI) may rely on; listed by `describe`, `doctor` and the `hello` event.
-FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation", "update-check")
+FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation", "update-check", "dash-live")
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 PJ = False          # machine mode: --json (protocol v2) or the legacy --progress-json
 JSONL = False       # --json: stdout carries ONLY one JSON object per line
@@ -4680,6 +4680,26 @@ def _classify_rep(adap, rep):
     return "ignore"
 
 
+def _extra_kind(adap, rep):
+    """What a representation that is NOT captured is: subtitles/captions get their own label so the user knows they exist."""
+    ct = adap.get("contentType", "").lower()
+    mt = rep.get("mimeType", adap.get("mimeType", "")).lower()
+    codecs = rep.get("codecs", adap.get("codecs", "")).lower()
+    if ct == "text" or mt.startswith("text/") or "ttml" in mt or "vtt" in mt or any(c in codecs for c in ("stpp", "wvtt", "tx3g", "cea", "dfxp")):
+        return "subtitle"
+    return "other"
+
+
+def _rep_summary(adap, rep, kind):
+    bw = rep.get("bandwidth", "0")
+    return {"kind": kind, "id": rep.get("id", ""), "codecs": rep.get("codecs") or adap.get("codecs") or "",
+            "mime": rep.get("mimeType") or adap.get("mimeType") or adap.get("contentType") or "",
+            "lang": rep.get("lang") or adap.get("lang") or "", "bandwidth": int(bw) if bw.isdigit() else 0,
+            "width": rep.get("width") or adap.get("width") or "", "height": rep.get("height") or adap.get("height") or "",
+            "role": _child_value(adap, "Role") or _child_value(rep, "Role") or "",
+            "label": next((c.text for c in adap if _strip_ns(c.tag) == "Label" and c.text), "") or ""}
+
+
 def _child_value(el, name):
     for c in el:
         if _strip_ns(c.tag) == name:
@@ -4708,7 +4728,7 @@ def parse_mpd_tasks(mpd_bytes, mpd_url, out_dir, now=None, window=12):
     now = time.time() if now is None else now
     mpd_base = _base(root, mpd_url.rsplit("/", 1)[0] + "/")
     periods = [p for p in root if _strip_ns(p.tag) == "Period"]
-    info = {"drm": False, "periods": len(periods), "unsupported": []}
+    info = {"drm": False, "periods": len(periods), "unsupported": [], "extra": []}
     tracks = {k: {"init": None, "segs": [], "meta": None} for k in DASH_KINDS}
     skipped = []
     if not periods:
@@ -4727,14 +4747,16 @@ def parse_mpd_tasks(mpd_bytes, mpd_url, out_dir, now=None, window=12):
             if _strip_ns(rep.tag) != "Representation":
                 continue
             kind = _classify_rep(adap, rep)
-            if kind == "ignore":
-                continue
             if any(_strip_ns(c.tag) == "ContentProtection" for el in (adap, rep) for c in el):
                 info["drm"] = True
+            if kind == "ignore":
+                info["extra"].append(_rep_summary(adap, rep, _extra_kind(adap, rep)))      # listed, never downloaded
+                continue
             rep_id = rep.get("id", "0")
             chosen = tracks[kind]["meta"]
             if chosen is not None and chosen["rep_id"] != rep_id:
                 skipped.append(f"{kind}:{rep_id}")
+                info["extra"].append(_rep_summary(adap, rep, "alt_" + kind))
                 continue
             bw = rep.get("bandwidth", "0")
             track_dir = os.path.join(out_dir, kind)
@@ -4752,6 +4774,8 @@ def parse_mpd_tasks(mpd_bytes, mpd_url, out_dir, now=None, window=12):
                     "bandwidth": int(bw) if bw.isdigit() else 0, "lang": rep.get("lang") or adap.get("lang"),
                     "channels": _child_value(rep, "AudioChannelConfiguration") or _child_value(adap, "AudioChannelConfiguration"),
                     "role": _child_value(adap, "Role") or _child_value(rep, "Role"),
+                    "codecs": rep.get("codecs") or adap.get("codecs") or "",
+                    "label": next((c.text for c in adap if _strip_ns(c.tag) == "Label" and c.text), "") or "",
                 }
             init_t, media_t = tmpl.get("initialization", ""), tmpl.get("media", "")
             start_num = int(tmpl.get("startNumber", "1"))
@@ -5322,6 +5346,7 @@ def cmd_dash_capture(a):
         if label != post["label"]:
             post["t0"] = time.time()
         post.update(label=label, frac=frac, detail=detail)
+        ev(type="live", phase="post", label=label, frac=frac if frac is not None else -1, detail=detail)
 
     def stop_live():
         if live is not None:
@@ -5332,19 +5357,32 @@ def cmd_dash_capture(a):
         live.start()
         atexit.register(stop_live)
     last_status = [0.0]
+    cap_t0 = [None]
+    last_live = [0.0]
+
+    def emit_live(act, done_dur):
+        """Machine-readable snapshot for the GUI's live view (about once a second)."""
+        now = time.time()
+        if now - last_live[0] < 1.0:
+            return
+        last_live[0] = now
+        ev(type="live", phase="capture", elapsed=round(now - (cap_t0[0] or now), 1), recorded=round(done_dur, 2),
+           limit=a.live_record_limit or 0, frames=merger.written, paired=merger.paired, errors=st["errors"],
+           tracks=[{"kind": k, "state": t.state, "done": len(t.done), "seen": len(t.seen), "bytes": t.bytes_total,
+                    "speed": round(t.speed()), "dur": round(t.done_dur, 2)} for k, t in trk.items() if t.active])
 
     def heartbeat(force=False):
         act = [t for t in trk.values() if t.active]
         if not act:
             return
         done_dur = max(t.done_dur for t in act)
+        emit_live(act, done_dur)
         if a.live_record_limit:
             frac = min(1.0, done_dur / a.live_record_limit)
         else:
             tot = sum(len(t.seen) for t in act)
             frac = (sum(len(t.done) for t in act) / tot) if (tot and not st.get("dynamic")) else 0.0
-        detail = f"recorded {dash_fmt_dur(done_dur)} · {merger.written} frames · " + " | ".join(
-            f"{t.tag} {len(t.done)}/{len(t.seen)}" for t in act)
+        detail = f"recorded {dash_fmt_dur(done_dur)} · {merger.written} frames"
         if live is None:
             progress("capture", frac, detail, force=force)
         if live is None and not PJ and time.time() - last_status[0] > 5:
@@ -5377,6 +5415,10 @@ def cmd_dash_capture(a):
                     if not tracks["vvc_base"]["meta"] or not tracks["lcevc_enh"]["meta"]:
                         note("Video or LCEVC track not found in the manifest: no 4K output is possible without both.")
                     st["announced"] = True
+                    cap_t0[0] = time.time()
+                    ev(type="tracks", dynamic=bool(is_dynamic), limit=a.live_record_limit or 0, drm=False,
+                       captured=[dict(m, kind=k, id=m["rep_id"]) for k in DASH_KINDS if (m := tracks[k]["meta"])],
+                       extra=minfo["extra"])
                     step("manifest", "done", f"{', '.join(found) or 'no tracks'}")
                     step("capture", "running")
                 if is_dynamic and a.live_take_count > 0:

@@ -46,7 +46,7 @@ w.close()
 R.program_and_prefix = lambda: (sys.executable, [os.path.join(ROOT, "tests", "gui", "old_dtv.py")])
 w = G.MainWindow(); w.show(); wait(500); done(w); wait(200)
 txt = [r["status"].text() for r in w.pages["tools"].rows.values()]
-check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.3.0" in t and "unrecognized" in t for t in txt))
+check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.3.1" in t and "unrecognized" in t for t in txt))
 w.close()
 
 # --- 1c. ferramentas escolhidas na tela vão como opção explícita, sem precisar "Salvar"
@@ -336,6 +336,46 @@ check("abertura: script diferente invalida o cache", "marcador" not in (w.core_i
 open(cache_f, "w").write("{lixo")
 w = G.MainWindow(); w.close()
 check("abertura: cache corrompido é ignorado e refeito", bool(w.core_info) and json.load(open(cache_f))["fp"] == _R.core_fingerprint())
+R.program_and_prefix = REAL
+# --- captura DASH ao vivo
+import dtv_gui_dash as DD
+check("dash: descrição da trilha", DD.describe_track({"width": "3840", "height": "2160", "bandwidth": 14_200_000, "codecs": "vvc1", "lang": "", "role": "main"}) == "3840×2160 · 14.2 Mbps · vvc1 · Main")
+check("dash: taxas legíveis", DD.fmt_bitrate(640_000) == "640 kbps" and DD.fmt_bitrate(2_500_000) == "2.5 Mbps" and DD.fmt_bitrate(0) == "—")
+oth, alts = DD.summarize_extra([{"kind": "subtitle"}, {"kind": "alt_vvc_base", "width": "1920", "height": "1080", "bandwidth": 6_000_000}])
+check("dash: legenda separada das qualidades ignoradas", len(oth) == 1 and "1920×1080" in alts and "6.0 Mbps" in alts)
+check("dash: escala do gráfico", DD.SpeedGraph.nice_max(0) == 1_000_000 and DD.SpeedGraph.nice_max(17_000_000) == 20_000_000 and DD.SpeedGraph.nice_max(2_100_000) == 2_500_000)
+os.environ["FAKE_HOLD"] = "49"
+R.program_and_prefix = lambda: (sys.executable, [FAKE])
+w = G.MainWindow(); w.show(); done(w)
+w.runner.env_extra["FAKE_HOLD"] = "49"
+w.nav_to("dash"); pg = w.pages["dash"]
+check("dash: cartão ao vivo escondido antes de gravar", not pg.live.isVisible())
+pg.url.setText("https://exemplo.tv/live/manifest.mpd")
+pg.run_built(pg.build_jobs)
+until(lambda: len(pg.live._rows) == 3 and pg.live.t_frames.value.text() not in ("—", "")); wait(300)
+check("dash: cartão aparece com o selo AO VIVO", pg.live.isVisible() and pg.live.badge._text == "AO VIVO")
+check("dash: trilhas gravadas + legendas listadas", set(pg.live._rows) == {"vvc_base", "lcevc_enh", "audio"} and len(pg.live._extra_rows) == 2)
+check("dash: legendas marcadas como não gravadas", all("não é gravada" in r.stat.text() for r in pg.live._extra_rows))
+check("dash: linha da trilha mostra estado, velocidade e segmentos", "Mbps" in pg.live._rows["vvc_base"].stat.text() and "seg" in pg.live._rows["vvc_base"].stat.text())
+check("dash: totais ao vivo", "Mbps" in pg.live.t_rate.value.text() and pg.live.t_rec.value.text() != "—")
+check("dash: gráfico recebe amostras", all(len(d) >= 1 for d in pg.live.graph.series.values()) and len(pg.live.graph.series) == 3)
+check("dash: formulário travado, botão Parar ativo", not pg.stream_card.isEnabled() and pg.live.stop_btn.isEnabled() and pg.live.stop_btn.text() == "Parar e empacotar")
+check("dash: painel com botão 'Forçar parada' e indicador simples", w.panel.stop_btn.text() == "Forçar parada" and w.panel.stop_btn.isEnabled()
+      and w.panel.state_lb.text() == "Gravando ao vivo")
+pg.live.stop_btn.click(); until(lambda: not w.runner.busy); wait(300)
+check("dash: parar encerra e o cartão mostra INTERROMPIDA sem botão", pg.live.badge._text == "INTERROMPIDA" and not pg.live.stop_btn.isVisible())
+check("dash: formulário liberado depois de parar", pg.stream_card.isEnabled())
+w.runner.env_extra["FAKE_HOLD"] = ""; os.environ.pop("FAKE_HOLD", None)
+pg.run_built(pg.build_jobs)
+until(lambda: not w.runner.busy, 60000); wait(300)
+check("dash: execução completa termina como CONCLUÍDA", pg.live.badge._text == "CONCLUÍDA")
+# 'Forçar parada' do painel mata na hora (sem esperar o empacotamento)
+w.runner.env_extra["FAKE_HOLD"] = "49"
+pg.run_built(pg.build_jobs); until(lambda: len(pg.live._rows) == 3); wait(300)
+w.panel.stop_btn.click(); until(lambda: not w.runner.busy); wait(300)
+check("dash: 'Forçar parada' do painel termina o processo e fecha o cartão", pg.live.badge._text == "INTERROMPIDA")
+w.runner.env_extra.pop("FAKE_HOLD", None); os.environ.pop("FAKE_HOLD", None)
+w.close()
 R.program_and_prefix = REAL
 print("RESULTADO:", sum(ok), "/", len(ok))
 sys.exit(0 if all(ok) else 1)

@@ -28,6 +28,7 @@ class Job:
     page: Any = None                            # página que receberá resultado/erros/log
     indeterminate: bool = False                 # barra "ocupada" enquanto o progresso for 0 (captura ao vivo)
     stop_label: str = "Parar"
+    force_only: bool = False                    # o botão do painel já é "forçar parada" (a parada normal fica na própria página)
     silent: bool = False                        # execução em segundo plano (verificação inicial)
     meta: dict = field(default_factory=dict)
 
@@ -69,6 +70,8 @@ class Runner(QObject):
     jobStarted = Signal(int, int, object)          # índice, total, Job
     stepChanged = Signal(object, str, str, str)    # Job, id, status, detalhe
     progressChanged = Signal(object, float, str, str, float)   # Job, % total, detalhe, etapa, fração da etapa (0-1; -1 = desconhecida)
+    tracksReported = Signal(object, dict)          # Job, evento `tracks` (trilhas do manifesto DASH)
+    liveReported = Signal(object, dict)            # Job, evento `live` (estado da captura ao vivo)
     began = Signal(object, list)                   # Job, [{"id","label","weight"}]  (evento begin)
     planned = Signal(object, list)
     resultReady = Signal(object, dict)
@@ -197,7 +200,7 @@ class Runner(QObject):
         job = self.current_job()
         if job is not None and "hello" not in self._seen and self._proc is not None:
             self.logLine.emit(job, f"⚠ O dtv_tools não enviou nenhum evento em {self.HELLO_TIMEOUT_MS // 1000} s. "
-                                   "Confira se o dtv_tools.py da pasta acima de gui/ é a versão 1.3.0 e rode o mesmo subcomando num terminal.")
+                                   "Confira se o dtv_tools.py da pasta acima de gui/ é a versão 1.3.1 e rode o mesmo subcomando num terminal.")
 
     def _on_err_ready(self):
         if self._proc is None:
@@ -241,6 +244,10 @@ class Runner(QObject):
             fr = ev.get("frac")
             self.progressChanged.emit(job, float(ev.get("pct", 0) or 0), ev.get("detail", "") or "", ev.get("stage", "") or "",
                                       float(fr) if fr is not None else -1.0)
+        elif t == "tracks":
+            self.tracksReported.emit(job, ev)
+        elif t == "live":
+            self.liveReported.emit(job, ev)
         elif t == "plan":
             self.planned.emit(job, list(ev.get("outs") or []))
         elif t == "result":
@@ -270,7 +277,7 @@ class Runner(QObject):
         if job is not None and not ({"result", "error"} & self._seen) and not self._stopped:
             # o processo terminou sem dizer nada utilizável: nunca deixar a tela só em "Verificando…"
             if "hello" not in self._seen:
-                why = ("O dtv_tools.py não respondeu no protocolo " + str(PROTOCOL) + " (é uma versão antiga? a interface precisa do dtv_tools 1.3.0 ou mais novo, "
+                why = ("O dtv_tools.py não respondeu no protocolo " + str(PROTOCOL) + " (é uma versão antiga? a interface precisa do dtv_tools 1.3.1 ou mais novo, "
                        "na pasta acima de gui/).")
             else:
                 why = "O processo terminou antes de entregar o resultado."

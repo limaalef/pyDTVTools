@@ -1427,6 +1427,11 @@ class TaskPanel(QWidget):
         bp.setColor(QPalette.ColorRole.Highlight, col if kind in ("err", "stop", "ok") else c.accent)
         self.overall.setPalette(bp)
 
+    def set_live_hint(self, text: str):
+        """Indicador simples de que a execução está em curso (ex.: “Gravando ao vivo”), sem detalhes."""
+        if self._running:
+            self._paint_state("run", text)
+
     def set_footer(self, text: str):
         self.footer.setText(text)
 
@@ -1437,7 +1442,7 @@ class TaskPanel(QWidget):
 
     def begin_job(self, index: int, total: int, job):
         self._job = job
-        self._running, self._force, self._pct = True, False, 0.0
+        self._running, self._force, self._pct = True, bool(job.force_only), 0.0
         self._t0 = time.time()
         q = f" · item {index + 1} de {total}" if total > 1 else ""
         self.title.setText(job.title + q)

@@ -184,3 +184,17 @@ def test_drm_manifest_stops_the_capture(tmp_path):
                            "--mp4box", "/bin/true")
     srv.shutdown()
     assert rc == 2 and "DRM" in next(e for e in ev if e["type"] == "error")["message"]
+
+
+def test_mpd_lists_subtitles_and_alternative_representations(tmp_path):
+    mpd = MPD_TIMELINE.replace(b"</Period>", b"""<AdaptationSet contentType="text" mimeType="application/mp4" lang="por"><Role value="subtitle"/>
+<Representation id="s1" codecs="stpp" bandwidth="1000"><SegmentTemplate timescale="1" duration="2" media="s_$Number$.m4s"/></Representation></AdaptationSet>
+<AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="v_alt" codecs="vvc1" bandwidth="999" width="1280" height="720">
+<SegmentTemplate timescale="1" duration="2" media="a_$Number$.m4s"/></Representation></AdaptationSet></Period>""", 1)
+    tracks, _, skipped, info = d.parse_mpd_tasks(mpd, "https://x.test/a/live.mpd", str(tmp_path))
+    kinds = {e["kind"] for e in info["extra"]}
+    assert "subtitle" in kinds and "alt_vvc_base" in kinds
+    sub = next(e for e in info["extra"] if e["kind"] == "subtitle")
+    assert sub["lang"] == "por" and sub["codecs"] == "stpp" and sub["role"] == "subtitle"
+    assert tracks["vvc_base"]["meta"]["codecs"]            # a trilha gravada continua a primeira representação
+    assert not (tmp_path / "subtitle").exists()            # nada é baixado/criado para a legenda

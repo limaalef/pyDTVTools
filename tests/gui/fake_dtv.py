@@ -21,6 +21,9 @@ def watch():
     if not os.environ.get("FAKE_IGNORE_STOP"): stop.set()
 threading.Thread(target=watch, daemon=True).start()
 
+FEED = None
+
+
 def run_steps(steps, weights, hold_at=None, delay=0.05, details=None):
     """percorre as etapas; se hold_at (0-100), fica parado nesse ponto até receber STOP."""
     done = 0.0
@@ -33,9 +36,12 @@ def run_steps(steps, weights, hold_at=None, delay=0.05, details=None):
             p = done + w * k / 10
             if hold_at is not None and p >= hold_at:
                 prog(p, (details or {}).get(sid, "00:04 / 00:11 · 3,95 fps · 0,101x"))
-                while not stop.is_set(): time.sleep(0.05)
+                while not stop.is_set():
+                    if FEED: FEED()
+                    time.sleep(0.2)
                 ev(type="error", kind="interrupted", message="Interrompido pelo usuário."); sys.exit(130)
             prog(p, (details or {}).get(sid, f"{k*10}%")); time.sleep(delay)
+            if FEED: FEED()
         done += w
         step(sid, "done", (details or {}).get(sid + "_done", ""))
     return done
@@ -125,6 +131,25 @@ def main():
         run_steps(T.MP_STEPS, {"prepare": 15, "decode": 50, "check": 5, "encode": 20, "mux": 10, "report": 0}, hold_at=hold, delay=0.01)
         ev(type="result", out="x", outputs=outputs("a_p0.ec3", "a_p2.ec3", "a_g2.m4a"), notes=[], rows=[["Arquivos", "3"]]); return 0
     if cmd == "dash-capture":
+        import random
+        n = [0]
+        def feed():
+            if n[0] == 0:
+                ev(type="tracks", dynamic=os.environ.get("FAKE_STATIC") != "1", limit=0, drm=False, captured=[
+                    {"kind": "vvc_base", "id": "v1", "width": "3840", "height": "2160", "bandwidth": 14_200_000, "codecs": "vvc1.1.L153.CL1.O0", "lang": "", "role": "main"},
+                    {"kind": "lcevc_enh", "id": "e1", "width": "3840", "height": "2160", "bandwidth": 3_400_000, "codecs": "lvc1", "lang": "", "role": ""},
+                    {"kind": "audio", "id": "a1", "bandwidth": 640_000, "codecs": "mhm1.0x0C", "lang": "por", "channels": "17", "role": "main", "width": "", "height": ""}],
+                   extra=[{"kind": "subtitle", "id": "s1", "codecs": "stpp", "mime": "application/mp4", "lang": "por", "bandwidth": 0, "width": "", "height": "", "role": "subtitle", "label": "Português"},
+                          {"kind": "subtitle", "id": "s2", "codecs": "stpp", "mime": "application/mp4", "lang": "eng", "bandwidth": 0, "width": "", "height": "", "role": "", "label": ""},
+                          {"kind": "alt_vvc_base", "id": "v0", "codecs": "vvc1", "mime": "video/mp4", "lang": "", "bandwidth": 6_000_000, "width": "1920", "height": "1080", "role": ""}])
+            n[0] += 1
+            i = n[0]
+            ev(type="live", phase="capture", elapsed=i * 0.2, recorded=i * 0.4, limit=0, frames=i * 24, paired=i * 24, errors=i // 40,
+               tracks=[{"kind": "vvc_base", "state": "Downloading", "done": i, "seen": i + 1, "bytes": i * 900_000, "speed": 1_700_000 + random.randint(-300_000, 300_000), "dur": i * 0.4},
+                       {"kind": "lcevc_enh", "state": "Waiting", "done": i, "seen": i, "bytes": i * 210_000, "speed": 420_000 + random.randint(-80_000, 80_000), "dur": i * 0.4},
+                       {"kind": "audio", "state": "Downloading", "done": i, "seen": i + 1, "bytes": i * 40_000, "speed": 80_000, "dur": i * 0.4}])
+        global FEED
+        FEED = feed
         run_steps(T.DASH_STEPS, T.DASH_WEIGHTS, hold_at=hold, delay=0.01)
         ev(type="result", out="x", outputs=outputs("capture_20261122_145001.mp4"), notes=[], rows=[]); return 0
     if cmd == "frame":

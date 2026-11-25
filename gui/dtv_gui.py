@@ -13,7 +13,7 @@ import os
 import sys
 
 APP_NAME = "DTV Tools"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--cli":
@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
 import cutmath  # noqa: E402
 from dtv_gui_notify import Notifier, summarize
 from dtv_gui_presets import PresetStore  # noqa: E402
+from dtv_gui_dash import DashLiveCard  # noqa: E402
 from dtv_gui_update import build_dialog as build_update_dialog, due as update_due, worth_showing as update_worth  # noqa: E402
 from dtv_gui_runner import PROTOCOL, Job, Runner, core_fingerprint, hide_console, program_and_prefix  # noqa: E402
 from dtv_gui_style import AccentButton, FluentStyle, accent_of, apply_backdrop, apply_fluent, mica_supported  # noqa: E402
@@ -1564,9 +1565,14 @@ class DashPage(Page):
         self.overwrite = QCheckBox("Substituir arquivo existente")
         f.addRow("", self.overwrite)
         lay.addWidget(g)
+        self.stream_card = g
         lay.addWidget(muted_label("Streams protegidos (DRM) não são suportados."))
+        self.live = DashLiveCard()
+        self.live.stopRequested.connect(lambda: self.win.runner.stop(False))
+        lay.addWidget(self.live)
 
         adv = Collapsible("Avançado: rede, cabeçalhos e limpeza")
+        self.adv_box = adv
         f2 = QFormLayout()
         self.threads = self.spin(1, 64, 8)
         self.take = self.spin(0, 100, 1, special="Desde o início da janela")
@@ -1597,6 +1603,23 @@ class DashPage(Page):
         lay.addWidget(adv)
         self.primary("Iniciar captura", lambda: self.run_built(self.build_jobs))
 
+    def set_busy(self, busy: bool):
+        # a página não se desabilita inteira: o cartão de captura (e o botão Parar) precisam continuar ativos
+        self._busy = busy
+        self.stream_card.setEnabled(not busy)
+        self.adv_box.setEnabled(not busy)
+        self.update_buttons()
+
+    def handle_tracks(self, job, d):
+        self.live.set_tracks(d)
+
+    def handle_live(self, job, d):
+        self.live.set_live(d)
+        self.win.panel.set_live_hint("Empacotando…" if d.get("phase") == "post" else "Gravando ao vivo" if self.live.dynamic else "Baixando")
+
+    def handle_finished(self, job, code, ok):
+        self.live.finish(ok, code == 130 or self.win.runner._stopped)
+
     def build_jobs(self):
         url = self.url.text().strip()
         if not re.match(r"^https?://", url, re.I):
@@ -1604,6 +1627,7 @@ class DashPage(Page):
         for h in self.headers.values():
             if ":" not in h:
                 raise UserError(f"Cabeçalho inválido: “{h}”. Use o formato Nome: valor.")
+        self.live.begin()
         lim = self.limit.time()
         secs = lim.hour() * 3600 + lim.minute() * 60 + lim.second()
         a = ["dash-capture", url, "--save-dir", self.save_dir.text() or ".", "--thread-count", str(self.threads.value()),
@@ -1623,7 +1647,7 @@ class DashPage(Page):
         if self.overwrite.isChecked():
             a.append("--overwrite")
         a += self.extra("dash-capture")
-        return [Job("Captura DASH", a, kind="dash-capture", page=self, indeterminate=not secs, stop_label="Parar e empacotar")]
+        return [Job("Captura DASH", a, kind="dash-capture", page=self, indeterminate=not secs, stop_label="Forçar parada", force_only=True)]
 
 
 # ═════════════════════════════ Ferramentas ═════════════════════════════
@@ -2069,6 +2093,8 @@ class MainWindow(QMainWindow):
         r.resultReady.connect(self._result)
         r.errorReported.connect(self._error)
         r.logLine.connect(self._log)
+        r.tracksReported.connect(lambda job, d: getattr(job.page, "handle_tracks", lambda *_: None)(job, d))
+        r.liveReported.connect(lambda job, d: getattr(job.page, "handle_live", lambda *_: None)(job, d))
         r.jobFinished.connect(self._job_finished)
         r.queueFinished.connect(self._queue_finished)
         p.stopRequested.connect(r.stop)
@@ -2106,6 +2132,8 @@ class MainWindow(QMainWindow):
             job.page.handle_log(job, line)
 
     def _job_finished(self, job, code, ok):
+        if job.page is not None and hasattr(job.page, "handle_finished"):
+            job.page.handle_finished(job, code, ok)
         self._q_jobs.append({"title": job.title, "ok": ok, "quiet": self._quiet(job), "err": "" if ok or code == 130 else self._last_err})
         self.panel.end_job(job, code, ok)
         if not ok and code == 130:
