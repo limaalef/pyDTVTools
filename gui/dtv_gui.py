@@ -22,6 +22,7 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--cli":
     sys.exit(_dtv.main(sys.argv[2:]))
 
 import json  # noqa: E402
+import time  # noqa: E402
 import re  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
 import cutmath  # noqa: E402
 from dtv_gui_notify import Notifier, summarize
 from dtv_gui_presets import PresetStore  # noqa: E402
+from dtv_gui_update import build_dialog as build_update_dialog, due as update_due, worth_showing as update_worth  # noqa: E402
 from dtv_gui_runner import PROTOCOL, Job, Runner, program_and_prefix  # noqa: E402
 from dtv_gui_style import AccentButton, FluentStyle, accent_of, apply_backdrop, apply_fluent, mica_supported  # noqa: E402
 from dtv_gui_widgets import (CardBox, WheelGuard, svg_icon, fit_view, AvailabilityChart, Collapsible, Colors, CutTimeline, FileEdit, ImagePreview, ItemList,  # noqa: E402
@@ -421,7 +423,7 @@ class CatalogView(QWidget):
             orig = o.get("layout_orig", o["layout"])
             choices = o.get("layout_choices") or [o["layout"]]
             it = QTreeWidgetItem(tops[sec], [o["title"], f"{lname(o['layout'])} · original" if len(choices) < 2 else "", "", ""])
-            it.setToolTip(1, f"{lname(o['layout']) } · {o['out_ch']} canais" + (f"\n{o['composition']}" if o.get("composition") else ""))
+            it.setToolTip(1, f"{lname(o['layout'])} · {o['out_ch']} canais" + (f"\n{o['composition']}" if o.get("composition") else ""))
             it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
             it.setCheckState(0, Qt.CheckState.Checked if sec == "presets" else Qt.CheckState.Unchecked)
             it.setToolTip(0, o["desc"])
@@ -993,7 +995,7 @@ class CutPage(Page):
         return [Job(f"Cortar · {os.path.basename(self.input.text())} ({len(self.cuts)} corte(s))", a, kind="mp4-cut", page=self)]
 
 
-# ═════════════════════════════ Transcodificar ═════════════════════════════
+# ═════════════════════════════ Recodificar ═════════════════════════════
 class TranscodePage(Page):
     title = "Recodificar"
     subtitle = "Recodificação de MP4 single-track (VVC com LCEVC embutido + MPEG-H) com opção de seleção de faixas de áudio do MPEG-H"
@@ -1118,7 +1120,7 @@ class TranscodePage(Page):
         lay.addWidget(go)
         self.files.changed.connect(lambda: self.output.setEnabled(len(self.files.values()) <= 1))
         self._preset_wire()
-        self.primary("Transcodificar", lambda: self.run_built(lambda: self.build_jobs(False)))
+        self.primary("Recodificar", lambda: self.run_built(lambda: self.build_jobs(False)))
         dry = QPushButton("Mostrar comando")
         dry.clicked.connect(lambda: self.run_built(lambda: self.build_jobs(True)))
         self.footer.addWidget(dry)
@@ -1398,7 +1400,7 @@ class TranscodePage(Page):
             if dry:
                 a.append("--dry-run")
             a += self.extra("transcode")
-            jobs.append(Job(f"{'Comando' if dry else 'Transcodificar'} · {os.path.basename(fpath)}", a, kind="transcode", page=self,
+            jobs.append(Job(f"{'Comando' if dry else 'Recodificar'} · {os.path.basename(fpath)}", a, kind="transcode", page=self,
                             meta={"quiet": dry}))
         return jobs
 
@@ -1629,8 +1631,8 @@ class ToolsPage(Page):
     title = "Configurações"
     subtitle = "Definição dos programas externos usados pelo dtv_tools. Programas já instalados podem ser encontrados automaticamente se já estão definidos em PATH."
 
-    NEEDED = {"mp4box": "ts-tv3, mp4-cut, dash-capture, áudio MPEG-H, transcodificação",
-              "ffmpeg": "áudio MPEG-H, transcodificação, quadro/imagem; verificação do LCEVC exige o filtro lcevc",
+    NEEDED = {"mp4box": "ts-tv3, mp4-cut, dash-capture, áudio MPEG-H, recodificação",
+              "ffmpeg": "áudio MPEG-H, recodificação, quadro/imagem; verificação do LCEVC exige o filtro lcevc",
               "mpegh_ui": "análise e renderização do áudio MPEG-H", "mpegh_decoder": "renderização do áudio MPEG-H"}
 
     def build(self, lay):
@@ -1651,11 +1653,13 @@ class ToolsPage(Page):
             gl.setColumnStretch(1, 1)
             lay.addWidget(g)
             self.rows[key] = {"icon": icon, "status": st, "edit": fe}
+        # BUILD-REMOVE-START
         gm = CardBox("Módulos Python")
         self.mods = QLabel("—")
         self.mods.setWordWrap(True)
         gm.body.addWidget(self.mods)
         lay.addWidget(gm)
+        # BUILD-REMOVE-END
         g, f = self.group("Pastas")
         self.tmpdir = FileEdit("dir", placeholder="Padrão: dentro da pasta de saída", key="tmp")
         self.cache = FileEdit("dir", placeholder="Padrão: <temp do sistema>/dtv_audio_cache", key="cache")
@@ -1734,7 +1738,9 @@ class ToolsPage(Page):
                 r["status"].setText("Não encontrado. Informe o caminho abaixo ou coloque o programa na pasta tools/.")
         mods = res.get("modules", {})
         use = {"requests": "captura DASH", "rich": "opcional: painel no terminal", "numpy": "quadro/imagem", "PIL": "imagens SDR"}
+        # BUILD-REMOVE-START-2
         self.mods.setText("    ".join(f"{'✔' if mods.get(m) else '✖'} {m} ({use[m]})" for m in use if m in mods))
+        # BUILD-REMOVE-END-2
         self.win.set_tools_status(res)
 
 
@@ -1748,6 +1754,23 @@ class NavDelegate(QStyledItemDelegate):
         return sh
 
 
+class _UpdateSink:
+    """O Runner entrega resultado e erro à 'página' do Job: aqui, a janela principal."""
+
+    def __init__(self, win):
+        self.win = win
+
+    def handle_result(self, job, res):
+        if res.get("update"):
+            self.win.update_result(res["update"])
+
+    def handle_error(self, job, msg):
+        self.win.update_error(msg)
+
+    def show_error(self, msg):
+        pass
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1756,6 +1779,7 @@ class MainWindow(QMainWindow):
         env = {"DTV_TOOLS_DIR": str(bundled_tools_dir()), "DTV_TOOLS_CONFIG": str(config_path())}
         self.runner = Runner(env, self)
         self.bg_runner = Runner(env, self)
+        self.up_runner = Runner(env, self)
         self._q_jobs = []
         self.notifier = Notifier(self)
         self.notifier.clicked.connect(self._bring_to_front)
@@ -1897,7 +1921,16 @@ class MainWindow(QMainWindow):
             self.mica_act.setChecked(self._mica)
             self.mica_act.triggered.connect(self.set_mica)
             v.addAction(self.mica_act)
-        h = mb.addMenu("A&juda")
+        h = mb.addMenu("&Ajuda")
+        updates = h.addMenu("&Atualizações")
+        u = QAction("Verificar atualizações…", self)
+        u.triggered.connect(lambda: self.check_update(manual=True))
+        updates.addAction(u)
+        self.update_auto_act = QAction("Verificar atualizações ao iniciar", self, checkable=True)
+        self.update_auto_act.setChecked(self.settings.value("update/auto", True, bool))
+        self.update_auto_act.toggled.connect(lambda on: self.settings.setValue("update/auto", on))
+        updates.addAction(self.update_auto_act)
+        h.addSeparator()
         a = QAction("Sobre o " + APP_NAME, self)
         a.setMenuRole(QAction.MenuRole.AboutRole)
         a.triggered.connect(self.about)
@@ -2021,6 +2054,8 @@ class MainWindow(QMainWindow):
         p.stopRequested.connect(r.stop)
         self.bg_runner.resultReady.connect(lambda job, res: job.page.handle_result(job, res))
         self.bg_runner.errorReported.connect(lambda job, msg: job.page.handle_error(job, msg))
+        self.up_runner.resultReady.connect(lambda job, res: job.page.handle_result(job, res))
+        self.up_runner.errorReported.connect(lambda job, msg: job.page.handle_error(job, msg))
 
     def _quiet(self, job) -> bool:
         return bool(job.meta.get("quiet"))
@@ -2098,6 +2133,28 @@ class MainWindow(QMainWindow):
     def startup_check(self):
         tp = self.pages["tools"]
         self.bg_runner.start([tp.job(quiet=True)])
+        if self.settings.value("update/auto", True, bool) and update_due(self.settings.value("update/last", 0.0, float)):
+            self.check_update(manual=False)
+
+    # ── atualizações ──
+    def check_update(self, manual: bool):
+        """Pergunta ao script se há versão nova. Automática: silenciosa (sem internet, erro, já atualizado)."""
+        if self.up_runner.busy:
+            return
+        self._update_manual = manual
+        self.up_runner.start([Job("Verificando atualizações", ["check-update"], kind="check-update", page=_UpdateSink(self), meta={"quiet": True})])
+
+    def update_result(self, info: dict):
+        manual = getattr(self, "_update_manual", False)
+        self.settings.setValue("update/last", time.time())
+        if not update_worth(info, self.settings.value("update/skip", "", str), manual):
+            return
+        self._update_box = build_update_dialog(self, info, lambda v: self.settings.setValue("update/skip", v))
+        self._update_box.open()
+
+    def update_error(self, msg: str):
+        if getattr(self, "_update_manual", False):
+            QMessageBox.warning(self, "Atualizações", msg)
 
     def set_tools_status(self, res: dict):
         self._tools_res = res

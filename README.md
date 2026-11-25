@@ -17,6 +17,7 @@ Caso você seja um uusário que tenha ressalvas ao uso de inteligência artifica
 | `frame` | Salva um quadro como imagem HDR (PNG 16 bits, AVIF) e/ou SDR com tone mapping (PNG, JPG) |
 | `sdr` | Gera imagens SDR a partir de um PNG HDR salvo |
 | `doctor` | Verifica os programas externos e os módulos Python necessários para o script funcionar |
+| `check-update` | Consulta no GitHub se há uma versão mais nova publicada (não baixa nem instala nada) |
 | `describe` | Imprime comandos, opções, ferramentas, formatos e layouts em JSON (para interfaces) |
 
 ### Opções comuns a todos os comandos
@@ -335,6 +336,16 @@ python dtv_tools.py sdr ENTRADA_hdr.png [--sdr png,jpg] [--tonemap hable] [--whi
 ```
  
 Mesmas opções de tone mapping de `frame`.
+
+### `check-update`
+
+Consulta a última *release* publicada no GitHub e compara com a versão instalada. Não baixa nem instala nada: mostra a versão, as notas, a página e o arquivo que parece ser o do seu sistema.
+
+```
+python dtv_tools.py check-update [--repo DONO/NOME] [--timeout SEG]
+```
+
+O repositório padrão fica em `UPDATE_REPO` no início da seção de atualização do script e pode ser trocado por `--repo` ou pela variável `DTV_UPDATE_REPO`. Só considera *releases* estáveis (rascunhos e pré-lançamentos publicados como tal ficam de fora). Sem internet, repositório inexistente ou limite de consultas do GitHub viram uma mensagem clara e código de saída 2. Na interface: **Ajuda → Verificar atualizações…**, e uma verificação silenciosa ao abrir (no máximo uma por dia, desligável em **Ajuda → Verificar atualizações ao iniciar**; "Ignorar esta versão" silencia o aviso daquela versão).
 
 ### `doctor`
  

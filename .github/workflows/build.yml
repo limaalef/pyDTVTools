@@ -73,6 +73,9 @@ jobs:
           case "$GITHUB_REF" in refs/tags/v*) ;; *) V="0.0.0-dev.${GITHUB_RUN_NUMBER}" ;; esac
           echo "DTV_VERSION=$V" >> "$GITHUB_ENV"
 
+      - name: Preparar código para compilação
+        run: python gui/packaging/prebuild.py
+      
       # Mesmo script que você roda localmente. Não embute ffmpeg/MP4Box/mpegh*: o usuário os aponta em "Ferramentas e pastas"
       # (ou coloca em tools/ ao lado do app). Faz: PyInstaller -> teste de fumaça -> pacote + SHA-256 em release/.
       # macOS: importa o certificado Developer ID num chaveiro temporário (só se o segredo existir)

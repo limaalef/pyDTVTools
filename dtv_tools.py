@@ -44,7 +44,7 @@ from pathlib import Path
 __version__ = "1.3.0"
 PROTOCOL_VERSION = 2
 # What a controlling program (the GUI) may rely on; listed by `describe`, `doctor` and the `hello` event.
-FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation")
+FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation", "update-check")
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 PJ = False          # machine mode: --json (protocol v2) or the legacy --progress-json
 JSONL = False       # --json: stdout carries ONLY one JSON object per line
@@ -6613,6 +6613,15 @@ def build_parser():
     s_doc.add_argument("--ascii", action="store_true")
     tool_flags(s_doc, ("mp4box", "ffmpeg", "mpegh"))
 
+    s_up = sub.add_parser("check-update", help="check on GitHub whether a newer release exists (never downloads or installs anything)")
+    s_up.add_argument("--repo", default="", metavar="OWNER/NAME", help=f"GitHub repository (default {UPDATE_REPO}, or $DTV_UPDATE_REPO)")
+    s_up.add_argument("--timeout", type=float, default=8.0, metavar="SEC", help="network timeout (default 8)")
+    s_up.add_argument("--api-url", default="", help=argparse.SUPPRESS)           # tests / mirrors: URL that returns the release JSON
+    machine_flags(s_up)
+    s_up.add_argument("-v", "--verbose", action="store_true")
+    s_up.add_argument("--no-color", action="store_true")
+    s_up.add_argument("--ascii", action="store_true")
+
     s_desc = sub.add_parser("describe", help="print the capabilities of this script as JSON (commands, options, tools, formats, layouts)")
     s_desc.add_argument("--no-color", action="store_true", help=argparse.SUPPRESS)
     s_desc.add_argument("--ascii", action="store_true", help=argparse.SUPPRESS)
@@ -6764,6 +6773,97 @@ def describe():
             "layouts": catalog_public(), "encoders": ENCODERS, "commands": commands}
 
 
+# ──────────────────────────── update check ────────────────────────────
+UPDATE_REPO = "limaalef/pyDTVTools"          # GitHub "owner/name" whose latest Release is compared with __version__
+
+
+def parse_version(v):
+    """'v1.2.10-rc1' -> ((1, 2, 10), 0) ; final releases sort after their pre-releases. None when unparseable."""
+    m = re.match(r"^\s*[vV]?(\d+(?:\.\d+){0,3})(?:[-+._ ]?([A-Za-z].*))?\s*$", str(v or ""))
+    if not m:
+        return None
+    nums = tuple(int(x) for x in m.group(1).split("."))
+    nums = (nums + (0, 0, 0))[:max(3, len(nums))]
+    return nums, (0 if m.group(2) else 1)
+
+
+def version_newer(latest, current) -> bool:
+    a, b = parse_version(latest), parse_version(current)
+    if a is None or b is None:
+        return False
+    n = max(len(a[0]), len(b[0]))
+    pad = lambda t: t[0] + (0,) * (n - len(t[0]))      # noqa: E731
+    return (pad(a), a[1]) > (pad(b), b[1])
+
+
+def pick_asset(assets, platform=None):
+    """The release file that looks made for this OS (by name), or None."""
+    plat = platform or sys.platform
+    keys = ("win", ".exe", ".msi") if plat.startswith("win") else ("mac", "darwin", "osx", ".dmg") if plat == "darwin" else ("linux", ".appimage", ".deb")
+    other = ("linux", "mac", "darwin", "osx", ".dmg") if plat.startswith("win") else ("win", ".exe", "linux", ".appimage", ".deb") if plat == "darwin" else ("win", ".exe", "mac", "darwin", "osx", ".dmg")
+    for a_ in assets:
+        n = a_.get("name", "").lower()
+        if n.endswith((".sha256", ".sha256sum", ".sig", ".asc", ".txt", ".md")):
+            continue
+        if any(k in n for k in keys) and not any(k in n for k in other):
+            return a_
+    return None
+
+
+def fetch_latest_release(repo, api_url=None, timeout=8.0):
+    import urllib.error
+    import urllib.request
+    url = api_url or f"https://api.github.com/repos/{repo}/releases/latest"
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": f"dtv_tools/{__version__}",
+                                               "X-GitHub-Api-Version": "2022-11-28"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise Fail(f"Nenhuma versão publicada em github.com/{repo} (ou o repositório é privado/não existe).")
+        if e.code in (403, 429):
+            raise Fail("O GitHub limitou as consultas (muitas verificações seguidas). Tente de novo mais tarde.")
+        raise Fail(f"O GitHub respondeu HTTP {e.code}.")
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        raise Fail(f"Não foi possível consultar o GitHub (sem internet?): {getattr(e, 'reason', e)}")
+    except ValueError:
+        raise Fail("Resposta inválida do GitHub.")
+
+
+def cmd_check_update(a):
+    set_steps([("check", "Consultar a última versão publicada")])
+    set_stages({"check": 100})
+    step("check", "running")
+    repo = (a.repo or os.environ.get("DTV_UPDATE_REPO") or UPDATE_REPO).strip().strip("/")
+    if not api_url_ok(a.api_url) and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise Fail(f"Repositório inválido: '{repo}' (use dono/nome).")
+    progress("check", 0.2, f"github.com/{repo}", force=True)
+    rel = fetch_latest_release(repo, a.api_url or os.environ.get("DTV_UPDATE_URL"), timeout=a.timeout)
+    tag = str(rel.get("tag_name") or rel.get("name") or "")
+    latest = tag.lstrip("vV")
+    if parse_version(tag) is None:
+        raise Fail(f"A versão publicada ('{tag}') não tem um número reconhecível.")
+    assets = [{"name": x.get("name", ""), "size": int(x.get("size") or 0), "url": x.get("browser_download_url", "")}
+              for x in rel.get("assets", []) if x.get("browser_download_url")]
+    newer = version_newer(tag, __version__) and not rel.get("draft")
+    info = {"repo": repo, "current": __version__, "latest": latest, "update_available": bool(newer), "url": rel.get("html_url", ""),
+            "published": rel.get("published_at", ""), "prerelease": bool(rel.get("prerelease")),
+            "notes": str(rel.get("body") or "")[:4000], "assets": assets, "suggested": pick_asset(assets)}
+    if newer:
+        say(f"Nova versão disponível: {latest} (instalada: {__version__})  {info['url']}", "ok")
+    else:
+        say(f"Você está na versão mais recente ({__version__}).", "ok")
+    progress("check", 1.0, force=True)
+    step("check", "done", f"{latest} disponível" if newer else "atualizado")
+    ev(type="result", out="", outputs=[], notes=NOTES, rows=[["Instalada", __version__], ["Última publicada", latest]], update=info)
+    return 0
+
+
+def api_url_ok(u):
+    return bool(u or os.environ.get("DTV_UPDATE_URL"))
+
+
 def main(argv=None):
     global PJ, JSONL, VERBOSE, CMD
     _fix_stdio()
@@ -6800,7 +6900,7 @@ def main(argv=None):
     global DASH_LOG, ORIG_LOOK
     DASH_LOG, ORIG_LOOK = None, False
     handlers = {"ts-tv3": cmd_ts_tv3, "mpegh-scan": cmd_mpegh_scan, "mpegh-audio": cmd_mpegh_audio,
-                "mp4-cut": cmd_mp4_cut, "dash-capture": cmd_dash_capture, "doctor": cmd_doctor,
+                "mp4-cut": cmd_mp4_cut, "dash-capture": cmd_dash_capture, "doctor": cmd_doctor, "check-update": cmd_check_update,
                 "transcode": cmd_transcode, "frame": cmd_frame, "sdr": cmd_sdr}
     try:
         return handlers[args.cmd](args) or 0

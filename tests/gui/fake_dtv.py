@@ -86,6 +86,15 @@ def main():
                  {"key": "mpegh_ui", "name": "mpeghUiManager", "ok": False, "path": "", "source": "", "version": "", "caps": {}},
                  {"key": "mpegh_decoder", "name": "mpeghDecoder", "ok": False, "path": "", "source": "", "version": "", "caps": {}}]
         ev(type="result", out="", outputs=[], notes=[], rows=[], tools=tools, modules={"requests": True, "rich": False, "numpy": True, "PIL": True}, version=T.__version__, protocol=2, features=list(T.FEATURES)); return 0
+    if cmd == "check-update":
+        mode = os.environ.get("FAKE_UPDATE", "new")
+        if mode == "error":
+            ev(type="error", kind="fail", message="Não foi possível consultar o GitHub (sem internet?)"); return 2
+        new = mode == "new"
+        info = {"repo": "x/y", "current": T.__version__, "latest": "9.9.9" if new else T.__version__, "update_available": new,
+                "url": "https://example.invalid/rel", "published": "", "prerelease": False, "notes": "Novidades da versão",
+                "assets": [], "suggested": {"name": "DTVTools-win.exe", "size": 52428800, "url": "https://example.invalid/DTVTools-win.exe"} if new else None}
+        ev(type="result", out="", outputs=[], notes=[], rows=[], update=info); return 0
     if cmd == "mpegh-scan":
         run_steps(T.MP_SCAN_STEPS, {"prepare": 65, "scene": 30, "catalog": 5}, delay=0.02)
         s = scan_audio(); ev(type="result", out="", outputs=[], scan=s, notes=s["warnings"]); return 0
