@@ -90,7 +90,8 @@ def main():
         tools = [{"key": "mp4box", "name": "MP4Box", "ok": True, "path": "C:/Users/x/Tools/MP4Box.exe", "source": "tools/", "version": "GPAC 2.4.0", "caps": {"vvc": True}},
                  {"key": "ffmpeg", "name": "ffmpeg", "ok": True, "path": "/usr/bin/ffmpeg", "source": "PATH", "version": "ffmpeg 7.1", "caps": {"lcevc_filter": False}},
                  {"key": "mpegh_ui", "name": "mpeghUiManager", "ok": False, "path": "", "source": "", "version": "", "caps": {}},
-                 {"key": "mpegh_decoder", "name": "mpeghDecoder", "ok": False, "path": "", "source": "", "version": "", "caps": {}}]
+                 {"key": "mpegh_decoder", "name": "mpeghDecoder", "ok": False, "path": "", "source": "", "version": "", "caps": {}},
+                 {"key": "ffplay", "name": "ffplay", "ok": False, "path": "", "source": "", "version": "", "caps": {}, "optional": True}]
         ev(type="result", out="", outputs=[], notes=[], rows=[], tools=tools, modules={"requests": True, "rich": False, "numpy": True, "PIL": True}, version=T.__version__, protocol=2, features=list(T.FEATURES)); return 0
     if cmd == "check-update":
         mode = os.environ.get("FAKE_UPDATE", "new")

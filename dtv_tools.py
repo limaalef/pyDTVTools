@@ -44,7 +44,7 @@ from pathlib import Path
 __version__ = "1.3.2"
 PROTOCOL_VERSION = 2
 # What a controlling program (the GUI) may rely on; listed by `describe`, `doctor` and the `hello` event.
-FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation", "update-check", "dash-live")
+FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation", "update-check", "dash-live", "preview")
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 PJ = False          # machine mode: --json (protocol v2) or the legacy --progress-json
 JSONL = False       # --json: stdout carries ONLY one JSON object per line
@@ -290,13 +290,14 @@ TOOL_DEFS = {
     "ffmpeg": {"label": "ffmpeg", "names": ("ffmpeg",), "flag": "--ffmpeg"},
     "mpegh_ui": {"label": "mpeghUiManager", "names": ("mpeghUiManager",), "flag": "--mpegh-ui"},
     "mpegh_decoder": {"label": "mpeghDecoder", "names": ("mpeghDecoder",), "flag": "--mpegh-decoder"},
+    "ffplay": {"label": "ffplay", "names": ("ffplay",), "flag": "--ffplay", "optional": True},      # only for the preview player
 }
 _TOOL_CACHE: dict = {}
 _CFG_CACHE: dict = {}
 
 
 def load_config() -> dict:
-    """Optional dtv_tools.json next to the script: {"mp4box": "...", "ffmpeg": "...", "mpegh_ui": "...", "mpegh_decoder": "..."}."""
+    """Optional dtv_tools.json next to the script: {"mp4box": "...", "ffmpeg": "...", "mpegh_ui": "...", "mpegh_decoder": "...", "ffplay": "..."}."""
     if "cfg" not in _CFG_CACHE:
         cfg = {}
         files = [CONFIG_PATH]
@@ -356,6 +357,16 @@ def find_tool(key: str, given: str = ""):
                         break
                 if res:
                     break
+    if res is None and key == "ffplay":                 # a build ships ffmpeg and ffplay together: look next to the ffmpeg in use
+        try:
+            ffdir = Path(find_tool("ffmpeg", "")[0]).parent
+            for n in d["names"]:
+                w = shutil.which(n, path=str(ffdir))
+                if w:
+                    res = (os.path.abspath(w), "ao lado do ffmpeg")
+                    break
+        except Fail:
+            pass
     if res is None:
         raise Fail(f"{d['label']} not found. Searched: {d['flag']} option, {CONFIG_PATH.name}, PATH, {TOOLS_DIR}. "
                    "Run 'dtv_tools.py doctor' for details.")
@@ -375,7 +386,7 @@ def optional_tool(key: str, given: str = ""):
 
 
 def tool_version(key: str, path: str) -> str:
-    args = {"mp4box": [path, "-version"], "ffmpeg": [path, "-hide_banner", "-version"]}.get(key)
+    args = {"mp4box": [path, "-version"], "ffmpeg": [path, "-hide_banner", "-version"], "ffplay": [path, "-hide_banner", "-version"]}.get(key)
     if not args:
         return ""
     try:
@@ -400,6 +411,25 @@ def ffmpeg_has_lcevc(ff: str) -> bool:
         except Exception:
             _FF_CAPS[ff] = False
     return _FF_CAPS[ff]
+
+
+_FF_FILTERS: dict = {}
+
+
+def ffmpeg_filters(exe: str) -> set:
+    """Names of the filters of an ffmpeg/ffplay build (cached); empty when it cannot be listed."""
+    if exe not in _FF_FILTERS:
+        names = set()
+        try:
+            r = sp_run([exe, "-hide_banner", "-filters"], capture_output=True, text=True, errors="replace", timeout=30, **NOWIN)
+            for ln in ((r.stdout or "") + "\n" + (r.stderr or "")).splitlines():
+                m = re.match(r"\s*[T.][S.][C.]\s+(\S+)\s+\S+->\S+", ln)
+                if m:
+                    names.add(m.group(1))
+        except Exception:
+            pass
+        _FF_FILTERS[exe] = names
+    return _FF_FILTERS[exe]
 
 
 def mp4box_major(version_line: str):
@@ -542,6 +572,7 @@ def cmd_doctor(a):
         "ffmpeg": "mpegh-audio, transcode, frame (required); LCEVC verification and decoding (needs a build with the 'lcevc' filter)",
         "mpegh_ui": "mpegh-scan, mpegh-audio, transcode (audio rendering)",
         "mpegh_decoder": "mpegh-audio, transcode (audio rendering)",
+        "ffplay": "play (video preview in Cut MP4; optional)",
     }
     tools, rows, problems = [], [], []
     n_items = len(TOOL_DEFS) + 4        # programs + Python modules
@@ -549,7 +580,7 @@ def cmd_doctor(a):
         progress("check", idx / n_items, f"{d['label']}…", force=True)
         given = getattr(a, key, "") or ""
         entry = {"key": key, "name": d["label"], "needed_by": needed_by[key], "ok": False, "path": "", "source": "",
-                 "version": "", "caps": {}}
+                 "version": "", "caps": {}, "optional": bool(d.get("optional"))}
         try:
             path, src = find_tool(key, given)
             entry.update(ok=True, path=path, source=src, version=tool_version(key, path))
@@ -567,10 +598,12 @@ def cmd_doctor(a):
                 say("  Video encoders: " + ", ".join(f"{ENCODERS[k]['ffmpeg']} {'ok' if v else 'no'}" for k, v in entry["caps"]["encoders"].items()))
             if key == "ffmpeg" and not entry["caps"]["lcevc_filter"]:
                 say("  ffmpeg has no 'lcevc' filter: the LCEVC enhancement check will be skipped.", "warn")
+            if key == "ffplay":
+                entry["caps"]["lcevc_filter"] = "lcevc" in ffmpeg_filters(path)
             if key == "mp4box" and entry["caps"].get("vvc") is False:
                 say("  MP4Box older than GPAC 2.0: VVC support is probably missing.", "warn")
         except Fail as e:
-            say(f"{d['label']}: NOT FOUND ({e})", "warn")
+            say(f"{d['label']}: NOT FOUND ({e})" + (" (optional)" if d.get("optional") else ""), "" if d.get("optional") else "warn")
             problems.append(key)
         tools.append(entry)
         rows.append([d["label"], entry["path"] or "not found"])
@@ -6510,6 +6543,125 @@ def cmd_frame(a):
     return 0
 
 
+# ──────────────────────────── preview (Cortar MP4) ────────────────────────────
+PREVIEW_TONEMAP = ("zscale=t=linear:npl=100", "format=gbrpf32le", "zscale=p=bt709", "tonemap=tonemap=hable:desat=0",
+                   "zscale=t=bt709:m=bt709:r=tv", "format=yuv420p")
+
+
+def preview_vf(exes, width, lcevc=True, tone=True):
+    """
+    Video filter chain of the preview: lcevc (enhancement) -> scale -> HDR-to-SDR (zscale + tonemap). Each stage is used only when
+    the build has the filter (the first of `exes` that lists its filters decides). Returns (chain, [what was left out]).
+    """
+    have = next((f for f in (ffmpeg_filters(x) for x in exes if x) if f), None)
+    parts, left = [], []
+    if lcevc:
+        if have is None or "lcevc" in have:
+            parts.append("lcevc")
+        else:
+            left.append("este programa não tem o filtro lcevc: só a camada base é mostrada")
+    parts.append(f"scale={int(width)}:-2:flags=bilinear")
+    if tone:
+        if have is not None and not {"zscale", "tonemap"} <= have:
+            left.append("sem zscale/tonemap: as cores HDR aparecem sem conversão (imagem lavada)")
+        else:
+            parts += [f"setparams={HDR10_TAGS}", *PREVIEW_TONEMAP]
+    return ",".join(parts), left
+
+
+def preview_frame_cmd(ff, src, t, vf, out):
+    return [ff, "-hide_banner", "-nostdin", "-loglevel", "error", "-ss", f"{max(0.0, t):.3f}", "-i", str(src), "-map", "0:v:0",
+            "-vf", vf, "-frames:v", "1", "-update", "1", "-y", str(out)]
+
+
+def play_cmd(ffplay, src, start, end, vf, title):
+    cmd = [ffplay, "-hide_banner", "-loglevel", "warning", "-nostats", "-autoexit", "-an", "-window_title", title]
+    if start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    if end is not None:
+        cmd += ["-t", f"{max(0.04, end - start):.3f}"]
+    return cmd + ["-vf", vf, "-i", str(src)]
+
+
+def cmd_preview(a):
+    """Still frames of a few instants (cheap: one seek + one decoded frame each), SDR and scaled, for the Cut MP4 page."""
+    set_steps([("decode", "Extrair quadros"), ("report", "Resumo")])
+    set_stages({"decode": 95, "report": 5})
+    step("decode", "running")
+    ff = find_tool("ffmpeg", a.ffmpeg)[0]
+    src = Path(a.input).resolve()
+    if not src.is_file():
+        raise Fail(f"Arquivo não encontrado: {src}")
+    times = [parse_time_input(t) for t in a.time]
+    out = Path(a.outdir).resolve() if a.outdir else Path(tempfile.mkdtemp(prefix="dtv_preview_"))
+    out.mkdir(parents=True, exist_ok=True)
+    vf, left = preview_vf([ff], a.width, not a.no_lcevc, not a.no_tonemap)
+    for x in left:
+        note(x)
+    stamp = int(time.time() * 1000)
+
+    def one(item):
+        i, t = item
+        p = out / f"pv_{stamp}_{i}.png"
+        cmd = preview_frame_cmd(ff, src, t, vf, p)
+        log("$ " + subprocess.list2cmdline(cmd))
+        r = sp_run(cmd, capture_output=True, text=True, errors="replace", timeout=180, **NOWIN)
+        if r.returncode != 0 or not p.is_file():
+            return i, t, None, (r.stderr or "").strip()[-400:]
+        return i, t, p, ""
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(2, len(times))) as ex:
+        got = list(ex.map(one, list(enumerate(times))))
+    outs = [{"kind": "preview", "index": i, "time": t, "path": str(p), "size": p.stat().st_size} for i, t, p, _ in got if p]
+    fails = [(t, e) for _, t, p, e in got if not p]
+    if not outs:
+        raise Fail("Não consegui extrair nenhum quadro:\n" + (fails[0][1] if fails else ""))
+    for t, e in fails:
+        note(f"Quadro em {fmt_clock(t)} não extraído: {e.splitlines()[-1] if e else 'erro desconhecido'}")
+    step("decode", "done", f"{len(outs)} quadro(s)")
+    step("report", "running")
+    ev(type="result", out=outs[0]["path"], outputs=outs, notes=NOTES, rows=[["Quadros", str(len(outs))], ["Filtros", vf]], previews=outs)
+    step("report", "done")
+    progress("report", 1.0, force=True)
+    return 0
+
+
+def cmd_play(a):
+    """Plays a stretch of the video in an ffplay window (no audio: MPEG-H is not decodable by ffplay). Waits until it is closed."""
+    set_steps([("play", "Reproduzir")])
+    set_stages({"play": 100})
+    step("play", "running")
+    play = find_tool("ffplay", a.ffplay)[0]
+    ff = optional_tool("ffmpeg", a.ffmpeg)
+    src = Path(a.input).resolve()
+    if not src.is_file():
+        raise Fail(f"Arquivo não encontrado: {src}")
+    start = parse_time_input(a.start) if a.start else 0.0
+    end = parse_time_input(a.end) if a.end else None
+    if end is not None and end <= start:
+        raise Fail("O fim deve ser depois do início.")
+    vf, left = preview_vf([play, ff], a.width, not a.no_lcevc, not a.no_tonemap)
+    for x in left:
+        note(x)
+    title = f"{src.name}  [{fmt_clock(start)} – {fmt_clock(end) if end is not None else 'fim'}]"
+    cmd = play_cmd(play, src, start, end, vf, title)
+    log("$ " + subprocess.list2cmdline(cmd))
+    p = sp_popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    err = Drain(p.stderr, keep=8192)
+    try:
+        rc = p.wait()
+    except BaseException:
+        p.kill()
+        raise
+    if rc != 0:
+        raise Fail(f"O ffplay terminou com código {rc}:\n{err.text()[-600:]}")
+    step("play", "done")
+    progress("play", 1.0, force=True)
+    ev(type="result", out="", outputs=[], notes=NOTES, rows=[["Trecho", f"{fmt_clock(start)} – {fmt_clock(end) if end is not None else 'fim'}"], ["Filtros", vf]])
+    return 0
+
+
 def cmd_sdr(a):
     """Redo only the SDR image from a saved *_hdr.png (fast way to tune the look; no decoding)."""
     set_steps([("sdr", "Converter para SDR"), ("report", "Resumo")])
@@ -6592,6 +6744,8 @@ def build_parser():
             sp.add_argument("--mp4box", "--mp4box-binary-path", default="", metavar="PATH", help="MP4Box executable")
         if "ffmpeg" in which:
             sp.add_argument("--ffmpeg", "--ffmpeg-binary-path", default="", metavar="PATH", help="ffmpeg executable (DTV+/LCEVC build for the enhancement check)")
+        if "ffplay" in which:
+            sp.add_argument("--ffplay", default="", metavar="PATH", help="ffplay executable (video preview; a build with the lcevc filter shows the enhancement)")
         if "mpegh" in which:
             sp.add_argument("--mpegh-ui", default="", metavar="PATH", help="mpeghUiManager executable")
             sp.add_argument("--mpegh-decoder", default="", metavar="PATH", help="mpeghDecoder executable")
@@ -6771,6 +6925,33 @@ def build_parser():
     tone_flags(s_fr)
     common_flags(s_fr)
 
+    def preview_flags(sp):
+        sp.add_argument("input", help="MP4 (VVC + LCEVC + MPEG-H)")
+        sp.add_argument("--no-lcevc", action="store_true", help="source without LCEVC: skip the lcevc filter")
+        sp.add_argument("--no-tonemap", action="store_true", help="do not convert HDR to SDR (colours look washed out)")
+        sp.add_argument("--width", type=int, default=960, help="width of the picture (default 960)")
+
+    s_pv = sub.add_parser("preview", help="extract still frames (scaled, SDR) at some instants, for the Cut MP4 preview")
+    preview_flags(s_pv)
+    s_pv.add_argument("--time", action="append", required=True, metavar="T", help="instant (HH:MM:SS.mmm, MM:SS or seconds); repeat for more frames")
+    s_pv.add_argument("--outdir", default="", help="folder for the PNG files (default: a temporary one)")
+    tool_flags(s_pv, ("ffmpeg",))
+    machine_flags(s_pv)
+    s_pv.add_argument("-v", "--verbose", action="store_true")
+    s_pv.add_argument("--no-color", action="store_true")
+    s_pv.add_argument("--ascii", action="store_true")
+
+    s_pl = sub.add_parser("play", help="play a stretch of the video in an ffplay window (no audio)")
+    preview_flags(s_pl)
+    s_pl.add_argument("--start", default="", help="start (default: beginning)")
+    s_pl.add_argument("--end", default="", help="end (default: end of the file)")
+    s_pl.set_defaults(width=1280)
+    tool_flags(s_pl, ("ffmpeg", "ffplay"))
+    machine_flags(s_pl)
+    s_pl.add_argument("-v", "--verbose", action="store_true")
+    s_pl.add_argument("--no-color", action="store_true")
+    s_pl.add_argument("--ascii", action="store_true")
+
     s_sdr = sub.add_parser("sdr", help="redo the SDR image from a saved *_hdr.png (no decoding)")
     s_sdr.add_argument("input", help="16-bit PNG made by 'frame'")
     s_sdr.add_argument("-o", "--output", default="")
@@ -6787,7 +6968,7 @@ def build_parser():
     s_doc.add_argument("-v", "--verbose", action="store_true")
     s_doc.add_argument("--no-color", action="store_true")
     s_doc.add_argument("--ascii", action="store_true")
-    tool_flags(s_doc, ("mp4box", "ffmpeg", "mpegh"))
+    tool_flags(s_doc, ("mp4box", "ffmpeg", "mpegh", "ffplay"))
 
     s_up = sub.add_parser("check-update", help="check on GitHub whether a newer release exists (never downloads or installs anything)")
     s_up.add_argument("--repo", default="", metavar="OWNER/NAME", help=f"GitHub repository (default {UPDATE_REPO}, or $DTV_UPDATE_REPO)")
@@ -6944,7 +7125,7 @@ def describe():
                          "default": act.default if isinstance(act.default, (str, int, float, bool, type(None))) else None})
         commands[name] = {"help": helps.get(name, ""), "options": opts}
     return {"version": __version__, "protocol": PROTOCOL_VERSION, "features": list(FEATURES),
-            "tools": {k: {"label": d["label"], "names": list(d["names"]), "flag": d["flag"]} for k, d in TOOL_DEFS.items()},
+            "tools": {k: {"label": d["label"], "names": list(d["names"]), "flag": d["flag"], "optional": bool(d.get("optional"))} for k, d in TOOL_DEFS.items()},
             "formats": {k: {"label": f["label"], "ext": f["ext"], "default_bitrate": f["br"], "max_channels": f["max"]} for k, f in FORMATS.items()},
             "layouts": catalog_public(), "encoders": ENCODERS, "commands": commands}
 
@@ -7077,7 +7258,8 @@ def main(argv=None):
     DASH_LOG, ORIG_LOOK = None, False
     handlers = {"ts-tv3": cmd_ts_tv3, "mpegh-scan": cmd_mpegh_scan, "mpegh-audio": cmd_mpegh_audio,
                 "mp4-cut": cmd_mp4_cut, "dash-capture": cmd_dash_capture, "doctor": cmd_doctor, "check-update": cmd_check_update,
-                "transcode": cmd_transcode, "frame": cmd_frame, "sdr": cmd_sdr}
+                "transcode": cmd_transcode, "frame": cmd_frame, "sdr": cmd_sdr,
+                "preview": cmd_preview, "play": cmd_play}
     try:
         return handlers[args.cmd](args) or 0
     except Fail as e:

@@ -1056,7 +1056,7 @@ class ResultItemDelegate(QStyledItemDelegate):
 
     def sizeHint(self, opt, idx):
         sh = super().sizeHint(opt, idx)
-        sh.setHeight(max(sh.height() + 14, 40))
+        sh.setHeight(sh.height())                      # a altura mínima (34 px) já dá o respiro; sem folga extra no topo e na base
         sh.setWidth(sh.width() + 20)
         return sh
 
@@ -1066,9 +1066,10 @@ class ResultItemDelegate(QStyledItemDelegate):
         sel = bool(opt.state & QStyle.StateFlag.State_Selected)
         hov = bool(opt.state & QStyle.StateFlag.State_MouseOver)
         pal = opt.palette
-        if (sel or hov) and idx.column() == 0:         # o destaque cobre a linha inteira (as duas colunas) de uma vez
+        if sel or hov:                                  # cada coluna pinta o seu pedaço do mesmo retângulo arredondado (linha contínua)
             row = QRectF(0, option.rect.top(), opt.widget.viewport().width() if opt.widget else option.rect.width(), option.rect.height())
             p.save()
+            p.setClipRect(option.rect)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(accent_of(pal) if sel else mix(pal.color(QPalette.ColorRole.Text), pal.color(QPalette.ColorRole.Base), 0.07))
@@ -1151,6 +1152,7 @@ class ResultTab(QWidget):
         self.files.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.files.setAlternatingRowColors(False)
         self.files.setItemDelegate(ResultItemDelegate(self.files))
+        self.files.setProperty("ownRowFill", True)          # o delegate pinta o destaque; o estilo não pinta o fundo da linha
         self.files.itemDoubleClicked.connect(lambda *_: self.open_selected())
         fit_view(self.files)
         self.where = muted_label("")

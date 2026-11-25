@@ -16,6 +16,8 @@ Caso você seja um uusário que tenha ressalvas ao uso de inteligência artifica
 | `transcode` | MP4 single-track -> HEVC ou AV1 10 bits HDR10 (camada LCEVC aplicada) e presets MPEG-H renderizados como trilhas de áudio |
 | `frame` | Salva um quadro como imagem HDR (PNG 16 bits, AVIF) e/ou SDR com tone mapping (PNG, JPG) |
 | `sdr` | Gera imagens SDR a partir de um PNG HDR salvo |
+| `preview` | Extrai quadros reduzidos em SDR (com LCEVC) de alguns instantes: usado na prévia do Corte MP4 |
+| `play` | Reproduz um trecho no `ffplay`, sem áudio, com LCEVC e conversão HDR → SDR |
 | `doctor` | Verifica os programas externos e os módulos Python necessários para o script funcionar |
 | `check-update` | Consulta no GitHub se há uma versão mais nova publicada (não baixa nem instala nada) |
 | `describe` | Imprime comandos, opções, ferramentas, formatos e layouts em JSON (para interfaces) |
@@ -378,6 +380,7 @@ python dtv_tools.py doctor [--mp4box CAMINHO] [--ffmpeg CAMINHO] [--mpegh-ui CAM
 | MP4Box (GPAC 2.x) | `ts-tv3`, `mp4-cut`, `dash-capture`, `mpegh-scan`, `mpegh-audio` |
 | ffmpeg | `mpegh-audio`, `transcode`, `frame` (`transcode` precisa do codificador escolhido: libx265, hevc_nvenc, libsvtav1 ou av1_nvenc; `frame --hdr avif` de libaom-av1); verificação opcional do LCEVC nos demais. O filtro `lcevc` estará disponível apenas em builds personalizadas compiladas com LCEVC |
 | mpeghUiManager, mpeghDecoder | `mpegh-scan`, `mpegh-audio`, `transcode --audio render` |
+| ffplay (opcional) | `play` (reprodução do trecho na prévia do Corte MP4). Use o da mesma build do ffmpeg, com VVC e LCEVC; é procurado também ao lado do ffmpeg |
  
 Módulos Python, importados só quando necessários: `requests` (`dash-capture`), `rich` (painel ao vivo do `dash-capture`), `numpy` e `Pillow` (`frame` e `sdr`);.
  

@@ -13,7 +13,7 @@ import os
 import sys
 
 APP_NAME = "DTV Tools"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--cli":
@@ -63,7 +63,8 @@ VIDEO_FILTER = "Vídeo MP4 (*.mp4 *.m4v *.mov);;Todos os arquivos (*)"
 TMPDIR_CMDS = {"ts-tv3", "mpegh-scan", "mpegh-audio", "transcode", "frame", "dash-capture"}
 CACHE_CMDS = {"mpegh-scan", "mpegh-audio", "transcode"}
 NATIVE_LAYOUTS = [("Detectar do stream", 0), ("2.0 (estéreo)", 2), ("5.1", 6), ("5.1.4", 16), ("7.1.4", 19)]
-TOOL_ROWS = [("mp4box", "MP4Box"), ("ffmpeg", "ffmpeg (build DTV+/LCEVC)"), ("mpegh_ui", "mpeghUiManager"), ("mpegh_decoder", "mpeghDecoder")]
+TOOL_ROWS = [("mp4box", "MP4Box"), ("ffmpeg", "ffmpeg (build DTV+/LCEVC)"), ("mpegh_ui", "mpeghUiManager"), ("mpegh_decoder", "mpeghDecoder"),
+             ("ffplay", "ffplay (opcional: prévia de vídeo)")]
 
 
 # usado só se o dtv_tools não informar a tabela de codificadores no `describe` (versão antiga)
@@ -790,6 +791,22 @@ class AudioPage(Page):
         return [Job(f"Gerar áudios · {os.path.basename(self.input.text())}", a, kind="mpegh-audio", page=self)]
 
 
+class _Sink:
+    """Entrega resultado e erro de um Job em segundo plano a funções (o Runner espera uma 'página')."""
+
+    def __init__(self, on_result, on_error):
+        self._r, self._e = on_result, on_error
+
+    def handle_result(self, job, res):
+        self._r(res)
+
+    def handle_error(self, job, msg):
+        self._e(msg)
+
+    def show_error(self, msg):
+        pass
+
+
 # ═════════════════════════════ Cortar MP4 ═════════════════════════════
 class CutPage(Page):
     title = "Cortar MP4"
@@ -858,6 +875,38 @@ class CutPage(Page):
         rr.addStretch(1)
         fc.addRow(rr)
         wl.addWidget(gc)
+        gp = CardBox("Prévia")
+        cols = QHBoxLayout()
+        self.pv_imgs, self.pv_caps = [], []
+        for cap in ("Primeiro quadro do corte", "Último quadro do corte"):
+            col = QVBoxLayout()
+            lb = muted_label(cap)
+            img = ImagePreview()
+            col.addWidget(lb)
+            col.addWidget(img)
+            cols.addLayout(col, 1)
+            self.pv_imgs.append(img)
+            self.pv_caps.append(lb)
+        gp.body.addLayout(cols)
+        pb = QHBoxLayout()
+        self.pv_btn = QPushButton("Ver quadros")
+        self.pv_btn.setToolTip("Mostra o primeiro e o último quadro do corte selecionado (ou do início/fim digitados), já em SDR e com o LCEVC aplicado")
+        self.pv_btn.clicked.connect(self.show_frames)
+        self.play_btn = QPushButton("Reproduzir trecho")
+        self.play_btn.setToolTip("Abre o trecho no ffplay (sem áudio), com o LCEVC aplicado e conversão HDR → SDR")
+        self.play_btn.clicked.connect(self.play)
+        self.pv_size = QComboBox()
+        for t, v in (("Janela 960 px", 960), ("Janela 1280 px", 1280), ("Janela 1920 px", 1920)):
+            self.pv_size.addItem(t, v)
+        self.pv_size.setCurrentIndex(1)
+        for w in (self.pv_btn, self.play_btn, self.pv_size):
+            pb.addWidget(w)
+        pb.addStretch(1)
+        gp.body.addLayout(pb)
+        self.pv_status = muted_label("Selecione um corte na tabela e use “Ver quadros” ou “Reproduzir trecho”. O vídeo é mostrado em SDR e sem áudio.")
+        self.pv_status.setWordWrap(True)
+        gp.body.addWidget(self.pv_status)
+        wl.addWidget(gp)
         go, fo = self.group("Saída")
         self.output = FileEdit("save", VIDEO_FILTER, "<nome>_cut_<início>_<fim>.mp4 ao lado do original", key="cut_out")
         self.noav = QCheckBox("Só medir a sincronia A/V, sem corrigir")
@@ -870,9 +919,132 @@ class CutPage(Page):
         lay.addWidget(self.work)
         self.cut_btn = self.primary("Cortar", lambda: self.run_built(self.build_jobs))
         self.timeline.rangeDragged.connect(self._dragged)
+        self.table.itemSelectionChanged.connect(self._selection_changed)
         self.cuts: list = []
         self.idr: list = []
         self.total = 0.0
+        self.fd = 0.04                  # duração de um quadro (aprox.)
+        self._pv_cache: dict = {}
+        self._pv_dir_obj = None
+        self._pv_pending = False
+        self._playing = False
+        self._pv_sink = _Sink(self._pv_result, self._pv_error)
+        self._pl_sink = _Sink(lambda res: None, self._play_error)
+        self._pv_timer = QTimer(self)
+        self._pv_timer.setSingleShot(True)
+        self._pv_timer.setInterval(350)
+        self._pv_timer.timeout.connect(self.show_frames)
+
+    # ── prévia ──
+    def _pv_range(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if rows and rows[0] < len(self.cuts):
+            c = self.cuts[rows[0]]
+            return c["a"], c["b"]
+        if self.start.text().strip() and self.end.text().strip():
+            return self._resolve(self.start.text(), self.end.text())
+        raise UserError("Selecione um corte na tabela ou preencha o início e o fim.")
+
+    def _selection_changed(self):
+        if self.table.selectedIndexes() and self.idr:
+            self._pv_timer.start()          # troca de linha em sequência: só a última gera os quadros
+
+    def _pv_dir(self) -> str:
+        if self._pv_dir_obj is None:
+            import tempfile
+            self._pv_dir_obj = tempfile.TemporaryDirectory(prefix="dtv_prev_")
+        return self._pv_dir_obj.name
+
+    def _pv_clear(self, text=None):
+        for img in self.pv_imgs:
+            img.clear_image()
+        if text is not None:
+            self.pv_status.setText(text)
+
+    def show_frames(self):
+        try:
+            a, b = self._pv_range()
+        except UserError as e:
+            self.show_error(str(e))
+            return
+        self.show_error("")
+        src = self.input.text()
+        t1, t2 = a, max(a, b - self.fd)
+        try:
+            stamp = int(os.stat(src).st_mtime)
+        except OSError:
+            stamp = 0
+        key = (src, stamp, round(t1, 3), round(t2, 3), 960)
+        self._pv_key = key
+        hit = self._pv_cache.get(key)
+        if hit and all(os.path.isfile(x) for x in hit):
+            self._pv_show(hit, t1, t2)
+            return
+        runner = self.win.pv_runner
+        if runner.busy:
+            self._pv_pending = True
+            return
+        self.pv_status.setText("Extraindo quadros…")
+        args = ["preview", src, "--time", f"{t1:.3f}", "--time", f"{t2:.3f}", "--outdir", self._pv_dir(), "--width", "960"] + self.extra("preview")
+        runner.start([Job("Prévia do corte", args, kind="preview", page=self._pv_sink, meta={"quiet": True})])
+        self._pv_times = (t1, t2)
+
+    def _pv_show(self, paths, t1, t2):
+        for img, path in zip(self.pv_imgs, paths):
+            img.set_image(path)
+        self.pv_caps[0].setText(f"Primeiro quadro do corte · {fmt_clock(t1)}")
+        self.pv_caps[1].setText(f"Último quadro do corte · {fmt_clock(t2)}")
+        self.pv_status.setText("Quadros em SDR (conversão simples), com o LCEVC aplicado quando a build do ffmpeg tem o filtro.")
+
+    def _pv_result(self, res):
+        outs = sorted(res.get("previews") or [], key=lambda x: x.get("index", 0))
+        if len(outs) < 2:
+            self._pv_clear("Não foi possível extrair os dois quadros." + ((" " + res["notes"][-1]) if res.get("notes") else ""))
+            return
+        paths = [o["path"] for o in outs[:2]]
+        self._pv_cache[self._pv_key] = paths
+        self._pv_show(paths, *self._pv_times)
+        if res.get("notes"):
+            self.pv_status.setText(self.pv_status.text() + "  Aviso: " + "; ".join(res["notes"]))
+
+    def _pv_error(self, msg):
+        self._pv_clear("Falha ao extrair os quadros: " + (msg.strip().splitlines()[0] if msg.strip() else "erro desconhecido"))
+
+    def pv_finished(self):
+        if self._pv_pending:
+            self._pv_pending = False
+            QTimer.singleShot(0, self.show_frames)
+
+    def play(self):
+        if self._playing:
+            self.win.pl_runner.stop(force=True)
+            return
+        try:
+            a, b = self._pv_range()
+        except UserError as e:
+            self.show_error(str(e))
+            return
+        self.show_error("")
+        args = ["play", self.input.text(), "--start", f"{a:.3f}", "--end", f"{b:.3f}", "--width", str(self.pv_size.currentData())] + self.extra("play")
+        self._set_playing(True)
+        if not self.win.pl_runner.start([Job("Reproduzindo o trecho", args, kind="play", page=self._pl_sink, meta={"quiet": True})]):
+            self._set_playing(False)
+
+    def _set_playing(self, on):
+        self._playing = on
+        self.play_btn.setText("Fechar o player" if on else "Reproduzir trecho")
+        if on:
+            self.pv_status.setText("Reproduzindo no ffplay… feche a janela do player ou use “Fechar o player”.")
+
+    def _play_error(self, msg):
+        low = msg.lower()
+        if "ffplay not found" in low or "ffplay" in low and "not found" in low:
+            msg = "ffplay não encontrado. Informe o caminho dele na tela Ferramentas."
+        self.show_error("Prévia: " + (msg.strip().splitlines()[0] if msg.strip() else "falha ao reproduzir"))
+
+    def pl_finished(self):
+        self._set_playing(False)
+        self.pv_status.setText("Selecione um corte na tabela e use “Ver quadros” ou “Reproduzir trecho”. O vídeo é mostrado em SDR e sem áudio.")
 
     def update_buttons(self):
         self.read_btn.setEnabled(not self._busy)
@@ -880,6 +1052,8 @@ class CutPage(Page):
 
     def _input_changed(self):
         self.idr, self.cuts, self.total = [], [], 0.0
+        self._pv_cache.clear()
+        self._pv_clear()
         self.work.setVisible(False)
         self._refresh()
 
@@ -905,6 +1079,7 @@ class CutPage(Page):
         self.timeline.set_data(self.total, self.idr)
         kinds = ", ".join(sorted({x[2] for x in self.idr}))
         step = self.total / max(1, len(self.idr))
+        self.fd = self.total / max(1, int(sc["frames"]))
         self.info.setText(f"Duração {fmt_clock(self.total)}  ·  {sc['frames']} quadros  ·  {len(self.idr)} pontos de corte (1 a cada ~{step:.2f} s)  ·  tipos: {kinds}")
         self.work.setVisible(True)
         self._refresh()
@@ -1657,7 +1832,8 @@ class ToolsPage(Page):
 
     NEEDED = {"mp4box": "ts-tv3, mp4-cut, dash-capture, áudio MPEG-H, recodificação",
               "ffmpeg": "áudio MPEG-H, recodificação, quadro/imagem; verificação do LCEVC exige o filtro lcevc",
-              "mpegh_ui": "análise e renderização do áudio MPEG-H", "mpegh_decoder": "renderização do áudio MPEG-H"}
+              "mpegh_ui": "análise e renderização do áudio MPEG-H", "mpegh_decoder": "renderização do áudio MPEG-H",
+              "ffplay": "reproduzir o trecho na prévia do Corte MP4 (build com VVC e LCEVC); sem ele só os quadros são mostrados"}
 
     def build(self, lay):
         self.rows: dict = {}
@@ -1759,7 +1935,7 @@ class ToolsPage(Page):
                 r["status"].setText(f"{t['path']}  [{t['source']}]\n{t['version']}{extra}")
             else:
                 r["icon"].set_state(StatusIcon.ERROR)
-                r["status"].setText("Não encontrado. Informe o caminho abaixo ou coloque o programa na pasta tools/.")
+                r["status"].setText("Não encontrado" + (" (opcional)" if t.get("optional") else "") + ". Informe o caminho abaixo ou coloque o programa na pasta tools/.")
         mods = res.get("modules", {})
         use = {"requests": "captura DASH", "rich": "opcional: painel no terminal", "numpy": "quadro/imagem", "PIL": "imagens SDR"}
         # BUILD-REMOVE-START-2
@@ -1804,6 +1980,8 @@ class MainWindow(QMainWindow):
         self.runner = Runner(env, self)
         self.bg_runner = Runner(env, self)
         self.up_runner = Runner(env, self)
+        self.pv_runner = Runner(env, self)          # quadros da prévia do corte
+        self.pl_runner = Runner(env, self)          # ffplay (bloqueia até a janela do player fechar)
         self._q_jobs = []
         self.notifier = Notifier(self)
         self.notifier.clicked.connect(self._bring_to_front)
@@ -1851,11 +2029,11 @@ class MainWindow(QMainWindow):
 
         section("Origem")
         add("dash", DashPage)
-        add("ts", TsPage)
         section("Edição")
-        add("cut", CutPage)
-        add("transcode", TranscodePage)
         add("frame", FramePage)
+        add("cut", CutPage)
+        add("ts", TsPage)
+        add("transcode", TranscodePage)
         section("Áudio")
         add("audio", AudioPage)
         section("Sistema")
@@ -2102,6 +2280,11 @@ class MainWindow(QMainWindow):
         self.bg_runner.errorReported.connect(lambda job, msg: job.page.handle_error(job, msg))
         self.up_runner.resultReady.connect(lambda job, res: job.page.handle_result(job, res))
         self.up_runner.errorReported.connect(lambda job, msg: job.page.handle_error(job, msg))
+        for rn in (self.pv_runner, self.pl_runner):
+            rn.resultReady.connect(lambda job, res: job.page.handle_result(job, res))
+            rn.errorReported.connect(lambda job, msg: job.page.handle_error(job, msg))
+        self.pv_runner.jobFinished.connect(lambda *_: self.pages["cut"].pv_finished())
+        self.pl_runner.jobFinished.connect(lambda *_: self.pages["cut"].pl_finished())
 
     def _quiet(self, job) -> bool:
         return bool(job.meta.get("quiet"))
@@ -2210,7 +2393,7 @@ class MainWindow(QMainWindow):
             if hasattr(pg, "on_tools"):
                 pg.on_tools(res)
         self.core_version, self.core_protocol = res.get("version", ""), int(res.get("protocol", 0) or 0)
-        missing = [t["name"] for t in res.get("tools", []) if not t["ok"]]
+        missing = [t["name"] for t in res.get("tools", []) if not t["ok"] and not t.get("optional")]
         if self.core_protocol != PROTOCOL:
             c = Colors(self)
             pal = self.banner.palette()
@@ -2238,6 +2421,8 @@ class MainWindow(QMainWindow):
                 return
             self.runner.stop(force=True)
         self.bg_runner.stop(force=True)
+        self.pv_runner.stop(force=True)
+        self.pl_runner.stop(force=True)
         self.settings.setValue("ui/geometry", self.saveGeometry())
         super().closeEvent(e)
 

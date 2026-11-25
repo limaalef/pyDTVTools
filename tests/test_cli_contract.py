@@ -39,7 +39,7 @@ def test_doctor_events():
     kinds = [e["type"] for e in ev]
     assert "step" in kinds and kinds[-1] == "result"
     res = ev[-1]
-    assert {t["key"] for t in res["tools"]} == {"mp4box", "ffmpeg", "mpegh_ui", "mpegh_decoder"}
+    assert {t["key"] for t in res["tools"]} == {"mp4box", "ffmpeg", "mpegh_ui", "mpegh_decoder", "ffplay"}
     assert set(res) >= {"out", "outputs", "notes", "rows", "tools", "modules", "version"}
 
 

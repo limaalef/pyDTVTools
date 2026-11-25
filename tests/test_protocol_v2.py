@@ -103,7 +103,7 @@ def test_describe_is_complete():
     p = subprocess.run([sys.executable, str(SCRIPT), "describe"], capture_output=True, text=True, timeout=60)
     d = json.loads(p.stdout)
     assert d["protocol"] == 2 and "describe" in d["features"]
-    assert set(d["tools"]) == {"mp4box", "ffmpeg", "mpegh_ui", "mpegh_decoder"}
+    assert set(d["tools"]) == {"mp4box", "ffmpeg", "mpegh_ui", "mpegh_decoder", "ffplay"}
     assert {"aac", "eac3", "flac", "wav"} <= set(d["formats"]) and "16" in d["layouts"]
     assert {"ts-tv3", "mpegh-scan", "mpegh-audio", "mp4-cut", "dash-capture", "transcode", "frame", "sdr", "doctor"} <= set(d["commands"])
     for name, c in d["commands"].items():

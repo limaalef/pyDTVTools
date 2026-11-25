@@ -33,7 +33,7 @@ for f in (f1, f2): open(f, "wb").write(b"x")
 R.program_and_prefix = REAL
 w = G.MainWindow(); w.show(); wait(500); done(w); wait(200)
 tools = w._tools_res
-check("integração real: doctor devolve 4 ferramentas", tools and len(tools.get("tools", [])) == 4)
+check("integração real: doctor devolve 5 ferramentas (ffplay opcional)", tools and len(tools.get("tools", [])) == 5)
 check("integração real: versão e protocolo vindos do doctor", w.core_protocol == 2 and bool(w.core_version))
 check("integração real: módulos python reportados", bool(tools and tools.get("modules")))
 # real mpegh-scan sem arquivo → erro tratado, não trava
@@ -48,6 +48,43 @@ w = G.MainWindow(); w.show(); wait(500); done(w); wait(200)
 txt = [r["status"].text() for r in w.pages["tools"].rows.values()]
 check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.3.2" in t and "unrecognized" in t for t in txt))
 w.close()
+
+# --- 1d. prévia do Corte MP4: quadros (ffmpeg real) e reprodução (ffplay trocado por um script)
+import shutil, subprocess
+if shutil.which("ffmpeg"):
+    vid = os.path.join(tmp, "pv.mp4")
+    enc = ["-c:v", "libx265", "-x265-params", "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:keyint=25:open-gop=0:log-level=error", "-tag:v", "hvc1"] \
+        if "libx265" in subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout else ["-c:v", "mpeg4", "-g", "25"]
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=6", "-vf", "format=yuv420p10le" if "x265" in " ".join(enc) else "format=yuv420p",
+                    *enc, vid], check=True)
+    stub = os.path.join(tmp, "ffplay_stub.sh"); argsf = os.path.join(tmp, "play_args.txt")
+    open(stub, "w").write(f"#!/bin/sh\necho \"$@\" > '{argsf}'\nexit 0\n"); os.chmod(stub, 0o755)
+    R.program_and_prefix = REAL
+    w = G.MainWindow(); w.show(); wait(300); done(w)
+    w.nav_to("cut"); cp = w.pages["cut"]
+    cp.input.setText(vid); cp.read_points(); done(w); until(lambda: cp.work.isVisible() and cp.idr)
+    cp.start.setText("00:00:01"); cp.end.setText("00:00:04"); cp.add_cut(); wait(100)
+    cp.table.selectRow(0)
+    until(lambda: cp.pv_imgs[0]._img is not None and cp.pv_imgs[1]._img is not None, 30000)
+    check("prévia: os dois quadros do corte aparecem", cp.pv_imgs[0]._img is not None and cp.pv_imgs[1]._img is not None)
+    check("prévia: legenda com o instante", "00:00:" in cp.pv_caps[0].text() and "00:00:" in cp.pv_caps[1].text())
+    n_cache = len(cp._pv_cache)
+    cp.show_frames(); wait(100)
+    check("prévia: repetir o mesmo corte usa o cache (não roda de novo)", len(cp._pv_cache) == n_cache and not w.pv_runner.busy)
+    # reprodução: sem ffplay definido o erro é claro; com o programa informado ele recebe o trecho certo
+    tp = w.pages["tools"]
+    tp.rows["ffplay"]["edit"].setText(os.path.join(tmp, "nao_existe_ffplay"))
+    cp.play(); until(lambda: not w.pl_runner.busy and not cp._playing)
+    check("prévia: ffplay inexistente → mensagem na página", "ffplay" in cp.msg.text().lower())
+    tp.rows["ffplay"]["edit"].setText(stub)
+    cp.play(); until(lambda: not w.pl_runner.busy and not cp._playing); wait(200)
+    got = open(argsf).read() if os.path.isfile(argsf) else ""
+    print("   ffplay args:", got[:200])
+    check("prévia: ffplay recebe -ss/-t do corte, sem áudio", "-an" in got and "-ss" in got and "-t " in got and "-autoexit" in got)
+    check("prévia: botão volta a 'Reproduzir trecho'", cp.play_btn.text() == "Reproduzir trecho")
+    w.close()
+else:
+    print("SKIP prévia do corte (sem ffmpeg)")
 
 # --- 1c. ferramentas escolhidas na tela vão como opção explícita, sem precisar "Salvar"
 R.program_and_prefix = REAL

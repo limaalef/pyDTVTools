@@ -133,6 +133,8 @@ class FluentStyle(QProxyStyle):
         S = QStyle.StateFlag
         if isinstance(widget, (QTableView, QTreeView)):
             if pe == PE.PE_PanelItemViewRow:
+                if widget.property("ownRowFill"):
+                    return
                 if isinstance(widget, QTreeView):          # chamado por pedaço da linha (ramo, colunas): pinta a linha como um bloco só
                     P = QStyleOptionViewItem.ViewItemPosition
                     vp = widget.viewport()
