@@ -99,6 +99,8 @@ def _emit(obj):
 
 def sp_popen(cmd, **kw):
     """subprocess.Popen that remembers the child so it can be killed if this process is terminated."""
+    if os.name == "nt":                 # never a console window, whatever the caller forgot to pass
+        kw["creationflags"] = kw.get("creationflags", 0) | 0x08000000
     p = subprocess.Popen(cmd, **kw)
     with _PROC_LOCK:
         _PROCS.difference_update({x for x in _PROCS if x.poll() is not None})

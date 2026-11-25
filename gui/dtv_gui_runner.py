@@ -32,6 +32,26 @@ class Job:
     meta: dict = field(default_factory=dict)
 
 
+def hide_console(proc: QProcess):
+    """Windows: o filho (python.exe / o próprio app com --cli) não pode abrir uma janela de console, nem por um instante."""
+    if os.name == "nt":
+        try:
+            proc.setCreateProcessArgumentsModifier(lambda a: setattr(a, "flags", a.flags | 0x08000000))   # CREATE_NO_WINDOW
+        except Exception:
+            pass
+
+
+def core_fingerprint() -> str:
+    """Identifica esta versão do dtv_tools (arquivo + tamanho + data): o `describe` só muda quando ela muda."""
+    prog, prefix = program_and_prefix()
+    target = prog if getattr(sys, "frozen", False) else prefix[0]
+    try:
+        st = os.stat(target)
+        return f"{target}|{st.st_size}|{int(st.st_mtime)}"
+    except OSError:
+        return ""
+
+
 def program_and_prefix():
     """(executável, argumentos iniciais) que rodam o dtv_tools: o app congelado (`--cli`), ou o script na raiz do projeto."""
     if getattr(sys, "frozen", False):
@@ -148,11 +168,7 @@ class Runner(QObject):
         proc.finished.connect(self._on_finished)
         proc.errorOccurred.connect(self._on_error)
         self._proc = proc
-        if os.name == "nt":
-            try:    # sem janela de console piscando para cada tarefa
-                proc.setCreateProcessArgumentsModifier(lambda a: setattr(a, "flags", a.flags | 0x08000000))
-            except Exception:
-                pass
+        hide_console(proc)         # sem janela de console piscando para cada tarefa
         self.jobStarted.emit(self._i, len(self._jobs), job)
         prog, prefix = program_and_prefix()
         argv = prefix + [str(a) for a in job.args] + ["--json", "--control"]

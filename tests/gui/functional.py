@@ -157,6 +157,7 @@ w.close()
 
 # --- codificadores (tabela vinda do describe do dtv_tools)
 sys.path.insert(0, ROOT); import dtv_tools as _dtv
+_STUB_DESCRIBE = G.MainWindow._describe_core
 G.MainWindow._describe_core = lambda self: _dtv.describe()
 w = G.MainWindow(); w.show(); done(w)
 w.nav_to("transcode"); tp = w.pages["transcode"]
@@ -317,6 +318,24 @@ check("atualização: dentro das 24 h não consulta de novo", w._update_box is N
 w.settings.setValue("update/auto", False); w.settings.setValue("update/last", 0.0); w.startup_check(); wait(300)
 check("atualização: opção desligada não consulta", w._update_box is None and not w.up_runner.busy)
 w.close()
+R.program_and_prefix = REAL
+# --- abertura: `describe` em cache e processos sem console
+import dtv_gui_runner as _R
+R.program_and_prefix = REAL
+cache_f = G.config_path().with_name("describe_cache.json"); cache_f.unlink(missing_ok=True)
+calls = []
+G.MainWindow._describe_core = _STUB_DESCRIBE
+w = G.MainWindow(); w.close()
+check("abertura: describe grava o cache", cache_f.exists() and json.load(open(cache_f))["fp"] == _R.core_fingerprint())
+c = json.load(open(cache_f)); c["describe"]["marcador"] = 1; json.dump(c, open(cache_f, "w"))
+w = G.MainWindow(); w.close()
+check("abertura: com o cache válido não inicia processo (usa o cache)", (w.core_info or {}).get("marcador") == 1)
+c["fp"] = "outro"; json.dump(c, open(cache_f, "w"))
+w = G.MainWindow(); w.close()
+check("abertura: script diferente invalida o cache", "marcador" not in (w.core_info or {}))
+open(cache_f, "w").write("{lixo")
+w = G.MainWindow(); w.close()
+check("abertura: cache corrompido é ignorado e refeito", bool(w.core_info) and json.load(open(cache_f))["fp"] == _R.core_fingerprint())
 R.program_and_prefix = REAL
 print("RESULTADO:", sum(ok), "/", len(ok))
 sys.exit(0 if all(ok) else 1)

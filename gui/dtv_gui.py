@@ -38,7 +38,7 @@ import cutmath  # noqa: E402
 from dtv_gui_notify import Notifier, summarize
 from dtv_gui_presets import PresetStore  # noqa: E402
 from dtv_gui_update import build_dialog as build_update_dialog, due as update_due, worth_showing as update_worth  # noqa: E402
-from dtv_gui_runner import PROTOCOL, Job, Runner, program_and_prefix  # noqa: E402
+from dtv_gui_runner import PROTOCOL, Job, Runner, core_fingerprint, hide_console, program_and_prefix  # noqa: E402
 from dtv_gui_style import AccentButton, FluentStyle, accent_of, apply_backdrop, apply_fluent, mica_supported  # noqa: E402
 from dtv_gui_widgets import (CardBox, WheelGuard, svg_icon, fit_view, AvailabilityChart, Collapsible, Colors, CutTimeline, FileEdit, ImagePreview, ItemList,  # noqa: E402
                              SpeakerDiagram, StatusIcon, TaskPanel, TracksChart, fmt_clock, fmt_hms, human, muted_label, mix)
@@ -2004,18 +2004,38 @@ class MainWindow(QMainWindow):
     # ── execução ──
     def _describe_core(self) -> dict | None:
         """`describe` do script (comandos, opções, ferramentas): lido uma vez, em modo síncrono (~0,2 s)."""
+        # O resultado só muda com o arquivo do script: fica em cache e a abertura não paga um processo (no executável único,
+        # cada processo extrai o pacote de novo).
+        fp = core_fingerprint()
+        cache = config_path().with_name("describe_cache.json")
+        if fp:
+            try:
+                c = json.loads(cache.read_text(encoding="utf-8"))
+                if c.get("fp") == fp and isinstance(c.get("describe"), dict):
+                    return c["describe"]
+            except (OSError, ValueError):
+                pass
         from PySide6.QtCore import QProcess as _QP
         prog, prefix = program_and_prefix()
         p = _QP()
         p.setProcessEnvironment(self.runner.process_env())
+        hide_console(p)
         p.start(prog, prefix + ["describe"])
         if not p.waitForFinished(8000):
             p.kill()
             return None
         try:
-            return json.loads(bytes(p.readAllStandardOutput()).decode("utf-8", "replace"))
+            data = json.loads(bytes(p.readAllStandardOutput()).decode("utf-8", "replace"))
         except ValueError:
             return None
+        if fp and isinstance(data, dict):
+            try:
+                tmp = cache.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"fp": fp, "describe": data}, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, cache)
+            except OSError:
+                pass
+        return data
 
     def extra_args(self, cmd: str) -> list:
         a = []
