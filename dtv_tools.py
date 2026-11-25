@@ -2474,7 +2474,7 @@ def analyze_scenes(states, total_frames):
 
 
 ISO_TEXT = {"preset": "", "mute": " · isolado silenciando os demais elementos do preset",
-            "edit": " · isolado numa cópia temporária com a cena editada (o original não é alterado)"}
+            "edit": " · isolado com edição da cena"}
 
 
 def option_layout(stream, native, forced, ids):

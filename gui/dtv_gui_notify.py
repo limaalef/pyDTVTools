@@ -68,5 +68,5 @@ class Notifier(QObject):
                 "error": QSystemTrayIcon.MessageIcon.Critical}.get(kind, QSystemTrayIcon.MessageIcon.Information)
         self._tray.setIcon(self._icon())
         self._tray.show()                                    # no Windows o ícone precisa estar visível para o aviso aparecer
-        self._tray.showMessage(f"DTV Tools — {title}", text, icon, 10000)
+        self._tray.showMessage(f"DTV Tools - {title}", text, icon, 10000)
         QTimer.singleShot(20000, self._tray.hide)            # some da bandeja depois de o aviso já ter sido exibido
