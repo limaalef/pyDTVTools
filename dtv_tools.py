@@ -405,34 +405,126 @@ def mp4box_major(version_line: str):
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
-_ALIAS_DIRS: list = []
+_BOX_DIRS: list = []
 
 
-def mp4box_in(path) -> str:
+def mp4box_title(text) -> str:
+    """Value for MP4Box 'name=' : its option parser treats ':' '#' as separators and '%' '$' as escapes/templates."""
+    t = re.sub(r"[\x00-\x1f]", " ", str(text))
+    t = re.sub(r"\s*:\s*", " - ", t)
+    t = t.translate({ord("#"): "-", ord("%"): "pct", ord("$"): "S"})
+    return re.sub(r"\s+", " ", t).strip() or "audio"
+
+
+class MP4BoxJob:
     """
-    MP4Box parses '#' and ':' inside '-add' arguments as option separators. If an input path contains them, expose the
-    file through a hard link / symlink (copy as a last resort) under a safe temporary name.
+    One MP4Box run in a private folder with neutral names (in0.ts, out0.mp4, ...) and that folder as the working
+    directory, so no user path ever reaches MP4Box's argument parser. MP4Box reads ':' '#' as option separators in
+    '-add' sources, '%XX' as URL escapes and '$...$' as templates (-out); spaces, '+', '&', '()', non-ASCII names also
+    break on some platforms/builds. Inputs are exposed by hard link / symlink (copy as the last resort); outputs are
+    written inside the folder and moved to their real path when MP4Box succeeds.
     """
-    s = str(path)
-    body = s[2:] if re.match(r"^[A-Za-z]:[\\/]", s) else s
-    if not re.search(r"[#:]", body):
-        return s
-    d = Path(tempfile.mkdtemp(prefix="dtv_"))
-    _ALIAS_DIRS.append(d)
-    dst = d / ("in_" + hashlib.sha1(s.encode("utf-8", "replace")).hexdigest()[:10] + Path(s).suffix)
-    try:
-        os.link(s, dst)
-    except OSError:
+
+    def __init__(self, near=None):
+        self.dir = None
+        cands = []
+        if near:
+            cands.append(Path(near).resolve().parent)       # same volume: hard links are free
+        cands.append(Path(tempfile.gettempdir()))
+        for c in cands:
+            try:
+                self.dir = Path(tempfile.mkdtemp(prefix=".dtvbox_", dir=str(c)))
+                break
+            except OSError:
+                continue
+        if self.dir is None:
+            self.dir = Path(tempfile.mkdtemp(prefix="dtvbox_"))
+        _BOX_DIRS.append(self.dir)
+        self._n = 0
+        self._outs = []
+
+    @staticmethod
+    def _suffix(path):
+        sfx = Path(str(path)).suffix
+        return sfx if re.fullmatch(r"\.[A-Za-z0-9]{1,8}", sfx) else ""
+
+    def inp(self, path) -> str:
+        """Neutral name (relative to self.dir) under which MP4Box sees the input file."""
+        src = os.path.abspath(str(path))
+        name = f"in{self._n}{self._suffix(src)}"
+        self._n += 1
+        dst = self.dir / name
         try:
-            os.symlink(s, dst)
+            os.link(src, dst)
         except OSError:
-            note(f"'{Path(s).name}' contains '#' or ':' which MP4Box cannot take in input names; copying it to a temporary folder.")
-            shutil.copy2(s, dst)
-    return str(dst)
+            try:
+                os.symlink(src, dst)
+            except OSError:
+                note(f"Could not link '{Path(src).name}'; copying it to a temporary folder for MP4Box.")
+                shutil.copy2(src, dst)
+        return name
+
+    def inp_nhml(self, nhml_path, media_path) -> str:
+        """NHML + the file its baseMediaFile points to; the reference is rewritten to the neutral name."""
+        mname = self.inp(media_path)
+        name = f"in{self._n}.nhml"
+        self._n += 1
+        txt = Path(nhml_path).read_text(encoding="utf-8")
+        txt = re.sub(r'(baseMediaFile\s*=\s*")[^"]*(")', lambda m: m.group(1) + mname + m.group(2), txt, count=1)
+        (self.dir / name).write_text(txt, encoding="utf-8")
+        return name
+
+    def out(self, final_path) -> str:
+        name = f"out{len(self._outs)}{self._suffix(final_path) or '.mp4'}"
+        self._outs.append((self.dir / name, Path(final_path)))
+        return name
+
+    def out_file(self, final_path) -> Path:
+        """Where the (still not committed) output really is, for progress by size."""
+        for tmp, fin in self._outs:
+            if fin == Path(final_path):
+                return tmp
+        raise KeyError(final_path)
+
+    def commit(self):
+        for tmp, fin in self._outs:
+            if tmp.is_file():
+                fin.parent.mkdir(parents=True, exist_ok=True)
+                fin.unlink(missing_ok=True)
+                shutil.move(str(tmp), str(fin))
+
+    def run(self, cmd, label, on_pct):
+        tail = run_mp4box(cmd, label, str(self.dir), on_pct)
+        self.commit()
+        return tail
+
+    def close(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+        try:
+            _BOX_DIRS.remove(self.dir)
+        except ValueError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def mp4box_splitx(mp4box, src, t0, t1, out) -> bool:
+    """MP4Box -splitx t0:t1 src -> out (any paths). True when MP4Box exited 0."""
+    with MP4BoxJob(src) as box:
+        i, o = box.inp(src), box.out(out)
+        r = sp_run([mp4box, "-splitx", f"{t0:.2f}:{t1:.2f}", i, "-out", o],
+                   capture_output=True, text=True, errors="replace", cwd=str(box.dir), **NOWIN)
+        if r.returncode == 0:
+            box.commit()
+        return r.returncode == 0
 
 
 def _cleanup_aliases():
-    for d in _ALIAS_DIRS:
+    for d in list(_BOX_DIRS):
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -2025,11 +2117,12 @@ def cmd_ts_tv3(a):
                 single_done.unlink(missing_ok=True)
                 tmp_out = tmp / "saida_single.mp4"
                 tmp_out.unlink(missing_ok=True)
-                cmd_single = [mp4box, "-add", f"{mp4box_in(merged)}:fps={fps}#video:id=1"]
-                if has_mpegh:
-                    cmd_single += ["-add", f"{mp4box_in(raw_mpegh)}{':delay=' + str(a_delay) if a_delay else ''}#audio:id=2"]
-                cmd_single += ["-new", str(tmp_out)]
-                run_mp4box(cmd_single, "single-track", str(tmp), lambda f, d: progress("single", f, d))
+                with MP4BoxJob(merged) as box:
+                    cmd_single = [mp4box, "-add", f"{box.inp(merged)}:fps={fps}#video:id=1"]
+                    if has_mpegh:
+                        cmd_single += ["-add", f"{box.inp(raw_mpegh)}{':delay=' + str(a_delay) if a_delay else ''}#audio:id=2"]
+                    cmd_single += ["-new", box.out(tmp_out)]
+                    box.run(cmd_single, "single-track", lambda f, d: progress("single", f, d))
                 if not tmp_out.is_file() or tmp_out.stat().st_size == 0:
                     raise Fail("O MP4Box não gerou o arquivo single-track.")
                 if v_timing is not None:
@@ -2073,11 +2166,12 @@ def cmd_ts_tv3(a):
                     nhml_done.write_text("ok", encoding="utf-8")
                 tmp_out = tmp / "saida_dual.mp4"
                 tmp_out.unlink(missing_ok=True)
-                cmd_dual = [mp4box, "-add", f"{mp4box_in(raw_vvc)}:fps={fps}#video:id=1", "-add", f"{mp4box_in(nhml_lcevc)}#video:id=2"]
-                if has_mpegh:
-                    cmd_dual += ["-add", f"{mp4box_in(raw_mpegh)}{':delay=' + str(a_delay) if a_delay else ''}#audio:id=3"]
-                cmd_dual += ["-new", str(tmp_out)]
-                run_mp4box(cmd_dual, "dual-track", str(tmp), lambda f, d: progress("dual", f, d))
+                with MP4BoxJob(raw_vvc) as box:
+                    cmd_dual = [mp4box, "-add", f"{box.inp(raw_vvc)}:fps={fps}#video:id=1", "-add", f"{box.inp_nhml(nhml_lcevc, bin_lcevc)}#video:id=2"]
+                    if has_mpegh:
+                        cmd_dual += ["-add", f"{box.inp(raw_mpegh)}{':delay=' + str(a_delay) if a_delay else ''}#audio:id=3"]
+                    cmd_dual += ["-new", box.out(tmp_out)]
+                    box.run(cmd_dual, "dual-track", lambda f, d: progress("dual", f, d))
                 if not tmp_out.is_file() or tmp_out.stat().st_size == 0:
                     raise Fail("O MP4Box não gerou o arquivo dual-track.")
                 if v_timing is not None:
@@ -2212,13 +2306,13 @@ def prepare_audio(src, root, mp4box, stage="prepare", frac_span=(0.0, 1.0)):
     with open(src, "rb") as fh:
         head = fh.read(12)
     is_mp4 = head[4:8] in (b"ftyp", b"moov", b"mdat", b"styp", b"free", b"skip")
-    sel = f"{mp4box_in(src)}#audio" if is_mp4 else mp4box_in(src)
-    run_mp4box(
-        [mp4box, "-add", sel, "-new", str(part)],
-        "extração do áudio",
-        str(d),
-        lambda f, t: progress(stage, f0 + (f1 - f0) * f, t),
-    )
+    with MP4BoxJob(src) as box:
+        i_name = box.inp(src)
+        box.run(
+            [mp4box, "-add", f"{i_name}#audio" if is_mp4 else i_name, "-new", box.out(part)],
+            "extração do áudio",
+            lambda f, t: progress(stage, f0 + (f1 - f0) * f, t),
+        )
     if not part.is_file() or part.stat().st_size == 0:
         raise Fail("O MP4Box não gerou o MP4 só com áudio. A entrada tem uma trilha de áudio MPEG-H (mhm1)?")
     part.replace(out)
@@ -3068,7 +3162,9 @@ def detect_native_info(audio_mp4, ffmpeg=None, mp4box=None):
 
     if mp4box:
         try:
-            r = sp_run([mp4box, "-info", str(audio_mp4)], capture_output=True, text=True, errors="replace", timeout=15, **NOWIN)
+            with MP4BoxJob(audio_mp4) as box:
+                r = sp_run([mp4box, "-info", box.inp(audio_mp4)], capture_output=True, text=True, errors="replace",
+                           timeout=15, cwd=str(box.dir), **NOWIN)
             mm = re.search(r"(?:ChannelLayout|referenceChannelLayout|Channels)\s*[:=]\s*([^\r\n]+)", (r.stdout or "") + "\n" + (r.stderr or ""), re.I)
             if mm:
                 val = mm.group(1).strip().lower()
@@ -3412,11 +3508,8 @@ def decode_one(dec, ffmpeg, mp4box, audio, wav, cicp, script, states, target_kin
                 tail_script = Path(wav).with_suffix(".tail.xml")
                 merged_wav = Path(wav).with_suffix(".merged.wav")
                 try:
-                    sp = sp_run(
-                        [mp4box, "-splitx", f"{resume_sec:.2f}:{dur + 10:.2f}", str(audio), "-out", str(tail_mp4)],
-                        capture_output=True, text=True, errors="replace", **NOWIN
-                    )
-                    if sp.returncode == 0 and tail_mp4.is_file() and tail_mp4.stat().st_size > 100:
+                    split_ok = mp4box_splitx(mp4box, audio, resume_sec, dur + 10, tail_mp4)
+                    if split_ok and tail_mp4.is_file() and tail_mp4.stat().st_size > 100:
                         cmd_t = [dec, "-if", str(tail_mp4), "-of", str(tail_wav), "-tl", str(cicp), "-dse", str(a.drc_effect)]
                         if a.target_loudness:
                             cmd_t += ["-rl", str(a.target_loudness)]
@@ -3475,11 +3568,8 @@ def decode_one(dec, ffmpeg, mp4box, audio, wav, cicp, script, states, target_kin
             tail_script = Path(wav).with_suffix(".tail.xml")
             merged_wav = Path(wav).with_suffix(".merged.wav")
             try:
-                sp = sp_run(
-                    [mp4box, "-splitx", f"{first_valid_sec:.2f}:{dur + 10:.2f}", str(audio), "-out", str(tail_mp4)],
-                    capture_output=True, text=True, errors="replace", **NOWIN
-                )
-                if sp.returncode == 0 and tail_mp4.is_file():
+                split_ok = mp4box_splitx(mp4box, audio, first_valid_sec, dur + 10, tail_mp4)
+                if split_ok and tail_mp4.is_file():
                     cmd_t = [dec, "-if", str(tail_mp4), "-of", str(tail_wav), "-tl", str(cicp), "-dse", str(a.drc_effect)]
                     if a.target_loudness:
                         cmd_t += ["-rl", str(a.target_loudness)]
@@ -3986,15 +4076,16 @@ def cmd_mpegh_audio(a):
             enc_map_path.write_text(json.dumps(enc_plan, ensure_ascii=False), encoding="utf-8")
             mux_out.unlink(missing_ok=True)
 
-            cmd_mux = [mp4box, "-add", str(src)]
-            delay_ms = int(a.audio_delay or 0)
-            for item in made:
-                spec_add = f"{item['path']}#audio:name={item['title']}"
-                if delay_ms != 0:
-                    spec_add += f":delay={delay_ms}"
-                cmd_mux += ["-add", spec_add]
-            cmd_mux += ["-new", str(mux_out)]
-            run_mp4box(cmd_mux, "muxagem multiaudio", str(tmp), lambda f, d_txt: progress("mux", f, d_txt))
+            with MP4BoxJob(src) as box:
+                cmd_mux = [mp4box, "-add", box.inp(src)]
+                delay_ms = int(a.audio_delay or 0)
+                for item in made:
+                    spec_add = f"{box.inp(item['path'])}#audio:name={mp4box_title(item['title'])}"
+                    if delay_ms != 0:
+                        spec_add += f":delay={delay_ms}"
+                    cmd_mux += ["-add", spec_add]
+                cmd_mux += ["-new", box.out(mux_out)]
+                box.run(cmd_mux, "muxagem multiaudio", lambda f, d_txt: progress("mux", f, d_txt))
             mux_entry = {
                 "kind": "mux",
                 "title": "MP4 com faixas de áudio acrescentadas",
@@ -4149,7 +4240,7 @@ def estimate_cut_bytes(mp4_path, t_in, t_out, total_dur):
     return max(1, int(os.path.getsize(mp4_path) * max(0.0, t_out - t_in) / total_dur))
 
 
-def run_cut_process(cmd, out_path, expected_bytes=0, on_info=None, poll=0.25):
+def run_cut_process(cmd, out_path, expected_bytes=0, on_info=None, poll=0.25, cwd=None):
     """
     Runs MP4Box and follows its progress through the bytes written to out_path (or the % MP4Box prints while the file
     does not exist yet). on_info(dict) receives: pct (0-100), elapsed, eta, total, speed (MB/s), size, expected.
@@ -4157,7 +4248,7 @@ def run_cut_process(cmd, out_path, expected_bytes=0, on_info=None, poll=0.25):
     """
     t0 = time.time()
     state = {"pct": None, "tail": "", "last": 0.0}
-    proc = sp_popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **NOWIN)
+    proc = sp_popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=cwd, **NOWIN)
 
     def reader():
         buf = b""
@@ -4222,9 +4313,14 @@ def cut_segment(mp4box, src, out, t_in, t_out, total_dur, on_info=None):
     if out.exists():
         out.unlink()
     # the start is 1 ms before the IDR so that MP4Box lands exactly on the chosen frame
-    cmd = [mp4box, "-splitx", f"{max(0.0, t_in - 0.001):.4f}:{t_out:.4f}", mp4box_in(src), "-out", str(out)]
-    log("$ " + subprocess.list2cmdline(cmd))
-    return run_cut_process(cmd, str(out), estimate_cut_bytes(str(src), t_in, t_out, total_dur), on_info)
+    with MP4BoxJob(src) as box:
+        cmd = [mp4box, "-splitx", f"{max(0.0, t_in - 0.001):.4f}:{t_out:.4f}", box.inp(src), "-out", box.out(out)]
+        log("$ " + subprocess.list2cmdline(cmd))
+        ok, tail = run_cut_process(cmd, str(box.out_file(out)), estimate_cut_bytes(str(src), t_in, t_out, total_dur), on_info,
+                                   cwd=str(box.dir))
+        if ok:
+            box.commit()
+        return ok and out.exists(), tail
 
 
 # --- A/V sync after the cut: MP4Box -splitx may lose the initial delay (empty edit) of a non-video track ---
@@ -5429,22 +5525,25 @@ def cmd_dash_capture(a):
     if final_mp4 != out_mp4:
         note(f"{out_mp4.name} appeared during the capture; saving as {final_mp4.name}.")
     origin = min(timing_p)
-    cmd = [mp4box, "-add", f"{mp4box_in(temp_vvc)}:fps={fps}#video:id=1"]
+    box = MP4BoxJob(temp_vvc)
+    cmd = [mp4box, "-add", f"{box.inp(temp_vvc)}:fps={fps}#video:id=1"]
     delay_ms = 0
     if st["has_audio"]:
         delay_ms = av_delay_ms(st["first_aud_sec"], origin)
-        cmd += ["-add", f"{mp4box_in(temp_aud)}{':delay=' + str(delay_ms) if delay_ms else ''}#audio:id=2"]
+        cmd += ["-add", f"{box.inp(temp_aud)}{':delay=' + str(delay_ms) if delay_ms else ''}#audio:id=2"]
     tmp_out = work_dir / "capture_out.mp4"
-    cmd += ["-new", str(tmp_out)]
+    cmd += ["-new", box.out(tmp_out)]
     clog("INFO", f"Packaging the final MP4 ({merger.written} frames, {fps} fps)...")
     try:
         post_set("Packaging MP4 (MP4Box)", 0.0)
-        run_mp4box(cmd, "package", str(work_dir), lambda f, d: (progress("package", f, d), post_set("Packaging MP4 (MP4Box)", f)))
+        box.run(cmd, "package", lambda f, d: (progress("package", f, d), post_set("Packaging MP4 (MP4Box)", f)))
     except Fail:
+        box.close()
         stop_live()
         step("package", "error", "MP4Box failed")
         clog("WARN", f"Temporary files kept in: {work_dir}")
         raise
+    box.close()
     post_set("Applying the real PTS timing")
     rt = retime_mp4_tracks(str(tmp_out), {1: (list(timing_d), list(timing_p))}, origin)
     if rt.get(1) != "ok":

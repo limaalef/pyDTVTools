@@ -52,7 +52,8 @@ def fake(cmd, label, tmpdir, on_pct):
     for i, c in enumerate(cmd):
         if isinstance(c, str) and c.split(":fps")[0].split("#")[0].endswith(".vvc"):
             src = c.split(":fps")[0].split("#")[0]
-            shutil.copy(src, src[:-4] + ".h264")
+            import os
+            shutil.copy(os.path.join(tmpdir, src), os.path.join(tmpdir, src[:-4] + ".h264"))
             cmd[i] = c.replace(".vvc", ".h264", 1)
     return real(cmd, label, tmpdir, on_pct)
 d.run_mp4box = fake
@@ -117,3 +118,19 @@ def test_ts_tv3_no_stray_print_in_json_mode(tv3_ts, tmp_path):
     rc, text = _run(h, "ts-tv3", ts, "--outdir", tmp_path / "o", "--outputs", "single", "--progress-json")
     assert rc == 0
     assert not [ln for ln in text.splitlines() if ln.startswith("[") and "single" in ln and "MP4Box" in ln]
+
+
+@need_mp4box
+@pytest.mark.parametrize("name", ["Jogo + Final 2026.ts", "100%25 $x$ #1 (a&b).ts", "ação ñ ; = !.ts"])
+def test_ts_tv3_hostile_names_single_and_dual(tv3_ts, tmp_path, name):
+    ts, h = tv3_ts
+    folder = tmp_path / "Meus Vídeos + Gravações %41"
+    folder.mkdir()
+    src = folder / name
+    shutil.copy(ts, src)
+    out = tmp_path / "Saída + final $d$"
+    rc, text = _run(h, "ts-tv3", src, "--outdir", out, "--no-color")
+    assert rc == 0, text
+    stem = src.stem
+    assert (out / f"{stem}_single_track_4k.mp4").stat().st_size > 0
+    assert (out / f"{stem}_dual_track.mp4").stat().st_size > 0

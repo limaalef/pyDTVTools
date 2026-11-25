@@ -1,3 +1,4 @@
+import re
 import pytest
 
 import dtv_tools as d
@@ -43,15 +44,32 @@ def test_tmp_session_never_wipes_unmarked_user_folder(tmp_path):
     assert (folder / "photo.jpg").exists()
 
 
-def test_mp4box_in_hides_hash_and_colon(tmp_path):
-    f = tmp_path / "a#b:c.mp4"
+NASTY = ["a b+c.mp4", "x#y:z.mp4", "100%25 ok.mp4", "p$q$r.mp4", "(a)&[b] 'c'.mp4", "ação ñ 日本.mp4", "a;b,c=d!.mp4"]
+
+
+@pytest.mark.parametrize("name", NASTY)
+def test_mp4box_job_neutral_names(tmp_path, name):
+    f = tmp_path / "pasta com + espaço" / name
+    f.parent.mkdir()
     f.write_bytes(b"data")
-    alias = d.mp4box_in(f)
-    assert "#" not in alias and ":" not in alias.replace("C:\\", "")
-    assert open(alias, "rb").read() == b"data"
-    plain = tmp_path / "plain.mp4"
-    plain.write_bytes(b"1")
-    assert d.mp4box_in(plain) == str(plain)
+    out = f.parent / ("out " + name)
+    with d.MP4BoxJob(f) as box:
+        i, o = box.inp(f), box.out(out)
+        assert re.fullmatch(r"[A-Za-z0-9_.]+", i) and re.fullmatch(r"[A-Za-z0-9_.]+", o)
+        assert (box.dir / i).read_bytes() == b"data"
+        (box.dir / o).write_bytes(b"result")
+        box.commit()
+        assert out.read_bytes() == b"result"
+        assert f.read_bytes() == b"data"
+        folder = box.dir
+    assert not folder.exists()
+
+
+def test_mp4box_title_is_safe():
+    t = d.mp4box_title("Preset 1: Diálogo #2 100% $x$")
+    assert not re.search(r"[:#%$]", t) and "Diálogo" in t
+    assert d.mp4box_title("::") == "-"  or d.mp4box_title("::")
+    assert d.mp4box_title("") == "audio"
 
 
 def test_free_space_check(tmp_path):
