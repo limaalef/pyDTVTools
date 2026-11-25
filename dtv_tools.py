@@ -41,7 +41,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 PROTOCOL_VERSION = 2
 # What a controlling program (the GUI) may rely on; listed by `describe`, `doctor` and the `hello` event.
 FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation", "update-check", "dash-live")
@@ -3703,20 +3703,27 @@ def loudness_gain(m, target, tp_limit):
     return (0.0 if abs(g) < 0.05 else g), limited
 
 
-def encode_audio(ffmpeg, wav_path, out_path, fmt_key, br, dur, cut_warn=False, on_pct=None, gain_db=0.0):
+def encode_audio(ffmpeg, wav_path, out_path, fmt_key, br, dur, cut_warn=False, on_pct=None, gain_db=0.0, trim_s=0.0):
     fdef = FORMATS[fmt_key]
     cmd = [
         ffmpeg, "-hide_banner", "-y", "-v", "error",
         "-progress", "pipe:1", "-nostats",
-        "-ignore_length", "1", "-i", str(wav_path)
+        "-ignore_length", "1"
     ]
+    if trim_s > 0.0:
+        cmd += ["-ss", f"{trim_s:.6f}"]
+    cmd += ["-i", str(wav_path)]
+    
     af = ([f"volume={gain_db:.2f}dB"] if gain_db else []) + (["apad"] if dur and cut_warn else [])
     if af:
         cmd += ["-af", ",".join(af)]
-    if dur and cut_warn:
-        cmd += ["-t", f"{dur:.3f}"]
-    elif dur:
-        cmd += ["-t", f"{dur:.3f}"]
+        
+    out_dur = max(0.1, dur - trim_s) if dur else None
+    if out_dur and cut_warn:
+        cmd += ["-t", f"{out_dur:.3f}"]
+    elif out_dur:
+        cmd += ["-t", f"{out_dur:.3f}"]
+        
     cmd += list(fdef["args"])
     use_br = br or fdef["br"]
     if use_br:
@@ -3731,11 +3738,11 @@ def encode_audio(ffmpeg, wav_path, out_path, fmt_key, br, dur, cut_warn=False, o
     if p.stdout:
         for ln in p.stdout:
             ln = ln.strip()
-            if on_pct and dur and dur > 0 and ln.startswith("out_time_us="):
+            if on_pct and out_dur and out_dur > 0 and ln.startswith("out_time_us="):
                 try:
                     us = int(ln.split("=", 1)[1])
                     if us >= 0:
-                        on_pct(min(0.99, (us / 1_000_000.0) / dur))
+                        on_pct(min(0.99, (us / 1_000_000.0) / out_dur))
                 except ValueError:
                     pass
     err = (p.stderr.read() if p.stderr else "").strip()
@@ -3995,6 +4002,17 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
             enc_plan[plan_key] = str(out_file)
             enc_map_path.write_text(json.dumps(enc_plan, ensure_ascii=False), encoding="utf-8")
 
+        trim_s = 0.0
+        try:
+            tables = mp4_tables(str(src))
+            at = next((t for t in tables if t.get("handler") == "soun" or t.get("id") == 2), None)
+            if at:
+                _, mt_val, _ = mp4_edit_info(at)
+                if mt_val is not None and mt_val > 0:
+                    trim_s = mt_val / at["ts"]
+        except Exception:
+            pass
+
         if out_file.is_file() and out_file.stat().st_size > 0 and enc_done.is_file():
             reused_enc += 1
             progress(pfx + "encode", (idx + 1) / n_chosen, f"[{idx + 1}/{len(chosen)}] {out_file.name} (reaproveitado)", force=True)
@@ -4017,7 +4035,7 @@ def mpegh_render(a, src, tools, outdir, tmp, raw_opts=None, fmt_override=None, p
                     say(f"  Volume de {out_file.name}: {m['i']:.1f} LUFS, pico {m['tp']:.1f} dBTP → {m['i'] + gain:.1f} LUFS ({gain:+.2f} dB)"
                         + (f" — limitado pelo pico máximo de {a.true_peak:g} dBTP; o alvo era {norm_target:g} LUFS" if limited else ""))
             encode_audio(
-                ffmpeg, wav, out_file, o["fmt"], o.get("br"), dur, cut_warn=has_cut, gain_db=gain,
+                ffmpeg, wav, out_file, o["fmt"], o.get("br"), dur, cut_warn=has_cut, gain_db=gain, trim_s=trim_s,
                 on_pct=lambda sub_f, i=idx, fn=out_file.name: progress(
                     pfx + "encode", (i + sub_f) / n_chosen, f"[{i + 1}/{len(chosen)}] {fn} ({sub_f * 100:.0f}%)"
                 )
@@ -5217,6 +5235,30 @@ def dash_fps(pts_list, timescale):
     return round(timescale / deltas[len(deltas) // 2], 3)
 
 
+def validate_dash_sync(mp4_path, expected_delay_s):
+    """Valida se o atraso entre áudio e vídeo no MP4 final bate com a expectativa da rede."""
+    try:
+        tables = mp4_tables(str(mp4_path))
+        vt = next((t for t in tables if t["handler"] == "vide"), None)
+        at = next((t for t in tables if t.get("id") == 2 or t.get("handler") == "soun"), None)
+        
+        if not vt or not at:
+            return "Validação ignorada: trilhas ausentes."
+            
+        v_pts = mp4_present(vt, 0)
+        a_pts = mp4_present(at, 0)
+        
+        actual_delay = a_pts - v_pts
+        diff = actual_delay - expected_delay_s
+        
+        # Tolerância de ~1 frame de áudio (21.3ms)
+        if abs(diff) > 0.022:
+            return f"AVISO CRÍTICO: Dessincronização de {diff * 1000:+.1f} ms no arquivo final! (Esperado: {expected_delay_s * 1000:.1f} ms, Real: {actual_delay * 1000:.1f} ms)"
+        return f"Sincronismo validado: desvio de apenas {diff * 1000:+.1f} ms."
+    except Exception as e:
+        return f"Erro ao validar sincronismo: {e}"
+
+
 def cmd_dash_capture(a):
     try:
         import requests
@@ -5314,6 +5356,9 @@ def cmd_dash_capture(a):
           "live_start": None, "live_logged": False, "last_warn": ("", 0.0), "stop_reason": ""}
     from array import array
     timing_d, timing_p = array("d"), array("d")
+
+    st_audio = {"expected_sec": None, "last_payload": None}
+    AUDIO_FRAME_SEC = 1024 / 48000.0
 
     f_vvc = open(temp_vvc, "wb")
     f_aud = open(temp_aud, "wb")
@@ -5499,13 +5544,35 @@ def cmd_dash_capture(a):
                     for a_sec, apay in aud_wait:
                         if a_sec < st["first_vvc_sec"] - 0.010:
                             continue
+                            
                         if st["first_aud_sec"] is None:
                             st["first_aud_sec"] = a_sec
+                            st_audio["expected_sec"] = a_sec
                             clog("INFO", f"Audio synced to the first 4K frame (offset: {round((a_sec - st['first_vvc_sec']) * 1000):+d} ms)")
-                        st["has_audio"] = True
+                            st["has_audio"] = True
+                        
+                        # ESTRATÉGIA: Padding Dinâmico para cobrir perdas de rede
+                        if st_audio["expected_sec"] is not None:
+                            gap = a_sec - st_audio["expected_sec"]
+                            # Se o buraco for maior que 1.5 quadros, preenchemos repetindo o último quadro
+                            if gap > AUDIO_FRAME_SEC * 1.5 and st_audio["last_payload"]:
+                                missing = int(round(gap / AUDIO_FRAME_SEC))
+                                # Limite de segurança (aprox 5 seg) para evitar loops infinitos em gaps bizarros
+                                if 0 < missing < 250:
+                                    clog("DEBUG", f"Padding: Injetando {missing} quadro(s) de áudio para mascarar gap temporal de {gap*1000:.1f}ms")
+                                    pad_frame = st_audio["last_payload"]
+                                    if not pad_frame.startswith(b"\xC0\x01\xA5"):
+                                        pad_frame = b"\xC0\x01\xA5" + pad_frame
+                                    for _ in range(missing):
+                                        f_aud.write(pad_frame)
+                        
                         if not apay.startswith(b"\xC0\x01\xA5"):
                             f_aud.write(b"\xC0\x01\xA5")
                         f_aud.write(apay)
+                        
+                        st_audio["last_payload"] = apay
+                        st_audio["expected_sec"] = a_sec + AUDIO_FRAME_SEC
+                        
                     aud_wait.clear()
                     f_aud.flush()
                 st["cleaned"] += cleanup_old_segments(ttl_files, a.cleanup_after)
@@ -5595,6 +5662,13 @@ def cmd_dash_capture(a):
     final_mp4.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(tmp_out), str(final_mp4))
     size = final_mp4.stat().st_size
+    if st["has_audio"]:
+        sync_msg = validate_dash_sync(final_mp4, (st["first_aud_sec"] - origin))
+        if "AVISO CRÍTICO" in sync_msg:
+            clog("ERROR", sync_msg)
+            notes.append(sync_msg)
+        else:
+            clog("INFO", sync_msg)
     step("package", "done", f"{final_mp4.name} · {dash_fmt_size(size)}")
     progress("package", 1, force=True)
 
@@ -5890,14 +5964,58 @@ def audio_offset(ff, src, a):
             return float(a.audio_delay) / 1000.0
         except ValueError:
             raise Fail("--audio-delay deve ser 'auto' ou um número em milissegundos.")
-    r = sp_run([ff, "-hide_banner", "-nostdin", "-i", str(src), "-map", "0:a:0", "-af", "ashowinfo", "-frames:v", "0", "-frames:a", "1",
-                "-f", "null", "-"], capture_output=True, text=True, errors="replace", timeout=120, **NOWIN)
-    m = re.search(r"pts_time:(-?[\d.]+)", r.stderr or "")
-    if not m:
-        note("Não consegui medir o início da trilha de áudio original (este ffmpeg decodifica MPEG-H?): deslocamento 0. "
-             "Use --audio-delay MS para ajustar.")
-        return 0.0
-    return max(0.0, float(m.group(1)))
+    try:
+        off = mp4_audio_offset(str(src))
+        if off is not None:
+            return off
+    except Exception as e:
+        note(f"Não consegui ler o atraso do áudio no arquivo de origem ({e}); usando 0 ms. Informe --audio-delay em ms se precisar.")
+    return 0.0
+
+
+def mp4_audio_offset(path):
+    """
+    Where the first audio sample sits on the player timeline, relative to the first displayed video frame (seconds, may be
+    negative), from the edit lists of both tracks: empty edit (delay added by the cut / capture), media_time (audio trimmed at
+    its start) and the video's own origin. The rendered audio starts at its own sample 0, so this is the offset it needs.
+    None when the file has no audio track tables.
+    """
+    tables = mp4_tables(str(path))
+    at = next((t for t in tables if t.get("handler") == "soun"), None)
+    vt = next((t for t in tables if t.get("handler") == "vide"), None)
+    if at is None or not at.get("dts"):
+        return None
+    a0 = mp4_present(at, 0)
+    v0 = min((mp4_present(vt, k) for k in range(min(len(vt["dts"]), 64))), default=0.0) if vt and vt.get("dts") else 0.0
+    return round(a0 - v0, 3)
+
+
+def first_pts(ff, path, kind, index=0):
+    """Timestamp (s) of the first decoded frame of the index-th video/audio stream (any container), None if it cannot be read."""
+    flt = ["-vf", "showinfo", "-frames:v", "1"] if kind == "v" else ["-af", "ashowinfo", "-frames:a", "1"]
+    try:
+        r = sp_run([ff, "-hide_banner", "-nostdin", "-i", str(path), "-map", f"0:{kind}:{index}", *flt, "-f", "null", "-"],
+                   capture_output=True, text=True, errors="replace", timeout=180, **NOWIN)
+    except Exception:
+        return None
+    m = re.search(r"pts_time:\s*(-?[\d.]+)", r.stderr or "")
+    return float(m.group(1)) if m else None
+
+
+def check_audio_sync(ff, out, n_rendered, expected, tol=0.05):
+    """After the encode: do the rendered audio tracks of the output sit `expected` s after the video? Returns (rows, problems)."""
+    v = first_pts(ff, out, "v")
+    rows, bad = [], []
+    for j in range(n_rendered):
+        a_ = first_pts(ff, out, "a", j)
+        if v is None or a_ is None:
+            rows.append((j, None))
+            continue
+        d_ = a_ - v
+        rows.append((j, d_))
+        if abs(d_ - expected) > tol:
+            bad.append((j, d_))
+    return rows, bad
 
 
 def build_transcode_cmd(ff, src, out, a, hdr, size, use_lcevc, n_src_audio, items=(), offset=0.0, keep_original=True, target=None):
@@ -5905,7 +6023,11 @@ def build_transcode_cmd(ff, src, out, a, hdr, size, use_lcevc, n_src_audio, item
     extra = enc_extra(a)
     cmd = [ff, "-hide_banner", "-y", "-nostdin", "-nostats", "-progress", "pipe:1", "-i", str(src)]
     for it in items:                                                   # rendered presets: one input each
-        cmd += (["-itsoffset", f"{offset:.3f}"] if offset else []) + ["-i", it["path"]]
+        if offset > 0:
+            cmd += ["-itsoffset", f"{offset:.3f}"]                     # delay: the audio starts later than the video
+        elif offset < 0:
+            cmd += ["-ss", f"{-offset:.3f}"]                           # the audio starts before the first frame: drop that stretch
+        cmd += ["-i", it["path"]]
     cmd += ["-map", "0:v:0"]
     titles = []
     for i, it in enumerate(items):
@@ -6029,7 +6151,8 @@ def cmd_transcode(a):
                 items.append({"path": m["path"], "title": track_label(o), "id": o["id"],
                               "fmt": AUDIO_EXT_FMT.get(Path(m["path"]).suffix.lower(), "?")})
             offset = audio_offset(ff, src, a)
-            say(f"Deslocamento do áudio renderizado: {offset * 1000:+.0f} ms ({'início da trilha original' if str(a.audio_delay).lower() == 'auto' else '--audio-delay'})")
+            say(f"Deslocamento do áudio renderizado: {offset * 1000:+.0f} ms "
+                f"({'atraso da trilha de áudio no arquivo de origem (corte/captura)' if str(a.audio_delay).strip().lower() == 'auto' else '--audio-delay'})")
         elif render:
             note("--dry-run: a renderização do áudio foi pulada; o comando abaixo não tem as trilhas renderizadas.")
         if ext is None:
@@ -6069,6 +6192,13 @@ def cmd_transcode(a):
             else:
                 raise Fail(f"O ffmpeg falhou (código {rc}):\n{tail[-1200:]}")
         final = probe_streams(ff, part)
+        sync_rows = []
+        if items and not a.limit:
+            want = max(offset, 0.0)                                    # a negative offset trims the start of the audio: it then begins at 0
+            sync_rows, sync_bad = check_audio_sync(ff, part, len(items), want)
+            for j, d_ in sync_bad:
+                note(f"Atraso do áudio no arquivo final: a trilha renderizada {j + 1} começa {d_ * 1000:+.0f} ms depois do vídeo, mas o esperado era "
+                     f"{want * 1000:+.0f} ms. Se ouvir dessincronia, ajuste com --audio-delay (ms).")
         os.replace(part, out)                                          # only a finished file gets the final name
         step("encode", "done", f"{out.name} · {human(out.stat().st_size)} · {fmt_hms(got or 0)}")
         progress("encode", 1.0, force=True)
@@ -6077,6 +6207,8 @@ def cmd_transcode(a):
         rows = [["Entrada", src.name], ["Vídeo", f"{CODEC_NAMES[E['codec']]} 10-bit HDR10 ({E['label']}) · {size or v['size'] or '?'} · CRF {enc_crf(a):g}" + (f" · preset {enc_preset(a)}" if enc_preset(a) else "")
                 + (f" · máx. {a.max_bitrate:g} Mbps" if enc_maxrate_kbps(a) else "")],
                 ["HDR10", hdr10_summary(hdr)], ["Duração", fmt_hms(got or 0)], ["Contêiner", out.suffix.lstrip(".").upper()],
+                *([["Atraso do áudio", (f"início aparado em {-offset * 1000:.0f} ms" if offset < 0 else f"{offset * 1000:+.0f} ms aplicado") + ("" if offset < 0 or not sync_rows or any(d_ is None for _, d_ in sync_rows) else
+                    f" · medido no arquivo: {', '.join(f'{d_ * 1000:+.0f} ms' for _, d_ in sync_rows)}")]] if items else []),
                 ["Trilhas de áudio", (f"{len(items)} renderizada(s): " + ", ".join(i['title'] for i in items) +
                                       (f" + {len(final['audio']) - len(items)} original(is)" if len(final['audio']) > len(items) else ""))
                  if items else f"{len(final['audio'])} (original)"],

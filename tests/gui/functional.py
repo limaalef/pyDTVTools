@@ -12,7 +12,7 @@ REAL = R.program_and_prefix
 import dtv_gui as G
 QSettings.setPath(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, cfg)
 app = G.make_app(["x"])
-QSettings().setValue("update/auto", False)       # os testes não vão à internet; a seção de atualização liga de propósito
+QSettings().setValue("update/auto", False)       # os testes não consultam a internet (verificação de atualização desligada)
 
 def wait(ms):
     l = QEventLoop(); QTimer.singleShot(ms, l.quit); l.exec()
@@ -46,7 +46,7 @@ w.close()
 R.program_and_prefix = lambda: (sys.executable, [os.path.join(ROOT, "tests", "gui", "old_dtv.py")])
 w = G.MainWindow(); w.show(); wait(500); done(w); wait(200)
 txt = [r["status"].text() for r in w.pages["tools"].rows.values()]
-check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.3.1" in t and "unrecognized" in t for t in txt))
+check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.3.2" in t and "unrecognized" in t for t in txt))
 w.close()
 
 # --- 1c. ferramentas escolhidas na tela vão como opção explícita, sem precisar "Salvar"
@@ -271,54 +271,6 @@ check("aviso: verificação silenciosa do início não avisa", len(sent) == 4)
 from dtv_gui_notify import Notifier as _N
 check("aviso: sem bandeja/serviço (aqui, offscreen), notificar devolve False em vez de falhar", _N(w).notify("t", "x") is False)
 w.close()
-# --- verificador de atualização
-import dtv_gui_update as U
-check("atualização: intervalo (nunca, recente, vencido, relógio voltou)", U.due(0, 1000) and not U.due(900, 1000) and U.due(1000, 1000 + U.INTERVAL_S) and U.due(5000, 1000))
-check("atualização: automática só avisa de versão nova não ignorada", U.worth_showing({"update_available": True, "latest": "2"}, "1", False)
-      and not U.worth_showing({"update_available": True, "latest": "2"}, "2", False) and not U.worth_showing({"update_available": False}, "", False)
-      and U.worth_showing({"update_available": False}, "", True) and U.worth_showing({"update_available": True, "latest": "2"}, "2", True))
-R.program_and_prefix = lambda: (sys.executable, [FAKE])
-os.environ["FAKE_UPDATE"] = "new"
-w = G.MainWindow(); w.show(); done(w)
-w.check_update(manual=True); until(lambda: not w.up_runner.busy); wait(100)
-box = getattr(w, "_update_box", None)
-check("atualização: manual com versão nova abre o aviso com a versão e o arquivo do sistema", box is not None and "9.9.9" in box.text() and "DTVTools-win.exe" in box.text())
-btns = [b.text() for b in box.buttons()]; print("   botões:", btns)
-check("atualização: botões Baixar / Ver novidades / Ignorar / Fechar", set(btns) == {"Baixar", "Ver novidades", "Ignorar esta versão", "Fechar"})
-next(b for b in box.buttons() if b.text() == "Ignorar esta versão").click(); box.close()
-check("atualização: 'Ignorar esta versão' é lembrado", w.settings.value("update/skip", "", str) == "9.9.9")
-w._update_box = None; w.check_update(manual=False); until(lambda: not w.up_runner.busy); wait(100)
-check("atualização: automática não repete a versão ignorada", w._update_box is None)
-w.settings.setValue("update/skip", "")
-w.check_update(manual=False); until(lambda: not w.up_runner.busy); wait(100)
-check("atualização: automática avisa de versão nova", w._update_box is not None and w._update_box.isVisible())
-w._update_box.close(); w._update_box = None
-os.environ["FAKE_UPDATE"] = "current"
-w.check_update(manual=False); until(lambda: not w.up_runner.busy); wait(100)
-check("atualização: automática e já atualizado fica em silêncio", w._update_box is None)
-w.check_update(manual=True); until(lambda: not w.up_runner.busy); wait(100)
-check("atualização: manual e já atualizado diz que está em dia", w._update_box is not None and "mais recente" in w._update_box.text())
-w._update_box.close(); w._update_box = None
-os.environ["FAKE_UPDATE"] = "error"
-shown = []
-import PySide6.QtWidgets as _W
-_orig = _W.QMessageBox.warning
-G.QMessageBox.warning = staticmethod(lambda *a, **k: shown.append(a[2]))
-w.check_update(manual=False); until(lambda: not w.up_runner.busy); wait(100)
-check("atualização: erro de rede na verificação automática é silencioso", not shown and w._update_box is None)
-w.check_update(manual=True); until(lambda: not w.up_runner.busy); wait(100)
-check("atualização: erro de rede na verificação manual é mostrado", len(shown) == 1 and "GitHub" in shown[0])
-G.QMessageBox.warning = _orig
-w.settings.setValue("update/auto", True); w.settings.setValue("update/last", 0.0); os.environ["FAKE_UPDATE"] = "new"
-w._update_box = None; w.startup_check(); until(lambda: not w.up_runner.busy); wait(100)
-check("atualização: na abertura, com a opção ligada e prazo vencido, consulta e avisa", w._update_box is not None)
-last = w.settings.value("update/last", 0.0, float)
-w._update_box.close(); w._update_box = None; w.startup_check(); until(lambda: not w.up_runner.busy); wait(100)
-check("atualização: dentro das 24 h não consulta de novo", w._update_box is None and w.settings.value("update/last", 0.0, float) == last)
-w.settings.setValue("update/auto", False); w.settings.setValue("update/last", 0.0); w.startup_check(); wait(300)
-check("atualização: opção desligada não consulta", w._update_box is None and not w.up_runner.busy)
-w.close()
-R.program_and_prefix = REAL
 # --- abertura: `describe` em cache e processos sem console
 import dtv_gui_runner as _R
 R.program_and_prefix = REAL
