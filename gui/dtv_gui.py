@@ -198,6 +198,36 @@ class Page(QWidget):
         g = CardBox(title)
         return g, g.form()
 
+    def remember(self, prefix: str, widgets: dict):
+        """Guarda e restaura, sem o usuário pedir, o valor dos campos (QSettings 'prefix/nome'). Valor ausente = fica o padrão do campo."""
+        st = QSettings()
+
+        def hook(name, w):
+            k = f"{prefix}/{name}"
+            try:
+                if isinstance(w, (QCheckBox, QRadioButton)):
+                    if st.contains(k):
+                        w.setChecked(st.value(k, False, bool))
+                    w.toggled.connect(lambda v, k=k: QSettings().setValue(k, bool(v)))
+                elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                    if st.contains(k):
+                        w.setValue(st.value(k, w.value(), float if isinstance(w, QDoubleSpinBox) else int))
+                    w.valueChanged.connect(lambda v, k=k: QSettings().setValue(k, v))
+                elif isinstance(w, QComboBox):
+                    if st.contains(k):
+                        i = w.findData(st.value(k, "", str))
+                        if i >= 0:
+                            w.setCurrentIndex(i)
+                    w.currentIndexChanged.connect(lambda _i, k=k, w=w: QSettings().setValue(k, str(w.currentData())))
+                elif isinstance(w, QLineEdit):
+                    if st.contains(k):
+                        w.setText(st.value(k, "", str))
+                    w.textChanged.connect(lambda v, k=k: QSettings().setValue(k, v))
+            except (TypeError, ValueError):
+                pass
+        for n, w in widgets.items():
+            hook(n, w)
+
     @staticmethod
     def spin(lo, hi, val, step=1, dec=0, special="", suffix=""):
         s = QDoubleSpinBox() if dec else QSpinBox()
@@ -1640,7 +1670,7 @@ class FramePage(Page):
         self.white = self.spin(50, 1000, 203, 1, 0, suffix=" nits")
         self.peak = self.spin(0, 10000, 0, 50, 0, special="Automático (MaxCLL)", suffix=" nits")
         self.exposure = self.spin(-5, 5, 0, 0.25, 2, suffix=" EV")
-        self.desat = self.spin(0, 10, 2, 0.25, 2, special="Desligado")
+        self.desat = self.spin(0, 10, 0, 0.25, 2, special="Desligado")
         self.sat = self.spin(0, 3, 1, 0.05, 2)
         f.addRow("Curva", self.tm)
         f.addRow("Branco SDR", self.white)
@@ -1665,6 +1695,10 @@ class FramePage(Page):
         self.footer.addWidget(self.redo)
         self.action_buttons.append(self.redo)
         self.last_hdr = ""
+        self.remember("frame", {"by_time": self.by_time, "nolcevc": self.nolcevc, "slow": self.slow, "hdr_png": self.hdr_png, "hdr_avif": self.hdr_avif,
+                                "sdr_png": self.sdr_png, "sdr_jpg": self.sdr_jpg, "jpgq": self.jpgq, "avif_crf": self.avif_crf,
+                                "avif_chroma": self.avif_chroma, "overwrite": self.overwrite, "tm": self.tm, "white": self.white,
+                                "peak": self.peak, "exposure": self.exposure, "desat": self.desat, "sat": self.sat})
 
     def update_buttons(self):
         for b in self.action_buttons:
@@ -2067,6 +2101,289 @@ class ToolsPage(Page):
 
 
 # ═════════════════════════════ janela principal ═════════════════════════════
+# BUILD-REMOVE-START-4
+# ═════════════════════════════ Acesso via ADB (fora das compilações) ═════════════════════════════
+class StepRow(QWidget):
+    def __init__(self, n: int, title: str, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        self.icon = StatusIcon(20)
+        lay.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        head = QHBoxLayout()
+        self.title = QLabel(f"<b>{n}. {title}</b>")
+        self.tag = QLabel("")
+        head.addWidget(self.title)
+        head.addWidget(self.tag)
+        head.addStretch(1)
+        col.addLayout(head)
+        self.detail = muted_label("")
+        self.detail.setWordWrap(True)
+        self.detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        col.addWidget(self.detail)
+        lay.addLayout(col, 1)
+        self.state = StatusIcon.PENDING
+
+    def set(self, state: int, detail: str = "", on_device: bool = False):
+        self.state = state
+        self.icon.set_state(state)
+        self.detail.setText(detail)
+        if on_device:
+            self.tag.setText("  ← conclua no aparelho")
+            pal = self.tag.palette()
+            pal.setColor(QPalette.ColorRole.WindowText, Colors(self).warn)
+            self.tag.setPalette(pal)
+        else:
+            self.tag.setText("")
+
+
+class AdbPage(Page):
+    title = "Acesso via ADB"
+    subtitle = "Conecta ao aparelho, redireciona as portas e mostra o endereço do streaming para a Captura DASH"
+    STEPS = ("ADB disponível", "Aparelho conectado e autorizado", "API do player acessível", "Endereço do streaming", "Porta da mídia redirecionada")
+
+    def build(self, lay):
+        self.runner = Runner(self.win.runner.env_extra, self)          # processo próprio: não usa o painel de tarefas
+        self.running = False
+        self.state: dict = {}
+        self.history: list = []
+        self.runner.adbReported.connect(lambda job, d: self.on_adb(d))
+        self.runner.errorReported.connect(lambda job, msg: self.handle_error(job, msg))
+        self.runner.resultReady.connect(lambda job, res: None)
+        self.runner.jobFinished.connect(lambda job, code, ok: self._finished(ok))
+        QApplication.instance().aboutToQuit.connect(lambda: self.runner.stop(force=True))
+
+        g, f = self.group("Conexão")
+        self.device = QLineEdit()
+        self.device.setPlaceholderText("IP do aparelho (192.168.0.20 ou 192.168.0.20:5555) ou o serial de um aparelho USB")
+        self.device.setClearButtonEnabled(True)
+        self.adb_path = FileEdit("open", placeholder="Detectar automaticamente (PATH, SDK Android ou ./platform-tools)", key="adb_bin")
+        f.addRow("Aparelho", self.device)
+        f.addRow("Programa adb", self.adb_path)
+        self.poll = QCheckBox("Acompanhar o endereço (troca de canal ou falha de sinal)")
+        self.poll.setChecked(True)
+        self.notify = QCheckBox("Avisar com uma notificação quando o endereço mudar")
+        self.notify.setChecked(True)
+        f.addRow("", self.poll)
+        f.addRow("", self.notify)
+        lay.addWidget(g)
+        self.conn_card = g
+
+        steps = CardBox("Passo a passo")
+        self.rows = [StepRow(i + 1, t) for i, t in enumerate(self.STEPS)]
+        for r in self.rows:
+            steps.body.addWidget(r)
+        lay.addWidget(steps)
+
+        ga = CardBox("Endereço do streaming")
+        self.dev_url = QLineEdit()
+        self.dev_url.setReadOnly(True)
+        self.dev_url.setPlaceholderText("Ainda não descoberto")
+        self.loc_url = QLineEdit()
+        self.loc_url.setReadOnly(True)
+        self.loc_url.setPlaceholderText("Disponível depois do redirecionamento")
+        fa = ga.form()
+        fa.addRow("No aparelho", self.dev_url)
+        fa.addRow("Neste computador", self.loc_url)
+        br = QHBoxLayout()
+        self.copy_btn = QPushButton("Copiar endereço local")
+        self.capture_btn = QPushButton("Capturar este DASH →")
+        self.capture_btn.setToolTip("Abre a Captura DASH com o endereço local já preenchido")
+        br.addWidget(self.copy_btn)
+        br.addWidget(self.capture_btn)
+        br.addStretch(1)
+        ga.body.addLayout(br)
+        self.player_info = muted_label("")
+        self.player_info.setWordWrap(True)
+        self.hist = muted_label("")
+        self.hist.setWordWrap(True)
+        ga.body.addWidget(self.player_info)
+        ga.body.addWidget(self.hist)
+        lay.addWidget(ga)
+
+        self.ports_card = CardBox("Outras portas abertas no aparelho (varredura)")
+        self.ports_lb = muted_label("")
+        self.ports_lb.setWordWrap(True)
+        self.ports_lb.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.ports_card.body.addWidget(self.ports_lb)
+        self.ports_card.setVisible(False)
+        lay.addWidget(self.ports_card)
+
+        adv = Collapsible("Avançado: portas, intervalo e varredura")
+        f2 = QFormLayout()
+        self.api_port = self.spin(1, 65535, 44642)
+        self.player_id = QLineEdit("1")
+        self.player_id.setMaximumWidth(200)
+        self.interval = self.spin(1, 300, 5, suffix=" s")
+        self.scan = QCheckBox("Listar e testar as outras portas abertas do aparelho (pode acionar serviços desconhecidos)")
+        self.keep = QCheckBox("Manter os redirecionamentos ao parar")
+        f2.addRow("Porta da API do player", self.api_port)
+        f2.addRow("Player", self.player_id)
+        f2.addRow("Verificar a cada", self.interval)
+        f2.addRow("", self.scan)
+        f2.addRow("", self.keep)
+        adv.content.addLayout(f2)
+        lay.addWidget(adv)
+        self.remember("adb", {"device": self.device, "adb_path": self.adb_path.edit, "poll": self.poll, "notify": self.notify, "api_port": self.api_port,
+                              "player_id": self.player_id, "interval": self.interval, "scan": self.scan, "keep": self.keep})
+
+        self.start_btn = self.primary("Iniciar", self.toggle)
+        self.copy_btn.clicked.connect(self.copy_local)
+        self.capture_btn.clicked.connect(self.to_capture)
+        self._reset()
+
+    # a página tem processo próprio: o estado "ocupado" do painel principal não a bloqueia
+    def set_busy(self, busy: bool):
+        pass
+
+    def update_buttons(self):
+        pass
+
+    def _reset(self):
+        for r in self.rows:
+            r.set(StatusIcon.PENDING, "")
+        self.rows[0].set(StatusIcon.PENDING, "Informe o aparelho e clique em Iniciar.")
+        self.capture_btn.setEnabled(False)
+        self.copy_btn.setEnabled(False)
+
+    def toggle(self):
+        if self.running:
+            self.start_btn.setEnabled(False)
+            self.runner.stop(False)
+            return
+        dev = self.device.text().strip()
+        if not dev:
+            self.show_error("Informe o IP do aparelho (ou o serial, se for USB).")
+            return
+        if not re.fullmatch(r"[\w.:\-]+", dev):
+            self.show_error("O aparelho deve ser um IP, IP:porta ou serial, sem espaços.")
+            return
+        self.show_error("")
+        self.state, self.history = {}, []
+        self.hist.setText("")
+        self.dev_url.clear()
+        self.loc_url.clear()
+        self.player_info.setText("")
+        self.ports_card.setVisible(False)
+        for r in self.rows:
+            r.set(StatusIcon.PENDING, "")
+        self.rows[0].set(StatusIcon.RUNNING, "Procurando o adb…")
+        a = ["adb-access", dev, "--api-port", str(self.api_port.value()), "--player-id", self.player_id.text().strip() or "1",
+             "--interval", str(self.interval.value())]
+        if self.poll.isChecked():
+            a.append("--watch")
+        if self.adb_path.text().strip():
+            a += ["--adb", self.adb_path.text().strip()]
+        if self.scan.isChecked():
+            a.append("--scan-ports")
+        if self.keep.isChecked():
+            a.append("--keep-forwards")
+        a += self.extra("adb-access")
+        if self.runner.start([Job("Acesso via ADB", a, kind="adb-access", page=self, meta={"quiet": True})]):
+            self._set_running(True)
+
+    def _set_running(self, on: bool):
+        self.running = on
+        self.start_btn.setText("Parar" if on else "Iniciar")
+        self.start_btn.setEnabled(True)
+        self.conn_card.setEnabled(not on)
+
+    def _finished(self, ok: bool):
+        self._set_running(False)
+        for r in self.rows:
+            if r.state == StatusIcon.RUNNING and not r.tag.text():
+                r.set(StatusIcon.PENDING, r.detail.text())
+
+    def handle_error(self, job, msg):
+        self.show_error(msg)
+        bad = next((r for r in self.rows if r.state != StatusIcon.DONE), self.rows[-1])
+        bad.set(StatusIcon.ERROR, msg)
+
+    # ── eventos do núcleo ──
+    def on_adb(self, d: dict):
+        self.state = d
+        R, S = self.rows, StatusIcon
+        R[0].set(S.DONE, "adb encontrado")
+        st, act = d.get("device_state", ""), d.get("action", "")
+        if st != "device":
+            R[1].set(S.RUNNING, act or f"Aguardando o aparelho (estado: {st or 'desconhecido'})…", on_device=bool(act))
+            for r in R[2:]:
+                r.set(S.PENDING, "")
+            return
+        R[1].set(S.DONE, d.get("serial", ""))
+        if not d.get("api_ok"):
+            R[2].set(S.ERROR, d.get("error") or "A API do player não respondeu.")
+            R[3].set(S.PENDING, "")
+            R[4].set(S.PENDING, "")
+            return
+        p = d.get("player") or {}
+        R[2].set(S.DONE, f"127.0.0.1:{self.api_port.value()} → player {self.player_id.text().strip() or '1'}")
+        info = []
+        for k, lb in (("state", "estado"), ("currTime", "tempo"), ("duration", "duração")):
+            if p.get(k) not in (None, ""):
+                info.append(f"{lb}: {p[k]}")
+        self.player_info.setText("Player — " + "; ".join(info) if info else "")
+        media = d.get("media", "")
+        self.dev_url.setText(media)
+        if not media:
+            R[3].set(S.RUNNING, "O player está sem mídia. Coloque um canal para tocar.", on_device=True)
+            R[4].set(S.PENDING, "")
+            self.loc_url.clear()
+        else:
+            R[3].set(S.DONE, media)
+            local = d.get("local_url", "")
+            self.loc_url.setText(local)
+            man = d.get("manifest", "")
+            if not local:
+                R[4].set(S.ERROR, d.get("error") or "Não foi possível redirecionar a porta.")
+            elif man.startswith("falhou"):
+                R[4].set(S.ERROR, f"{local} — o manifesto não respondeu ({man[8:]})")
+            else:
+                R[4].set(S.DONE, f"{local}" + (f" — manifesto {man}" if man else ""))
+        self.capture_btn.setEnabled(bool(d.get("local_url")))
+        self.copy_btn.setEnabled(bool(d.get("local_url")))
+        local = d.get("local_url", "")
+        if local and (not self.history or self.history[-1][1] != local):
+            self.history.append((time.strftime("%H:%M:%S"), local))
+            self.hist.setText("Endereços desta sessão:\n" + "\n".join(f"{t}  {u}" for t, u in self.history[-6:][::-1]))
+            if d.get("changed"):
+                self.show_error("")
+                if self.notify.isChecked():
+                    self.win.notifier.notify("Endereço do streaming mudou", f"Novo endereço local: {local}", "info")
+                    QApplication.alert(self.win)
+        if d.get("ports"):
+            self.ports_card.setVisible(True)
+            self.ports_lb.setText("\n".join(self._fmt_port(x) for x in d["ports"]))
+
+    @staticmethod
+    def _fmt_port(x: dict) -> str:
+        pr = x.get("probe") or {}
+        if pr.get("http"):
+            what = f"HTTP {pr['http'].get('status')} {pr['http'].get('content_type', '')}".strip()
+        elif pr.get("banner"):
+            what = "TCP: " + pr["banner"].strip().replace("\n", " ")[:80]
+        else:
+            what = pr.get("error") or "sem resposta"
+        return f"{x.get('port')}  —  {what}"
+
+    def copy_local(self):
+        u = self.state.get("local_url", "")
+        if u:
+            QGuiApplication.clipboard().setText(u)
+            self.show_error("")
+            self.msg.setText("Endereço copiado.")
+
+    def to_capture(self):
+        u = self.state.get("local_url", "")
+        if not u:
+            return
+        self.win.pages["dash"].url.setText(u)
+        self.win.nav.setCurrentRow(self.win.nav.row(self.win._nav_icons["dash"]))
+# BUILD-REMOVE-END-4
+
+
 class NavDelegate(QStyledItemDelegate):
     """Item de navegação 100% nativo (inclusive o destaque do item atual); só define a altura de linha do Fluent (40 px; seções 32 px)."""
 
@@ -2150,6 +2467,9 @@ class MainWindow(QMainWindow):
             self._nav_page[self.nav.row(it)] = idx
 
         section("Origem")
+        # BUILD-REMOVE-START-3
+        add("adb", AdbPage)
+        # BUILD-REMOVE-END-3
         add("dash", DashPage)
         section("Edição")
         add("frame", FramePage)

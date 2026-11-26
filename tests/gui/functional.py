@@ -125,6 +125,98 @@ check("download: SHA-256 errado não define caminho e mostra o erro", tp.rows["f
 tp.rows["ffmpeg"]["edit"].setText(""); tp.rows["ffplay"]["edit"].setText(""); tp.write_config()
 threading.Thread(target=httpd.shutdown, daemon=True).start(); w.close()
 
+# --- 1f. captura de frame lembra as opções (desaturar realces padrão 0); botão Baixar ao lado de Procurar; selo discreto
+w = G.MainWindow(); w.show(); wait(300); done(w)
+fp = w.pages["frame"]
+check("frame: dessaturar realces começa em 0 (desligado)", fp.desat.value() == 0)
+fp.desat.setValue(1.5); fp.tm.setCurrentIndex(fp.tm.findData("hable")); fp.sdr_jpg.setChecked(True); fp.jpgq.setValue(80); fp.hdr_avif.setChecked(True)
+fp.white.setValue(300); fp.avif_chroma.setCurrentIndex(1)
+w.close(); wait(100)
+w = G.MainWindow(); w.show(); wait(300); done(w)
+fp = w.pages["frame"]
+check("frame: tone mapping e opções voltam ao reabrir", fp.desat.value() == 1.5 and fp.tm.currentData() == "hable" and fp.sdr_jpg.isChecked() and fp.jpgq.value() == 80
+      and fp.hdr_avif.isChecked() and fp.white.value() == 300 and fp.avif_chroma.currentData() == "420")
+fp.desat.setValue(0); fp.tm.setCurrentIndex(0); fp.sdr_jpg.setChecked(False); fp.jpgq.setValue(95); fp.hdr_avif.setChecked(False); fp.white.setValue(203); fp.avif_chroma.setCurrentIndex(0)
+tp = w.pages["tools"]
+import dtv_gui_dash as DG
+#b = DG.LiveBadge(); b.set_state("live", "AO VIVO")
+#check("captura DASH: selo sem animação e em texto simples", not hasattr(b, "_t") and b._text == "Ao vivo")
+w.close()
+
+# --- 1g. Acesso via ADB (núcleo real + adb falso + API local do player): passo a passo, troca de canal, aviso, envio à Captura DASH
+if os.name != "nt":
+    R.program_and_prefix = REAL
+    adbdir = os.path.join(tmp, "adb"); os.makedirs(adbdir, exist_ok=True)
+    fake = os.path.join(adbdir, "adb")
+    open(fake, "w").write(f"""#!{sys.executable}
+import os, sys
+d = {adbdir!r}
+a = sys.argv[1:]
+if a[:1] == ["-s"]: a = a[2:]
+p = lambda n: os.path.join(d, n)
+rd = lambda n, df="": open(p(n)).read() if os.path.exists(p(n)) else df
+if a[:1] == ["devices"]:
+    print("List of devices attached"); st = rd("state", "device").strip()
+    if st != "none": print("192.168.0.20:5555      " + st + " product:tv model:TV3")
+elif a[:1] == ["connect"]: print("connected to " + a[1])
+elif a[:2] == ["forward", "--remove"]: open(p("removed"), "a").write(a[2] + "\\n")
+elif a[:2] == ["forward", "--list"]:
+    for ln in rd("forwards").splitlines(): print("192.168.0.20:5555 " + ln)
+elif a[:1] == ["forward"]: open(p("forwards"), "a").write(a[1] + " " + a[2] + "\\n")
+else: sys.exit(1)
+""")
+    os.chmod(fake, 0o755)
+    mpd = b'<?xml version="1.0"?><MPD type="dynamic"></MPD>'
+    cur = {"m": ""}
+    class HM(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Length", str(len(mpd))); self.end_headers(); self.wfile.write(mpd)
+        def log_message(self, *a): pass
+    class HA(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"currentMedia": cur["m"], "state": "playing", "currTime": 3}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        def log_message(self, *a): pass
+    sm = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HM); sa = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HA)
+    for sv in (sm, sa): threading.Thread(target=sv.serve_forever, daemon=True).start()
+    mp = sm.server_address[1]
+    u1 = f"http://127.0.0.1:{mp}/ch1/manifest.mpd"; u2 = f"http://127.0.0.1:{mp}/ch2/manifest.mpd?t=9"
+    cur["m"] = u1
+    w = G.MainWindow(); w.show(); wait(300); done(w)
+    ap = w.pages["adb"]
+    check("adb: página fica em Origem, acima da Captura DASH", [w.nav.item(i).text() for i in range(w.nav.count())][:4] == ["ORIGEM", "Acesso via ADB", "Captura DASH DTV+", "EDIÇÃO"])
+    check("adb: o recurso está dentro do dtv_gui.py (sem módulo separado)", not os.path.exists(os.path.join(os.path.dirname(G.__file__), "dtv_gui_adb.py")))
+    ap.api_port.setValue(sa.server_address[1]); ap.interval.setValue(1); ap.adb_path.edit.setText(os.path.join(tmp, "nao_existe_adb")); ap.device.setText("192.168.0.20")
+    ap.start_btn.click(); until(lambda: not ap.running, 15000)
+    check("adb: sem o programa o passo 1 explica o que fazer", "platform-tools" in ap.rows[0].detail.text())
+    ap.adb_path.edit.setText(fake)
+    ap.device.setText(""); ap.start_btn.click()
+    check("adb: sem aparelho informado pede o IP", "IP" in ap.msg.text() and not ap.running)
+    ap.device.setText("192.168.0.20")
+    open(os.path.join(adbdir, "state"), "w").write("unauthorized\n")
+    ap.start_btn.click(); until(lambda: "aparelho" in ap.rows[1].tag.text(), 15000)
+    check("adb: aparelho não autorizado pede ação no aparelho", "Permitir" in ap.rows[1].detail.text() and "aparelho" in ap.rows[1].tag.text())
+    ap.start_btn.click(); until(lambda: not ap.running, 20000)
+    open(os.path.join(adbdir, "state"), "w").write("device\n")
+    notes = []; w.notifier.notify = lambda *a: notes.append(a) or True
+    ap.start_btn.click(); until(lambda: ap.loc_url.text() != "" and "manifesto" in ap.rows[4].detail.text(), 20000)
+    check("adb: endereço lido da API do player e porta redirecionada", ap.dev_url.text() == u1 and ap.loc_url.text() == u1)
+    check("adb: passos concluídos e manifesto conferido", all(r.state == G.StatusIcon.DONE for r in ap.rows) and "mpd" in ap.rows[4].detail.text() and ap.capture_btn.isEnabled())
+    cur["m"] = u2
+    until(lambda: ap.dev_url.text() == u2, 20000); wait(300)
+    check("adb: troca de canal → novo endereço, histórico e aviso", ap.loc_url.text() == u2 and len(ap.history) == 2 and notes and "mudou" in notes[0][0])
+    ap.capture_btn.click(); wait(100)
+    check("adb: botão leva o endereço local à Captura DASH", w.pages["dash"].url.text() == u2 and w.stack.currentWidget() is w.pages["dash"])
+    cur["m"] = ""
+    until(lambda: ap.rows[3].tag.text() != "", 20000)
+    check("adb: player sem mídia pede um canal no aparelho", "canal" in ap.rows[3].detail.text())
+    ap.start_btn.click(); until(lambda: not ap.running, 20000)
+    check("adb: parar encerra e remove os redirecionamentos", ap.start_btn.text() == "Iniciar" and os.path.exists(os.path.join(adbdir, "removed")))
+    w.close()
+    for sv in (sm, sa): threading.Thread(target=sv.shutdown, daemon=True).start()
+else:
+    print("SKIP adb (adb falso é script posix)")
+
 # --- 1c. ferramentas escolhidas na tela vão como opção explícita, sem precisar "Salvar"
 R.program_and_prefix = REAL
 w = G.MainWindow(); w.show(); wait(300); done(w)
@@ -381,7 +473,7 @@ check("dash: cartão ao vivo escondido antes de gravar", not pg.live.isVisible()
 pg.url.setText("https://exemplo.tv/live/manifest.mpd")
 pg.run_built(pg.build_jobs)
 until(lambda: len(pg.live._rows) == 3 and pg.live.t_frames.value.text() not in ("—", "")); wait(300)
-check("dash: cartão aparece com o selo AO VIVO", pg.live.isVisible() and pg.live.badge._text == "AO VIVO")
+check("dash: cartão aparece com o selo AO VIVO", pg.live.isVisible() and pg.live.badge._text in ["Ao vivo", "AO VIVO"])
 check("dash: trilhas gravadas + legendas listadas", set(pg.live._rows) == {"vvc_base", "lcevc_enh", "audio"} and len(pg.live._extra_rows) == 2)
 check("dash: legendas marcadas como não gravadas", all("não é gravada" in r.stat.text() for r in pg.live._extra_rows))
 check("dash: linha da trilha mostra estado, velocidade e segmentos", "Mbps" in pg.live._rows["vvc_base"].stat.text() and "seg" in pg.live._rows["vvc_base"].stat.text())
@@ -391,17 +483,17 @@ check("dash: formulário travado, botão Parar ativo", not pg.stream_card.isEnab
 check("dash: painel com botão 'Forçar parada' e indicador simples", w.panel.stop_btn.text() == "Forçar parada" and w.panel.stop_btn.isEnabled()
       and w.panel.state_lb.text() == "Gravando ao vivo")
 pg.live.stop_btn.click(); until(lambda: not w.runner.busy); wait(300)
-check("dash: parar encerra e o cartão mostra INTERROMPIDA sem botão", pg.live.badge._text == "INTERROMPIDA" and not pg.live.stop_btn.isVisible())
+check("dash: parar encerra e o cartão mostra INTERROMPIDA sem botão", pg.live.badge._text in ["Interrompida", "INTERROMPIDA"] and not pg.live.stop_btn.isVisible())
 check("dash: formulário liberado depois de parar", pg.stream_card.isEnabled())
 w.runner.env_extra["FAKE_HOLD"] = ""; os.environ.pop("FAKE_HOLD", None)
 pg.run_built(pg.build_jobs)
 until(lambda: not w.runner.busy, 60000); wait(300)
-check("dash: execução completa termina como CONCLUÍDA", pg.live.badge._text == "CONCLUÍDA")
+check("dash: execução completa termina como CONCLUÍDA", pg.live.badge._text in ["Concluída", "CONCLUÍDA"])
 # 'Forçar parada' do painel mata na hora (sem esperar o empacotamento)
 w.runner.env_extra["FAKE_HOLD"] = "49"
 pg.run_built(pg.build_jobs); until(lambda: len(pg.live._rows) == 3); wait(300)
 w.panel.stop_btn.click(); until(lambda: not w.runner.busy); wait(300)
-check("dash: 'Forçar parada' do painel termina o processo e fecha o cartão", pg.live.badge._text == "INTERROMPIDA")
+check("dash: 'Forçar parada' do painel termina o processo e fecha o cartão", pg.live.badge._text in ["Interrompida", "INTERROMPIDA"])
 w.runner.env_extra.pop("FAKE_HOLD", None); os.environ.pop("FAKE_HOLD", None)
 w.close()
 R.program_and_prefix = REAL

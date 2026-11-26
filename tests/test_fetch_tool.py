@@ -172,10 +172,10 @@ def test_lima_package_covers_the_four_programs_in_one_folder(server, tmp_path, m
     api = root / "repos" / "o" / "r" / "releases"
     api.mkdir(parents=True)
     (api / "latest").write_text(json.dumps({"tag_name": "t1", "assets": [{"name": "pkg-win64-static-limaalef.zip", "browser_download_url": f"{base}/pkg-win64-static-limaalef.zip", "digest": "sha256:" + sha}]}))
-    monkeypatch.setitem(d.TOOL_SOURCES["mpegh_decoder"]["assets"], d.source_platform_key(), dict(d._LIMA, github="o/r"))
+    monkeypatch.setitem(d.TOOL_SOURCES["mpegh_decoder"]["assets"], d.source_platform_key(), dict(d._lima(r"win64-static-limaalef\.zip$"), github="o/r"))
     monkeypatch.setenv("DTV_GITHUB_API", base)
     env = dict(os.environ, DTV_GITHUB_API=base, PYTHONPATH=str(ROOT))
-    code = ("import sys,dtv_tools as d; d.TOOL_SOURCES['mpegh_decoder']['assets'][d.source_platform_key()]=dict(d._LIMA, github='o/r'); "
+    code = ("import sys,dtv_tools as d; d.TOOL_SOURCES['mpegh_decoder']['assets'][d.source_platform_key()]=dict(d._lima(r'win64-static-limaalef\.zip$'), github='o/r'); "
             "sys.argv=['x','fetch-tool','mpegh_decoder','--accept-license','--dest',sys.argv[1],'--json']; sys.exit(d.main())")
     r = subprocess.run([sys.executable, "-c", code, str(tmp_path / "i")], capture_output=True, text=True, env=env, timeout=120)
     evs = [json.loads(x) for x in r.stdout.splitlines() if x.startswith("{")]

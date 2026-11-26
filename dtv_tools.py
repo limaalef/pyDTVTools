@@ -6390,7 +6390,7 @@ def tone_curve(name, x, peak):
     return np.where(x <= j, x, (b * b + 2 * b * j + j * j) / (b - a) * (x + a) / (x + b))
 
 
-def tonemap_sdr(rgb16, hdr, algo, white, peak_nits, exposure=0.0, desat=2.0, saturation=1.0):
+def tonemap_sdr(rgb16, hdr, algo, white, peak_nits, exposure=0.0, desat=0.0, saturation=1.0):
     """
     PQ BT.2020 (uint16, full range) -> 8-bit sRGB/BT.709. The curve acts on max(R,G,B) (hue-preserving).
     white: HDR nits that become SDR white (higher = darker image); exposure: stops; desat: highlight desaturation
@@ -6665,21 +6665,29 @@ def cmd_play(a):
 # ──────────────────────────── assisted download of programs ────────────────────────────
 _BTBN = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
 _LIMA_REPO = "limaalef/ffmpeg-autobuild-lcevc-mpegh"
-_LIMA_NOTICE = ("Pacote do projeto limaalef/ffmpeg-autobuild-lcevc-mpegh (GitHub): ffmpeg, ffplay, ffprobe, mpeghDecoder e mpeghUIManager já "
-                "compilados com VVC, LCEVC (V-Nova) e MPEG-H (Fraunhofer), só para Windows x64. A build é estática e inclui componentes GPL/não-livres "
-                "(libx265, libfdk-aac...), então não pode ser redistribuída livremente, e o LCEVCdec e o mpeghdec têm licenças próprias: confira "
-                "as licenças de cada componente antes de usar ou compartilhar. O arquivo é conferido pelo SHA-256 que o GitHub publica para a release.")
-_LIMA = {"github": _LIMA_REPO, "asset": r"win64-static-limaalef\.zip$", "package": "ffmpeg-lcevc-mpegh"}
+_LIMA_NOTICE = ("Pacote do projeto limaalef/ffmpeg-autobuild-lcevc-mpegh (GitHub): ffmpeg, ffprobe, ffplay, mpeghDecoder e mpeghUIManager já "
+                "compilados com VVC, LCEVC (V-Nova) e MPEG-H (Fraunhofer), para Windows x64, Linux x64 (glibc 2.39 ou mais nova; sem ffplay) e "
+                "macOS Intel/Apple Silicon (macOS 11 ou mais novo). A build inclui componentes GPL/não-livres (libx265, libfdk-aac...), então não "
+                "pode ser redistribuída livremente, e o LCEVCdec e o mpeghdec têm licenças próprias: confira as licenças de cada componente antes "
+                "de usar ou compartilhar. O arquivo é conferido pelo SHA-256 publicado na release (digest do GitHub ou SHA256SUMS.txt).")
+
+
+def _lima(pattern):
+    return {"github": _LIMA_REPO, "asset": pattern, "package": "ffmpeg-lcevc-mpegh"}
+
+
+_LIMA_ASSETS = {"win64": _lima(r"win64-static-limaalef\.zip$"), "linux64": _lima(r"linux64-static-limaalef\.tar\.xz$"),
+                "macos-intel": _lima(r"macos-intel-limaalef\.zip$"), "macos-arm64": _lima(r"macos-arm64-limaalef\.zip$")}
 _PKG = ("ffmpeg", "ffplay", "mpegh_ui", "mpegh_decoder")
 TOOL_SOURCES = {}
 for _k in _PKG:
     TOOL_SOURCES[_k] = {
-        "title": "Pacote FFmpeg + LCEVC + MPEG-H (limaalef, Windows x64)",
+        "title": "Pacote FFmpeg + LCEVC + MPEG-H (limaalef)",
         "provides": _PKG,
         "license": "GPL v3 e licenças próprias de LCEVCdec (V-Nova) e mpeghdec (Fraunhofer)",
         "license_url": "https://github.com/" + _LIMA_REPO,
         "notice": _LIMA_NOTICE,
-        "assets": {"win64": dict(_LIMA)},
+        "assets": {k: dict(v) for k, v in _LIMA_ASSETS.items()},
     }
 _BTBN_SRC = {
     "title": "FFmpeg + ffplay (builds automáticas BtbN, GPL)",
@@ -6688,14 +6696,13 @@ _BTBN_SRC = {
     "license_url": "https://www.ffmpeg.org/legal.html",
     "notice": ("O FFmpeg é software livre; esta build usa a licença GPL v3, que impõe condições à redistribuição (inclusive do que você "
                "empacotar com ela). Os arquivos vêm de github.com/BtbN/FFmpeg-Builds, não do projeto FFmpeg, e são conferidos pelo SHA-256 "
-               "publicado na mesma página. Esta build NÃO tem o filtro lcevc nem MPEG-H: para isso use o pacote limaalef (Windows) ou a sua build."),
+               "publicado na mesma página. Esta build NÃO tem o filtro lcevc nem MPEG-H: para isso use a sua build."),
     "assets": {
         "winarm64": {"url": _BTBN + "ffmpeg-master-latest-winarm64-gpl.zip", "sha256_url": _BTBN + "checksums.sha256", "package": "ffmpeg-btbn"},
-        "linux64": {"url": _BTBN + "ffmpeg-master-latest-linux64-gpl.tar.xz", "sha256_url": _BTBN + "checksums.sha256", "package": "ffmpeg-btbn"},
         "linuxarm64": {"url": _BTBN + "ffmpeg-master-latest-linuxarm64-gpl.tar.xz", "sha256_url": _BTBN + "checksums.sha256", "package": "ffmpeg-btbn"},
     },
 }
-for _k in ("ffmpeg", "ffplay"):                     # outros sistemas: só o ffmpeg/ffplay genérico
+for _k in ("ffmpeg", "ffplay"):                     # sem pacote do limaalef (Windows/Linux ARM64): o ffmpeg/ffplay genérico
     for _plat, _asset in _BTBN_SRC["assets"].items():
         TOOL_SOURCES[_k]["assets"].setdefault(_plat, _asset)
 TOOL_SOURCES["mp4box"] = {
@@ -6720,7 +6727,7 @@ def source_platform_key():
         return "winarm64" if arm else "win64"
     if sys.platform.startswith("linux"):
         return "linuxarm64" if arm else "linux64"
-    return "macos"
+    return "macos-arm64" if arm else "macos-intel"
 
 
 def tool_source_info(key):
@@ -6746,9 +6753,11 @@ def resolve_github_asset(repo, pattern, timeout):
             sha = dg.split(":", 1)[1].lower() if dg.lower().startswith("sha256:") else ""
             if not sha:                                          # a sibling '<asset>.sha256' file, if the project publishes one
                 for b in rel.get("assets") or []:
-                    if b.get("name") in (a["name"] + ".sha256", a["name"] + ".sha256sum"):
+                    if b.get("name") in (a["name"] + ".sha256", a["name"] + ".sha256sum", "SHA256SUMS.txt", "SHA256SUMS", "checksums.sha256"):
                         with http_open(b["browser_download_url"], timeout) as r2:
-                            sha = parse_checksums(r2.read(100_000).decode("utf-8", "replace"), a["name"]) or ""
+                            sha = parse_checksums(r2.read(200_000).decode("utf-8", "replace"), a["name"]) or ""
+                        if sha:
+                            break
             return a["browser_download_url"], sha, rel.get("tag_name", "")
     raise Fail(f"A última release de {repo} não tem arquivo '{pattern}'.")
 
@@ -6941,8 +6950,10 @@ def cmd_fetch_tool(a):
     except Fail:
         raise
     found = find_programs(target, info["provides"] + [key])
-    if key not in found:
+    if not found:
         raise Fail(f"Não achei o {TOOL_DEFS[key]['label']} dentro do arquivo baixado ({target}).")
+    if key not in found:
+        note(f"Este pacote não traz o {TOOL_DEFS[key]['label']} (fica sem; os demais foram instalados).")
     marker.write_text(json.dumps({"tool": key, "url": url, "sha256": digest, "verified": verified, "license": info["license"],
                                   "date": time.strftime("%Y-%m-%d %H:%M:%S")}, ensure_ascii=False, indent=1), encoding="utf-8")
     step("install", "done")
@@ -6951,8 +6962,9 @@ def cmd_fetch_tool(a):
         say(f"{TOOL_DEFS[k]['label']}: {pth}", "ok")
     rows = [["Programa", TOOL_DEFS[key]["label"]], ["Origem", url], ["SHA-256", digest + ("  (conferido)" if verified else "  (NÃO verificado)")],
             ["Licença", info["license"] or "do autor"], ["Pasta", str(target)]]
-    ev(type="result", out=found[key], outputs=[], notes=NOTES, rows=rows,
-       installed={"tool": key, "path": found[key], "found": found, "sha256": digest, "verified": verified, "url": url, "size": got, "dir": str(target)})
+    first = found.get(key) or next(iter(found.values()))
+    ev(type="result", out=first, outputs=[], notes=NOTES, rows=rows,
+       installed={"tool": key, "path": found.get(key, ""), "found": found, "sha256": digest, "verified": verified, "url": url, "size": got, "dir": str(target)})
     step("report", "done")
     progress("report", 1.0, force=True)
     return 0
@@ -6961,6 +6973,316 @@ def cmd_fetch_tool(a):
 def find_programs_name(filename, keys):
     low = filename.lower()
     return any(low.startswith(n.lower()) for k in keys for n in TOOL_DEFS[k]["names"])
+
+
+# BUILD-REMOVE-START-ADB
+# ──────────────────────────── Acesso via ADB (fora das compilações) ────────────────────────────
+ADB_API_PORT = 44642
+PLATFORM_TOOLS_URL = "https://developer.android.com/tools/releases/platform-tools"
+
+
+def find_adb(given=""):
+    """adb: the given path, PATH, the Android SDK (ANDROID_HOME / ANDROID_SDK_ROOT / default folder) or ./platform-tools. '' when none."""
+    names = ("adb.exe", "adb") if os.name == "nt" else ("adb",)
+    if given:
+        return given if os.path.isfile(given) else ""
+    w = shutil.which("adb")
+    if w:
+        return w
+    roots = [os.environ.get("ANDROID_HOME", ""), os.environ.get("ANDROID_SDK_ROOT", "")]
+    if os.name == "nt":
+        roots.append(os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk"))
+    elif sys.platform == "darwin":
+        roots.append(os.path.expanduser("~/Library/Android/sdk"))
+    else:
+        roots.append(os.path.expanduser("~/Android/Sdk"))
+    here = Path(__file__).resolve().parent
+    cands = [os.path.join(r, "platform-tools", n) for r in roots if r for n in names]
+    cands += [str(here / "platform-tools" / n) for n in names] + [str(here.parent / "platform-tools" / n) for n in names]
+    return next((c for c in cands if os.path.isfile(c)), "")
+
+
+def adb_serial(device):
+    """-> (serial, over_network). 'IP' becomes 'IP:5555'; 'IP:port' is kept; anything else is a USB serial."""
+    d = device.strip()
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", d):
+        return d + ":5555", True
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}:\d+", d):
+        return d, True
+    return d, False
+
+
+def parse_adb_devices(text):
+    """`adb devices -l` -> [{serial, state, desc}]."""
+    out = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith(("List of", "*")):
+            continue
+        parts = ln.split(None, 2)
+        if len(parts) >= 2:
+            out.append({"serial": parts[0], "state": parts[1], "desc": parts[2] if len(parts) > 2 else ""})
+    return out
+
+
+def parse_forward_list(raw):
+    """`adb forward --list` -> [{serial, local, remote}]."""
+    out = []
+    for ln in raw.splitlines():
+        p = ln.split()
+        if len(p) >= 3:
+            out.append({"serial": p[0], "local": p[1], "remote": p[2]})
+    return out
+
+
+def media_local_url(current_media):
+    """currentMedia (an address on 127.0.0.1 INSIDE the device) -> (port, same address on this computer)."""
+    from urllib.parse import urlsplit
+    u = urlsplit(current_media)
+    if not u.port:
+        raise Fail(f"Não consegui extrair a porta de '{current_media}'")
+    return u.port, f"{u.scheme}://127.0.0.1:{u.port}{u.path}" + (f"?{u.query}" if u.query else "")
+
+
+def parse_proc_net_tcp(raw):
+    """/proc/net/tcp(6) -> [(ip, port)] in LISTEN (state 0A)."""
+    res = []
+    for ln in raw.strip().splitlines()[1:]:
+        p = ln.split()
+        if len(p) < 4 or p[3].upper() != "0A" or ":" not in p[1]:
+            continue
+        ip_hex, port_hex = p[1].split(":")
+        try:
+            port = int(port_hex, 16)
+        except ValueError:
+            continue
+        ip = ".".join(str(x) for x in reversed(bytes.fromhex(ip_hex))) if len(ip_hex) == 8 else ip_hex
+        res.append((ip, port))
+    return res
+
+
+def parse_netstat_listen(raw):
+    """`netstat -tln` / `ss -tln` -> [(ip, port)] in LISTEN."""
+    res = []
+    for ln in raw.splitlines():
+        if "LISTEN" not in ln.upper():
+            continue
+        m = re.search(r"([\d\.\*]+|\[?::1?\]?):(\d+)\s", ln.strip() + " ")
+        if m:
+            res.append((m.group(1), int(m.group(2))))
+    return res
+
+
+def adb_run(adb, args, timeout=15):
+    """-> (returncode, stdout, stderr); never raises (a hung or missing adb comes back as rc -1/-2)."""
+    try:
+        r = sp_run([adb, *args], capture_output=True, text=True, errors="replace", timeout=timeout, **NOWIN)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return -2, "", "tempo esgotado"
+    except OSError as e:
+        return -1, "", str(e)
+
+
+def adb_probe_port(port, timeout=2.5):
+    """What answers on a forwarded local port: HTTP first, then a raw TCP banner."""
+    import socket
+    try:
+        with http_open(f"http://127.0.0.1:{port}/", timeout) as r:
+            return {"http": {"status": r.status, "content_type": r.headers.get("Content-Type", ""), "snippet": r.read(200).decode("utf-8", "replace")},
+                    "banner": None, "error": None}
+    except Fail:
+        pass
+    res = {"http": None, "banner": None, "error": None}
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sk:
+            sk.settimeout(timeout)
+            try:
+                data = sk.recv(200)
+            except socket.timeout:
+                data = b""
+            res["banner"] = data.decode("utf-8", "replace") if data else "(conectou, sem resposta)"
+    except OSError as e:
+        res["error"] = str(e)[:150]
+    return res
+
+
+def cmd_adb_access(a):
+    """
+    Connects to a TV 3.0 receiver with adb, forwards the port of its media-player API, reads `currentMedia` (an address on the device's
+    own loopback) and forwards that port too, so the stream can be captured from this computer. With --watch it repeats every
+    --interval seconds and redoes the forward when the address changes (new channel, signal loss). Stop = Ctrl+C / stop command.
+    """
+    set_steps([("connect", "Conectar ao aparelho"), ("watch", "Acompanhar o endereço")])
+    set_stages({"connect": 30, "watch": 70})
+    step("connect", "running")
+    adb = find_adb(a.adb)
+    if not adb:
+        raise Fail(f"adb não encontrado. Instale o Android platform-tools ({PLATFORM_TOOLS_URL}) ou informe o caminho com --adb.")
+    serial, net = adb_serial(a.device)
+    say(f"adb: {adb}", "ok")
+    made = {"api": False, "media": 0, "scan": set()}          # forwards this run created (removed when it ends)
+    state = {"device_state": "", "action": "", "api_ok": False, "player": None, "media": "", "media_port": 0, "local_url": "", "changed": False,
+             "manifest": "", "forwards": [], "ports": [], "error": "", "cycle": 0, "serial": serial}
+
+    def emit():
+        ev(type="adb", **{k: v for k, v in state.items()})
+
+    def device_state():
+        rc, out, err = adb_run(adb, ["devices", "-l"], 15)
+        if rc != 0:
+            return "", err or out or "o adb não respondeu"
+        for d in parse_adb_devices(out):
+            if d["serial"] == serial:
+                return d["state"], ""
+        return "absent", ""
+
+    def ensure_connected(deadline):
+        """Waits until the device is in state 'device'; says what to do on the device otherwise."""
+        tried = False
+        while True:
+            if net and not tried:
+                tried = True
+                rc, out, err = adb_run(adb, ["connect", a.device if ":" in a.device else a.device], 20)
+                log(f"adb connect: {out or err}")
+            st, err = device_state()
+            state["device_state"], state["error"] = st, err
+            if st == "device":
+                state["action"] = ""
+                return True
+            state["action"] = {"unauthorized": "No aparelho: toque em “Permitir depuração” para autorizar este computador.",
+                               "offline": "No aparelho: desative e ative de novo a depuração (ou reconecte o cabo).",
+                               "absent": "No aparelho: ative a depuração por Wi-Fi/USB e confira o endereço IP."}.get(st, "")
+            emit()
+            if time.time() > deadline:
+                return False
+            if net and st in ("absent", "offline"):
+                tried = False
+            time.sleep(min(2.0, a.interval))
+
+    def forward(local, remote):
+        rc, out, err = adb_run(adb, ["-s", serial, "forward", f"tcp:{local}", f"tcp:{remote}"], 15)
+        if rc != 0:
+            raise Fail(f"Falha no adb forward tcp:{local}: {err or out}")
+
+    def unforward(port):
+        adb_run(adb, ["-s", serial, "forward", "--remove", f"tcp:{port}"], 10)
+
+    def list_forwards():
+        rc, out, err = adb_run(adb, ["-s", serial, "forward", "--list"], 10)
+        return [f for f in parse_forward_list(out) if f["serial"] == serial] if rc == 0 else []
+
+    def fetch_player():
+        with http_open(f"http://127.0.0.1:{a.api_port}/tv3/mediaplayers/{a.player_id}", 5) as r:
+            return json.loads(r.read(2_000_000).decode("utf-8", "replace"))
+
+    def scan(exclude):
+        listening = []
+        for cmd, parser in ((["shell", "cat", "/proc/net/tcp"], parse_proc_net_tcp), (["shell", "netstat", "-tln"], parse_netstat_listen),
+                            (["shell", "ss", "-tln"], parse_netstat_listen)):
+            rc, out, err = adb_run(adb, ["-s", serial, *cmd], 15)
+            if rc == 0 and out:
+                listening = parser(out)
+                if listening:
+                    break
+        seen, res = set(), []
+        for ip, port in listening:
+            if port in seen or port in exclude:
+                continue
+            seen.add(port)
+            try:
+                forward(port, port)
+                made["scan"].add(port)
+                probe = adb_probe_port(port)
+                ok = True
+            except Fail:
+                probe, ok = {"http": None, "banner": None, "error": "forward falhou"}, False
+            res.append({"port": port, "address": ip, "forwarded": ok, "probe": probe})
+        return sorted(res, key=lambda r: r["port"])
+
+    last_media = None
+    try:
+        if not ensure_connected(time.time() + (a.connect_timeout if a.watch else a.connect_timeout)):
+            raise Fail(f"O aparelho {serial} não ficou disponível (estado: {state['device_state'] or 'desconhecido'}). {state['action']}".strip())
+        say(f"Aparelho conectado: {serial}", "ok")
+        step("connect", "done", serial)
+        step("watch", "running")
+        while True:
+            state["cycle"] += 1
+            state["changed"], state["error"] = False, ""
+            st, err = device_state()
+            state["device_state"] = st
+            if st != "device":
+                state["action"], state["error"] = "No aparelho: confira a conexão e a depuração.", err
+                emit()
+                if not a.watch:
+                    raise Fail("O aparelho deixou de responder.")
+                if not ensure_connected(time.time() + 3600):
+                    raise Fail("O aparelho não voltou.")
+                continue
+            state["action"] = ""
+            try:
+                if not made["api"] or not any(f["local"] == f"tcp:{a.api_port}" for f in list_forwards()):
+                    forward(a.api_port, a.api_port)
+                    made["api"] = True
+                data = fetch_player()
+                state["api_ok"], state["player"] = True, data
+            except Fail as e:
+                state["api_ok"], state["error"] = False, f"API do player ({a.api_port}): {e}"
+                log(f"ERRO ao consultar a API: {e}")
+                emit()
+                if not a.watch:
+                    raise
+                time.sleep(a.interval)
+                continue
+            media = data.get("currentMedia") or ""
+            state["media"] = media
+            if not media:
+                state["local_url"], state["media_port"] = "", 0
+                state["action"] = "No aparelho: coloque um canal para tocar (o player está sem mídia)."
+            elif media != last_media:
+                try:
+                    port, url = media_local_url(media)
+                    if made["media"] and made["media"] != port and made["media"] != a.api_port:
+                        unforward(made["media"])
+                    forward(port, port)
+                    made["media"] = port
+                    state.update(media_port=port, local_url=url, changed=last_media is not None)
+                    last_media = media
+                    say(f"Mídia disponível localmente em: {url}", "ok")
+                except Fail as e:
+                    state["error"] = str(e)
+                    log(f"ERRO ao fazer forward da mídia: {e}")
+            if state["local_url"]:
+                try:
+                    with http_open(state["local_url"], 4) as r:
+                        head = r.read(400).decode("utf-8", "replace")
+                    state["manifest"] = "mpd" if "<MPD" in head.upper() else f"http {r.status}"
+                except Fail as e:
+                    state["manifest"] = f"falhou: {e}"
+            else:
+                state["manifest"] = ""
+            if a.scan_ports:
+                try:
+                    state["ports"] = scan({a.api_port, state["media_port"]})
+                except Fail as e:
+                    note(f"Varredura de portas: {e}")
+            state["forwards"] = list_forwards()
+            emit()
+            if not a.watch:
+                break
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        say("Acompanhamento encerrado.", "ok")
+    finally:
+        if not a.keep_forwards:
+            for port in ([a.api_port] if made["api"] else []) + ([made["media"]] if made["media"] else []) + sorted(made["scan"]):
+                unforward(port)
+    step("watch", "done")
+    rows = [["Aparelho", serial], ["Mídia no aparelho", state["media"] or "—"], ["Endereço local", state["local_url"] or "—"]]
+    ev(type="result", out=state["local_url"], outputs=[], notes=NOTES, rows=rows, adb={k: state[k] for k in ("serial", "media", "local_url", "media_port")})
+    return 0
+# BUILD-REMOVE-END-ADB
 
 
 def cmd_sdr(a):
@@ -7160,7 +7482,7 @@ def build_parser():
         sp.add_argument("--white-nits", type=float, default=203.0, help="HDR nits that become SDR white (higher = darker; default 203)")
         sp.add_argument("--peak-nits", type=float, default=0, help="HDR peak for the roll-off (default: MaxCLL, else mastering max)")
         sp.add_argument("--exposure", type=float, default=0.0, help="stops added before tone mapping (negative = darker)")
-        sp.add_argument("--desat", type=float, default=2.0, help="highlight desaturation, 0 = off (default 2, like ffmpeg tonemap)")
+        sp.add_argument("--desat", type=float, default=0.0, help="highlight desaturation, 0 = off (default 0; ffmpeg tonemap uses 2)")
         sp.add_argument("--saturation", type=float, default=1.0, help="final saturation multiplier (e.g. 0.85 = less vivid)")
         sp.add_argument("--jpg-quality", type=int, default=95)
 
@@ -7294,6 +7616,24 @@ def build_parser():
     s_ft.add_argument("-v", "--verbose", action="store_true")
     s_ft.add_argument("--no-color", action="store_true")
     s_ft.add_argument("--ascii", action="store_true")
+
+    # BUILD-REMOVE-START-ADB
+    s_adb = sub.add_parser("adb-access", help="connect to a TV 3.0 receiver by adb, forward its media port and report the stream address (source only)")
+    s_adb.add_argument("device", help="IP (or IP:port) of the device, or the adb serial of a USB one")
+    s_adb.add_argument("--adb", default="", metavar="PATH", help="adb executable (default: PATH, Android SDK or ./platform-tools)")
+    s_adb.add_argument("--api-port", type=int, default=ADB_API_PORT, help=f"port of the media-player API on the device (default {ADB_API_PORT})")
+    s_adb.add_argument("--player-id", default="1", help="media player id (default 1)")
+    s_adb.add_argument("--watch", action="store_true", help="keep checking and redo the forward whenever currentMedia changes")
+    s_adb.add_argument("--interval", type=float, default=5.0, metavar="SEC", help="seconds between checks with --watch (default 5)")
+    s_adb.add_argument("--connect-timeout", type=float, default=30.0, metavar="SEC", help="how long to wait for the device (default 30)")
+    s_adb.add_argument("--scan-ports", action="store_true",
+                       help="also list the other TCP ports listening on the device, forward them and probe each with GET / (may have side effects on unknown services)")
+    s_adb.add_argument("--keep-forwards", action="store_true", help="do not remove the forwards when finishing")
+    machine_flags(s_adb)
+    s_adb.add_argument("-v", "--verbose", action="store_true")
+    s_adb.add_argument("--no-color", action="store_true")
+    s_adb.add_argument("--ascii", action="store_true")
+    # BUILD-REMOVE-END-ADB
 
     s_desc = sub.add_parser("describe", help="print the capabilities of this script as JSON (commands, options, tools, formats, layouts)")
     s_desc.add_argument("--no-color", action="store_true", help=argparse.SUPPRESS)
@@ -7576,6 +7916,9 @@ def main(argv=None):
                 "mp4-cut": cmd_mp4_cut, "dash-capture": cmd_dash_capture, "doctor": cmd_doctor, "check-update": cmd_check_update,
                 "transcode": cmd_transcode, "frame": cmd_frame, "sdr": cmd_sdr,
                 "preview": cmd_preview, "play": cmd_play, "fetch-tool": cmd_fetch_tool}
+    # BUILD-REMOVE-START-ADB
+    handlers["adb-access"] = cmd_adb_access
+    # BUILD-REMOVE-END-ADB
     try:
         return handlers[args.cmd](args) or 0
     except Fail as e:

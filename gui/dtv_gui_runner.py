@@ -72,6 +72,7 @@ class Runner(QObject):
     progressChanged = Signal(object, float, str, str, float)   # Job, % total, detalhe, etapa, fração da etapa (0-1; -1 = desconhecida)
     tracksReported = Signal(object, dict)          # Job, evento `tracks` (trilhas do manifesto DASH)
     liveReported = Signal(object, dict)            # Job, evento `live` (estado da captura ao vivo)
+    adbReported = Signal(object, dict)             # Job, evento `adb` (Acesso via ADB: estado do aparelho e do endereço)
     began = Signal(object, list)                   # Job, [{"id","label","weight"}]  (evento begin)
     planned = Signal(object, list)
     resultReady = Signal(object, dict)
@@ -248,6 +249,8 @@ class Runner(QObject):
             self.tracksReported.emit(job, ev)
         elif t == "live":
             self.liveReported.emit(job, ev)
+        elif t == "adb":
+            self.adbReported.emit(job, ev)
         elif t == "plan":
             self.planned.emit(job, list(ev.get("outs") or []))
         elif t == "result":
