@@ -65,11 +65,13 @@ if shutil.which("ffmpeg"):
     cp.input.setText(vid); cp.read_points(); done(w); until(lambda: cp.work.isVisible() and cp.idr)
     cp.start.setText("00:00:01"); cp.end.setText("00:00:04"); cp.add_cut(); wait(100)
     cp.table.selectRow(0)
+    check("prévia: ao selecionar o corte os quadros mostram o carregamento", all(i._loading for i in cp.pv_imgs) and not hasattr(cp, "pv_btn"))
     until(lambda: cp.pv_imgs[0]._img is not None and cp.pv_imgs[1]._img is not None, 30000)
     check("prévia: os dois quadros do corte aparecem", cp.pv_imgs[0]._img is not None and cp.pv_imgs[1]._img is not None)
+    check("prévia: carregamento some quando os quadros chegam", not any(i._loading for i in cp.pv_imgs))
     check("prévia: legenda com o instante", "00:00:" in cp.pv_caps[0].text() and "00:00:" in cp.pv_caps[1].text())
     n_cache = len(cp._pv_cache)
-    cp.show_frames(); wait(100)
+    cp.table.clearSelection(); cp.table.selectRow(0); wait(700)
     check("prévia: repetir o mesmo corte usa o cache (não roda de novo)", len(cp._pv_cache) == n_cache and not w.pv_runner.busy)
     # reprodução: sem ffplay definido o erro é claro; com o programa informado ele recebe o trecho certo
     tp = w.pages["tools"]
@@ -85,6 +87,43 @@ if shutil.which("ffmpeg"):
     w.close()
 else:
     print("SKIP prévia do corte (sem ffmpeg)")
+
+# --- 1e. download assistido de programas (servidor http local, zip pequeno; núcleo real)
+import hashlib, http.server, threading, zipfile, functools
+srvdir = os.path.join(tmp, "srv"); os.makedirs(srvdir, exist_ok=True)
+zp = os.path.join(srvdir, "ff.zip")
+with zipfile.ZipFile(zp, "w") as z:
+    z.writestr("pkg/bin/ffmpeg" + (".exe" if os.name == "nt" else ""), "#!/bin/sh\n"); z.writestr("pkg/bin/ffplay" + (".exe" if os.name == "nt" else ""), "#!/bin/sh\n")
+zsha = hashlib.sha256(open(zp, "rb").read()).hexdigest()
+hnd = functools.partial(http.server.SimpleHTTPRequestHandler, directory=srvdir); hnd.log_message = lambda *a, **k: None
+httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), hnd); threading.Thread(target=httpd.serve_forever, daemon=True).start()
+url = f"http://127.0.0.1:{httpd.server_address[1]}/ff.zip"
+R.program_and_prefix = REAL
+w = G.MainWindow(); w.show(); wait(300); done(w)
+tp = w.pages["tools"]
+dlg = G.FetchToolDialog("ffmpeg", {"title": "t", "notice": "aviso", "license": "GPL", "license_url": "https://x.org/l", "url": "https://x.org/a.zip", "sha256_url": "https://x.org/sums"})
+check("download: botão desabilitado sem aceitar a licença", not dlg.go.isEnabled() and "licença" in dlg.msg.text())
+dlg.accept_lic.setChecked(True)
+check("download: endereço do catálogo + checksums publicados bastam", dlg.go.isEnabled())
+dlg.url.setText("https://outro.org/b.zip")
+check("download: endereço próprio exige SHA-256 ou marcação explícita", not dlg.go.isEnabled() and "SHA-256" in dlg.msg.text())
+dlg.sha.setText("abc"); check("download: SHA-256 inválido é recusado", not dlg.go.isEnabled())
+dlg.sha.setText("a" * 64); check("download: SHA-256 válido habilita", dlg.go.isEnabled() and dlg.values()["sha256"] == "a" * 64)
+dlg.sha.setText(""); dlg.url.setText("http://exemplo.org/b.zip"); check("download: só https", not dlg.go.isEnabled())
+tp._ask_fetch = lambda key: {"url": url, "sha256": zsha, "unverified": False}
+tp.rows["ffmpeg"]["edit"].setText("")
+tp.fetch("ffmpeg")
+until(lambda: tp.rows["ffmpeg"]["edit"].text() != "", 30000); until(lambda: not w.runner.busy, 30000)
+got = tp.rows["ffmpeg"]["edit"].text()
+check("download: caminho do programa definido na tela", got.replace("\\", "/").endswith("tools/ffmpeg/pkg/bin/ffmpeg" + (".exe" if os.name == "nt" else "")) and os.path.isfile(got))
+check("download: caminho salvo na configuração", json.loads(G.config_path().read_text(encoding="utf-8")).get("ffmpeg") == got)
+wait(900); done(w)  # a verificação automática depois do download termina antes do próximo
+tp._ask_fetch = lambda key: {"url": url, "sha256": "0" * 64, "unverified": False}
+tp.rows["ffmpeg"]["edit"].setText("")
+tp.fetch("ffmpeg"); until(lambda: not w.runner.busy, 30000); wait(200)
+check("download: SHA-256 errado não define caminho e mostra o erro", tp.rows["ffmpeg"]["edit"].text() == "" and "SHA-256" in tp.msg.text())
+tp.rows["ffmpeg"]["edit"].setText(""); tp.rows["ffplay"]["edit"].setText(""); tp.write_config()
+threading.Thread(target=httpd.shutdown, daemon=True).start(); w.close()
 
 # --- 1c. ferramentas escolhidas na tela vão como opção explícita, sem precisar "Salvar"
 R.program_and_prefix = REAL

@@ -18,6 +18,7 @@ Caso você seja um uusário que tenha ressalvas ao uso de inteligência artifica
 | `sdr` | Gera imagens SDR a partir de um PNG HDR salvo |
 | `preview` | Extrai quadros reduzidos em SDR (com LCEVC) de alguns instantes: usado na prévia do Corte MP4 |
 | `play` | Reproduz um trecho no `ffplay`, sem áudio, com LCEVC e conversão HDR → SDR |
+| `fetch-tool` | Baixa um programa (no Windows, o pacote ffmpeg + ffplay + mpegh do `limaalef/ffmpeg-autobuild-lcevc-mpegh`; ou um .zip/.tar informado), confere o SHA-256, mostra a licença e extrai |
 | `doctor` | Verifica os programas externos e os módulos Python necessários para o script funcionar |
 | `check-update` | Consulta no GitHub se há uma versão mais nova publicada (não baixa nem instala nada) |
 | `describe` | Imprime comandos, opções, ferramentas, formatos e layouts em JSON (para interfaces) |

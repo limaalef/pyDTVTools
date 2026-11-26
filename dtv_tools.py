@@ -44,7 +44,7 @@ from pathlib import Path
 __version__ = "1.3.2"
 PROTOCOL_VERSION = 2
 # What a controlling program (the GUI) may rely on; listed by `describe`, `doctor` and the `hello` event.
-FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation", "update-check", "dash-live", "preview")
+FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation", "update-check", "dash-live", "preview", "fetch-tool")
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 PJ = False          # machine mode: --json (protocol v2) or the legacy --progress-json
 JSONL = False       # --json: stdout carries ONLY one JSON object per line
@@ -6662,6 +6662,307 @@ def cmd_play(a):
     return 0
 
 
+# ──────────────────────────── assisted download of programs ────────────────────────────
+_BTBN = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+_LIMA_REPO = "limaalef/ffmpeg-autobuild-lcevc-mpegh"
+_LIMA_NOTICE = ("Pacote do projeto limaalef/ffmpeg-autobuild-lcevc-mpegh (GitHub): ffmpeg, ffplay, ffprobe, mpeghDecoder e mpeghUIManager já "
+                "compilados com VVC, LCEVC (V-Nova) e MPEG-H (Fraunhofer), só para Windows x64. A build é estática e inclui componentes GPL/não-livres "
+                "(libx265, libfdk-aac...), então não pode ser redistribuída livremente, e o LCEVCdec e o mpeghdec têm licenças próprias: confira "
+                "as licenças de cada componente antes de usar ou compartilhar. O arquivo é conferido pelo SHA-256 que o GitHub publica para a release.")
+_LIMA = {"github": _LIMA_REPO, "asset": r"win64-static-limaalef\.zip$", "package": "ffmpeg-lcevc-mpegh"}
+_PKG = ("ffmpeg", "ffplay", "mpegh_ui", "mpegh_decoder")
+TOOL_SOURCES = {}
+for _k in _PKG:
+    TOOL_SOURCES[_k] = {
+        "title": "Pacote FFmpeg + LCEVC + MPEG-H (limaalef, Windows x64)",
+        "provides": _PKG,
+        "license": "GPL v3 e licenças próprias de LCEVCdec (V-Nova) e mpeghdec (Fraunhofer)",
+        "license_url": "https://github.com/" + _LIMA_REPO,
+        "notice": _LIMA_NOTICE,
+        "assets": {"win64": dict(_LIMA)},
+    }
+_BTBN_SRC = {
+    "title": "FFmpeg + ffplay (builds automáticas BtbN, GPL)",
+    "provides": ("ffmpeg", "ffplay"),
+    "license": "GPL v3 (a build inclui componentes GPL, como libx265)",
+    "license_url": "https://www.ffmpeg.org/legal.html",
+    "notice": ("O FFmpeg é software livre; esta build usa a licença GPL v3, que impõe condições à redistribuição (inclusive do que você "
+               "empacotar com ela). Os arquivos vêm de github.com/BtbN/FFmpeg-Builds, não do projeto FFmpeg, e são conferidos pelo SHA-256 "
+               "publicado na mesma página. Esta build NÃO tem o filtro lcevc nem MPEG-H: para isso use o pacote limaalef (Windows) ou a sua build."),
+    "assets": {
+        "winarm64": {"url": _BTBN + "ffmpeg-master-latest-winarm64-gpl.zip", "sha256_url": _BTBN + "checksums.sha256", "package": "ffmpeg-btbn"},
+        "linux64": {"url": _BTBN + "ffmpeg-master-latest-linux64-gpl.tar.xz", "sha256_url": _BTBN + "checksums.sha256", "package": "ffmpeg-btbn"},
+        "linuxarm64": {"url": _BTBN + "ffmpeg-master-latest-linuxarm64-gpl.tar.xz", "sha256_url": _BTBN + "checksums.sha256", "package": "ffmpeg-btbn"},
+    },
+}
+for _k in ("ffmpeg", "ffplay"):                     # outros sistemas: só o ffmpeg/ffplay genérico
+    for _plat, _asset in _BTBN_SRC["assets"].items():
+        TOOL_SOURCES[_k]["assets"].setdefault(_plat, _asset)
+TOOL_SOURCES["mp4box"] = {
+    "title": "MP4Box (GPAC)",
+    "provides": ("mp4box",),
+    "license": "LGPL v2.1 ou posterior",
+    "license_url": "https://github.com/gpac/gpac/blob/master/COPYING",
+    "notice": ("O GPAC é distribuído como instalador (.exe/.dmg) ou pacote do sistema, sem arquivo avulso estável: não há download "
+               "automático. Baixe em https://gpac.io/downloads/ ou, se você tiver o endereço de um .zip/.tar com o MP4Box, informe-o abaixo "
+               "(com o SHA-256 se o publicador fornecer)."),
+    "assets": {},
+}
+GENERIC_NOTICE = ("Você informou um endereço próprio: o programa baixado tem a licença do seu autor e a conferência dele é sua. O SHA-256 abaixo "
+                  "só prova que o arquivo é o mesmo que o publicador divulgou, não que ele é seguro.")
+
+
+def source_platform_key():
+    import platform
+    m = platform.machine().lower()
+    arm = m in ("arm64", "aarch64")
+    if sys.platform.startswith("win"):
+        return "winarm64" if arm else "win64"
+    if sys.platform.startswith("linux"):
+        return "linuxarm64" if arm else "linux64"
+    return "macos"
+
+
+def tool_source_info(key):
+    src = TOOL_SOURCES.get(key) or {}
+    asset = (src.get("assets") or {}).get(source_platform_key()) or {}
+    return {"title": src.get("title", TOOL_DEFS[key]["label"]), "license": src.get("license", ""), "license_url": src.get("license_url", ""),
+            "notice": src.get("notice", GENERIC_NOTICE), "provides": list(src.get("provides", (key,))),
+            "url": asset.get("url", ""), "sha256_url": asset.get("sha256_url", ""), "auto": bool(asset),
+            "github": asset.get("github", ""), "asset": asset.get("asset", ""), "package": asset.get("package", key),
+            "sha256_auto": bool(asset.get("github"))}
+
+
+def resolve_github_asset(repo, pattern, timeout):
+    """Latest release of a GitHub repository -> (download url, sha256 or ''). The hash is the `digest` GitHub publishes for the asset."""
+    base = os.environ.get("DTV_GITHUB_API", "https://api.github.com").rstrip("/")
+    if not url_allowed(base):
+        raise Fail("DTV_GITHUB_API precisa ser https://.")
+    with http_open(f"{base}/repos/{repo}/releases/latest", timeout) as r:
+        rel = json.loads(r.read(5_000_000).decode("utf-8", "replace"))
+    for a in rel.get("assets") or []:
+        if re.search(pattern, a.get("name", "")):
+            dg = str(a.get("digest") or "")
+            sha = dg.split(":", 1)[1].lower() if dg.lower().startswith("sha256:") else ""
+            if not sha:                                          # a sibling '<asset>.sha256' file, if the project publishes one
+                for b in rel.get("assets") or []:
+                    if b.get("name") in (a["name"] + ".sha256", a["name"] + ".sha256sum"):
+                        with http_open(b["browser_download_url"], timeout) as r2:
+                            sha = parse_checksums(r2.read(100_000).decode("utf-8", "replace"), a["name"]) or ""
+            return a["browser_download_url"], sha, rel.get("tag_name", "")
+    raise Fail(f"A última release de {repo} não tem arquivo '{pattern}'.")
+
+
+def url_allowed(u):
+    from urllib.parse import urlparse
+    pu = urlparse(u)
+    if pu.scheme == "https" and pu.hostname:
+        return True
+    return pu.scheme == "http" and pu.hostname in ("localhost", "127.0.0.1", "::1")          # http only for tests / local mirrors
+
+
+def parse_checksums(text, filename):
+    """SHA-256 of `filename` in a checksum file ('<hash>  <name>' lines, or a bare hash when the file has just one)."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    for ln in lines:
+        m = re.match(r"^([0-9a-fA-F]{64})\s+\*?(.+)$", ln)
+        if m and os.path.basename(m.group(2).strip()) == filename:
+            return m.group(1).lower()
+    if len(lines) == 1 and re.fullmatch(r"[0-9a-fA-F]{64}", lines[0]):
+        return lines[0].lower()
+    return None
+
+
+def http_open(url, timeout):
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": f"dtv_tools/{__version__}"})
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raise Fail(f"O servidor respondeu HTTP {e.code} para {url}")
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        raise Fail(f"Não foi possível baixar (sem internet?): {getattr(e, 'reason', e)}")
+
+
+def safe_extract(archive, dest):
+    """Extracts a zip / tar(.gz/.xz/.bz2) refusing paths that leave `dest` and links. Returns False when it is not an archive."""
+    import tarfile
+    import zipfile
+    root = Path(dest).resolve()
+
+    def inside(name):
+        t = (root / name).resolve()
+        return t == root or root in t.parents
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as z:
+            for n in z.namelist():
+                if not inside(n):
+                    raise Fail(f"Arquivo compactado recusado: caminho suspeito '{n}'.")
+            z.extractall(root)
+            for i in z.infolist():                      # zip does not restore the executable bit
+                mode = (i.external_attr >> 16) & 0o777
+                if mode & 0o100 and not i.is_dir():
+                    (root / i.filename).chmod(mode)
+        return True
+    if tarfile.is_tarfile(archive):
+        with tarfile.open(archive) as t:
+            for m in t.getmembers():
+                if not inside(m.name) or m.issym() or m.islnk():
+                    if m.issym() or m.islnk():
+                        continue
+                    raise Fail(f"Arquivo compactado recusado: caminho suspeito '{m.name}'.")
+            members = [m for m in t.getmembers() if not (m.issym() or m.islnk())]
+            t.extractall(root, members=members)
+        return True
+    return False
+
+
+def find_programs(folder, keys):
+    """{key: path} of the executables named like TOOL_DEFS[key]['names'] found under `folder`."""
+    exts = ("", ".exe") if os.name == "nt" else ("",)
+    want = {}
+    for k in keys:
+        for n in TOOL_DEFS[k]["names"]:
+            for e in exts:
+                want[(n + e).lower()] = k
+    found = {}
+    for dp, _dn, fns in os.walk(folder):
+        for fn in sorted(fns):
+            k = want.get(fn.lower())
+            if k and k not in found:
+                found[k] = os.path.join(dp, fn)
+    for pth in found.values():
+        try:
+            os.chmod(pth, os.stat(pth).st_mode | 0o111)
+        except OSError:
+            pass
+    return found
+
+
+def cmd_fetch_tool(a):
+    """Downloads a program, checks its SHA-256, unpacks it and reports where the executables are (never bundled in releases)."""
+    import hashlib
+    import shutil as _sh
+    set_steps([("source", "Preparar"), ("download", "Baixar"), ("verify", "Conferir SHA-256"), ("install", "Extrair e localizar"), ("report", "Resumo")])
+    set_stages({"source": 3, "download": 75, "verify": 7, "install": 13, "report": 2})
+    key = a.tool
+    info = tool_source_info(key)
+    step("source", "running")
+    url = a.url or info["url"]
+    resolved_hash, tag = "", ""
+    if not url and info["github"]:
+        url, resolved_hash, tag = resolve_github_asset(info["github"], info["asset"], a.timeout)
+        say(f"Última release de {info['github']}: {tag}", "ok")
+    auto_src = not a.url
+    if not url:
+        raise Fail(f"Não há download automático do {TOOL_DEFS[key]['label']} para este sistema. Informe o endereço com --url.")
+    if not url_allowed(url):
+        raise Fail("Só endereços https:// são aceitos para baixar programas.")
+    if not a.accept_license:
+        raise Fail("Leia o aviso de licença e confirme com --accept-license:\n" + (info["notice"] if not a.url or a.url == info["url"] else GENERIC_NOTICE))
+    name = os.path.basename(url.split("?")[0]) or f"{key}.bin"
+    expected = (a.sha256 or "").strip().lower()
+    if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise Fail("O SHA-256 informado não tem 64 dígitos hexadecimais.")
+    if not expected and resolved_hash and auto_src:
+        expected = resolved_hash
+        say(f"SHA-256 esperado (publicado pelo GitHub): {expected}", "ok")
+    sums_url = a.sha256_url or (info["sha256_url"] if url == info["url"] else "")
+    if not expected and sums_url and not (auto_src and info["github"]):
+        if not url_allowed(sums_url):
+            raise Fail("O endereço do arquivo de checksums precisa ser https://.")
+        with http_open(sums_url, a.timeout) as r:
+            expected = parse_checksums(r.read(2_000_000).decode("utf-8", "replace"), name) or ""
+        if not expected:
+            raise Fail(f"O arquivo de checksums não lista '{name}'.")
+        say(f"SHA-256 esperado (de {sums_url}): {expected}", "ok")
+    if not expected and not a.allow_unverified:
+        raise Fail("Sem SHA-256 para conferir o arquivo. Informe --sha256 (ou --sha256-url); só use --allow-unverified se aceitar o risco.")
+    dest = Path(a.dest).resolve() if a.dest else TOOLS_DIR.resolve()
+    dl = dest / ".download"
+    dl.mkdir(parents=True, exist_ok=True)
+    part = dl / (name + ".part")
+    step("source", "done")
+    step("download", "running")
+    h = hashlib.sha256()
+    got, t0, limit = 0, time.time(), int(a.max_size * 1024 * 1024)
+    log(f"GET {url}")
+    try:
+        with http_open(url, a.timeout) as r, open(part, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            if total and total > limit:
+                raise Fail(f"O arquivo tem {human(total)}, acima do limite de {human(limit)} (--max-size).")
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > limit:
+                    raise Fail(f"O download passou do limite de {human(limit)} (--max-size).")
+                h.update(chunk)
+                f.write(chunk)
+                spd = got / max(time.time() - t0, 0.001)
+                progress("download", got / total if total else 0.0, f"{human(got)}" + (f" de {human(total)}" if total else "") + f" · {human(spd)}/s")
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    progress("download", 1.0, f"{human(got)}", force=True)
+    step("download", "done", human(got))
+    step("verify", "running")
+    digest = h.hexdigest()
+    if expected and digest != expected:
+        part.unlink(missing_ok=True)
+        raise Fail(f"SHA-256 diferente do esperado: o arquivo foi descartado.\n  esperado: {expected}\n  obtido:   {digest}")
+    verified = bool(expected)
+    if verified:
+        say(f"SHA-256 conferido: {digest}", "ok")
+    else:
+        note(f"Arquivo sem verificação (SHA-256 {digest}).")
+    step("verify", "done", "conferido" if verified else "não verificado")
+    step("install", "running")
+    target = dest / (info["package"] if auto_src else key)
+    marker = target / ".dtv_fetch.json"
+    if target.exists():
+        if not marker.is_file():
+            part.unlink(missing_ok=True)
+            raise Fail(f"A pasta {target} já existe e não foi criada por este programa; remova-a ou use --dest.")
+        _sh.rmtree(target)
+    target.mkdir(parents=True)
+    archive = dl / name
+    os.replace(part, archive)
+    try:
+        if safe_extract(archive, target):
+            archive.unlink(missing_ok=True)
+        elif name.lower().endswith((".exe", ".msi", ".dmg", ".pkg", ".deb", ".rpm")) and not find_programs_name(name, info["provides"]):
+            raise Fail(f"Isto é um instalador, não um programa avulso. Ele ficou em {archive}: execute-o e informe depois o caminho do programa instalado.")
+        else:
+            _sh.move(str(archive), str(target / name))
+    except Fail:
+        raise
+    found = find_programs(target, info["provides"] + [key])
+    if key not in found:
+        raise Fail(f"Não achei o {TOOL_DEFS[key]['label']} dentro do arquivo baixado ({target}).")
+    marker.write_text(json.dumps({"tool": key, "url": url, "sha256": digest, "verified": verified, "license": info["license"],
+                                  "date": time.strftime("%Y-%m-%d %H:%M:%S")}, ensure_ascii=False, indent=1), encoding="utf-8")
+    step("install", "done")
+    step("report", "running")
+    for k, pth in found.items():
+        say(f"{TOOL_DEFS[k]['label']}: {pth}", "ok")
+    rows = [["Programa", TOOL_DEFS[key]["label"]], ["Origem", url], ["SHA-256", digest + ("  (conferido)" if verified else "  (NÃO verificado)")],
+            ["Licença", info["license"] or "do autor"], ["Pasta", str(target)]]
+    ev(type="result", out=found[key], outputs=[], notes=NOTES, rows=rows,
+       installed={"tool": key, "path": found[key], "found": found, "sha256": digest, "verified": verified, "url": url, "size": got, "dir": str(target)})
+    step("report", "done")
+    progress("report", 1.0, force=True)
+    return 0
+
+
+def find_programs_name(filename, keys):
+    low = filename.lower()
+    return any(low.startswith(n.lower()) for k in keys for n in TOOL_DEFS[k]["names"])
+
+
 def cmd_sdr(a):
     """Redo only the SDR image from a saved *_hdr.png (fast way to tune the look; no decoding)."""
     set_steps([("sdr", "Converter para SDR"), ("report", "Resumo")])
@@ -6979,6 +7280,21 @@ def build_parser():
     s_up.add_argument("--no-color", action="store_true")
     s_up.add_argument("--ascii", action="store_true")
 
+    s_ft = sub.add_parser("fetch-tool", help="download an external program (ffmpeg, MP4Box...), check its SHA-256 and unpack it; releases do not bundle them")
+    s_ft.add_argument("tool", choices=list(TOOL_DEFS), help="program to fetch")
+    s_ft.add_argument("--url", default="", help="address of the .zip/.tar (default: the known source for ffmpeg/ffplay on this system)")
+    s_ft.add_argument("--sha256", default="", metavar="HEX", help="expected SHA-256 of the file")
+    s_ft.add_argument("--sha256-url", default="", metavar="URL", help="checksum file ('<hash>  <name>' lines) to read the expected SHA-256 from")
+    s_ft.add_argument("--allow-unverified", action="store_true", help="accept a file with no SHA-256 to check against (not recommended)")
+    s_ft.add_argument("--accept-license", action="store_true", help="confirm that you read the license notice (required)")
+    s_ft.add_argument("--dest", default="", metavar="DIR", help="folder where the program is installed under <DIR>/<tool> (default: the tools folder)")
+    s_ft.add_argument("--max-size", type=float, default=1500.0, metavar="MB", help="refuse downloads larger than this (default 1500)")
+    s_ft.add_argument("--timeout", type=float, default=30.0, metavar="SEC", help="network timeout (default 30)")
+    machine_flags(s_ft)
+    s_ft.add_argument("-v", "--verbose", action="store_true")
+    s_ft.add_argument("--no-color", action="store_true")
+    s_ft.add_argument("--ascii", action="store_true")
+
     s_desc = sub.add_parser("describe", help="print the capabilities of this script as JSON (commands, options, tools, formats, layouts)")
     s_desc.add_argument("--no-color", action="store_true", help=argparse.SUPPRESS)
     s_desc.add_argument("--ascii", action="store_true", help=argparse.SUPPRESS)
@@ -7125,7 +7441,7 @@ def describe():
                          "default": act.default if isinstance(act.default, (str, int, float, bool, type(None))) else None})
         commands[name] = {"help": helps.get(name, ""), "options": opts}
     return {"version": __version__, "protocol": PROTOCOL_VERSION, "features": list(FEATURES),
-            "tools": {k: {"label": d["label"], "names": list(d["names"]), "flag": d["flag"], "optional": bool(d.get("optional"))} for k, d in TOOL_DEFS.items()},
+            "tools": {k: {"label": d["label"], "names": list(d["names"]), "flag": d["flag"], "optional": bool(d.get("optional")), "source": tool_source_info(k)} for k, d in TOOL_DEFS.items()},
             "formats": {k: {"label": f["label"], "ext": f["ext"], "default_bitrate": f["br"], "max_channels": f["max"]} for k, f in FORMATS.items()},
             "layouts": catalog_public(), "encoders": ENCODERS, "commands": commands}
 
@@ -7259,7 +7575,7 @@ def main(argv=None):
     handlers = {"ts-tv3": cmd_ts_tv3, "mpegh-scan": cmd_mpegh_scan, "mpegh-audio": cmd_mpegh_audio,
                 "mp4-cut": cmd_mp4_cut, "dash-capture": cmd_dash_capture, "doctor": cmd_doctor, "check-update": cmd_check_update,
                 "transcode": cmd_transcode, "frame": cmd_frame, "sdr": cmd_sdr,
-                "preview": cmd_preview, "play": cmd_play}
+                "preview": cmd_preview, "play": cmd_play, "fetch-tool": cmd_fetch_tool}
     try:
         return handlers[args.cmd](args) or 0
     except Fail as e:

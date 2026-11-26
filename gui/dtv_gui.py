@@ -28,7 +28,7 @@ from pathlib import Path  # noqa: E402
 
 from PySide6.QtCore import QRectF, QSettings, QSize, QStandardPaths, Qt, QTime, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import QAction, QActionGroup, QColor, QGuiApplication, QIcon, QPainter, QPalette  # noqa: E402
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,  # noqa: E402
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,  # noqa: E402
                                QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
                                QMessageBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
                                QStackedWidget, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QTimeEdit, QTreeWidget,
@@ -889,9 +889,6 @@ class CutPage(Page):
             self.pv_caps.append(lb)
         gp.body.addLayout(cols)
         pb = QHBoxLayout()
-        self.pv_btn = QPushButton("Ver quadros")
-        self.pv_btn.setToolTip("Mostra o primeiro e o último quadro do corte selecionado (ou do início/fim digitados), já em SDR e com o LCEVC aplicado")
-        self.pv_btn.clicked.connect(self.show_frames)
         self.play_btn = QPushButton("Reproduzir trecho")
         self.play_btn.setToolTip("Abre o trecho no ffplay (sem áudio), com o LCEVC aplicado e conversão HDR → SDR")
         self.play_btn.clicked.connect(self.play)
@@ -899,11 +896,11 @@ class CutPage(Page):
         for t, v in (("Janela 960 px", 960), ("Janela 1280 px", 1280), ("Janela 1920 px", 1920)):
             self.pv_size.addItem(t, v)
         self.pv_size.setCurrentIndex(1)
-        for w in (self.pv_btn, self.play_btn, self.pv_size):
+        for w in (self.play_btn, self.pv_size):
             pb.addWidget(w)
         pb.addStretch(1)
         gp.body.addLayout(pb)
-        self.pv_status = muted_label("Selecione um corte na tabela e use “Ver quadros” ou “Reproduzir trecho”. O vídeo é mostrado em SDR e sem áudio.")
+        self.pv_status = muted_label("Selecione um corte na tabela para ver o primeiro e o último quadro, ou use “Reproduzir trecho”. O vídeo é mostrado em SDR e sem áudio.")
         self.pv_status.setWordWrap(True)
         gp.body.addWidget(self.pv_status)
         wl.addWidget(gp)
@@ -947,13 +944,20 @@ class CutPage(Page):
 
     def _selection_changed(self):
         if self.table.selectedIndexes() and self.idr:
-            self._pv_timer.start()          # troca de linha em sequência: só a última gera os quadros
+            self._pv_loading(True)          # retorno imediato; troca de linha em sequência: só a última gera os quadros
+            self._pv_timer.start()
 
     def _pv_dir(self) -> str:
         if self._pv_dir_obj is None:
             import tempfile
             self._pv_dir_obj = tempfile.TemporaryDirectory(prefix="dtv_prev_")
         return self._pv_dir_obj.name
+
+    def _pv_loading(self, on):
+        for img in self.pv_imgs:
+            img.set_loading(on, "Carregando quadro…")
+        if on:
+            self.pv_status.setText("Carregando os quadros do corte…")
 
     def _pv_clear(self, text=None):
         for img in self.pv_imgs:
@@ -964,10 +968,9 @@ class CutPage(Page):
     def show_frames(self):
         try:
             a, b = self._pv_range()
-        except UserError as e:
-            self.show_error(str(e))
+        except UserError:
+            self._pv_loading(False)
             return
-        self.show_error("")
         src = self.input.text()
         t1, t2 = a, max(a, b - self.fd)
         try:
@@ -984,7 +987,7 @@ class CutPage(Page):
         if runner.busy:
             self._pv_pending = True
             return
-        self.pv_status.setText("Extraindo quadros…")
+        self._pv_loading(True)
         args = ["preview", src, "--time", f"{t1:.3f}", "--time", f"{t2:.3f}", "--outdir", self._pv_dir(), "--width", "960"] + self.extra("preview")
         runner.start([Job("Prévia do corte", args, kind="preview", page=self._pv_sink, meta={"quiet": True})])
         self._pv_times = (t1, t2)
@@ -1044,7 +1047,7 @@ class CutPage(Page):
 
     def pl_finished(self):
         self._set_playing(False)
-        self.pv_status.setText("Selecione um corte na tabela e use “Ver quadros” ou “Reproduzir trecho”. O vídeo é mostrado em SDR e sem áudio.")
+        self.pv_status.setText("Selecione um corte na tabela para ver o primeiro e o último quadro, ou use “Reproduzir trecho”. O vídeo é mostrado em SDR e sem áudio.")
 
     def update_buttons(self):
         self.read_btn.setEnabled(not self._busy)
@@ -1826,6 +1829,77 @@ class DashPage(Page):
 
 
 # ═════════════════════════════ Ferramentas ═════════════════════════════
+class FetchToolDialog(QDialog):
+    """Aviso de licença + endereço + SHA-256 antes de baixar um programa. Só habilita 'Baixar' com tudo confirmado."""
+
+    def __init__(self, label: str, src: dict, parent=None):
+        super().__init__(parent)
+        self.src = src
+        self.setWindowTitle(f"Baixar {label}")
+        self.setMinimumWidth(560)
+        lay = QVBoxLayout(self)
+        t = QLabel(f"<b>{src.get('title') or label}</b>")
+        lay.addWidget(t)
+        n = QLabel(src.get("notice") or "")
+        n.setWordWrap(True)
+        lay.addWidget(n)
+        if src.get("license"):
+            lic = QLabel("Licença: " + src["license"] + (f' — <a href="{src["license_url"]}">texto da licença</a>' if src.get("license_url") else ""))
+            lic.setOpenExternalLinks(True)
+            lic.setWordWrap(True)
+            lay.addWidget(lic)
+        form = QFormLayout()
+        self.url = QLineEdit(src.get("url", ""))
+        self.url.setPlaceholderText(f"automático: última release de {src['github']}" if src.get("github") else "https://…/programa.zip (ou .tar.xz)")
+        self.sha = QLineEdit()
+        self.sha.setPlaceholderText("automático (publicado pelo GitHub para a release)" if src.get("sha256_auto") else "automático (checksums publicados no site)" if src.get("sha256_url") else "64 dígitos hexadecimais, como publicado pelo autor (recomendado)")
+        form.addRow("Endereço", self.url)
+        form.addRow("SHA-256", self.sha)
+        lay.addLayout(form)
+        self.unverified = QCheckBox("Baixar sem conferir o SHA-256 (não recomendado)")
+        lay.addWidget(self.unverified)
+        self.accept_lic = QCheckBox("Li o aviso de licença acima e aceito os termos")
+        lay.addWidget(self.accept_lic)
+        self.msg = muted_label("")
+        lay.addWidget(self.msg)
+        self.box = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.go = self.box.addButton("Baixar", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.box.accepted.connect(self.accept)
+        self.box.rejected.connect(self.reject)
+        lay.addWidget(self.box)
+        for w in (self.url, self.sha):
+            w.textChanged.connect(self._validate)
+        for w in (self.unverified, self.accept_lic):
+            w.toggled.connect(self._validate)
+        self._validate()
+
+    def _has_hash_source(self) -> bool:
+        u = self.url.text().strip()
+        return bool(re.fullmatch(r"[0-9a-fA-F]{64}", self.sha.text().strip()) or (self.src.get("sha256_url") and u == self.src.get("url"))
+                    or (self.src.get("sha256_auto") and not u))
+
+    def _validate(self):
+        u = self.url.text().strip()
+        sha = self.sha.text().strip()
+        problem = ""
+        if not u and self.src.get("github"):
+            pass
+        elif not (u.startswith("https://") or u.startswith("http://127.0.0.1") or u.startswith("http://localhost")):
+            problem = "Informe um endereço https://."
+        elif sha and not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+            problem = "O SHA-256 deve ter 64 dígitos hexadecimais."
+        elif not self._has_hash_source() and not self.unverified.isChecked():
+            problem = "Informe o SHA-256 do arquivo ou marque para baixar sem conferir."
+        elif not self.accept_lic.isChecked():
+            problem = "Confirme que leu o aviso de licença."
+        self.msg.setText(problem)
+        self.go.setEnabled(not problem)
+
+    def values(self) -> dict:
+        return {"url": self.url.text().strip(), "sha256": self.sha.text().strip().lower(),
+                "unverified": self.unverified.isChecked() and not self._has_hash_source()}
+
+
 class ToolsPage(Page):
     title = "Configurações"
     subtitle = "Definição dos programas externos usados pelo dtv_tools. Programas já instalados podem ser encontrados automaticamente se já estão definidos em PATH."
@@ -1848,6 +1922,11 @@ class ToolsPage(Page):
             fe = FileEdit("open", placeholder="Detectar automaticamente", key="tool_" + key)
             gl.addWidget(icon, 0, 0, Qt.AlignmentFlag.AlignTop)
             gl.addWidget(st, 0, 1)
+            dl = QPushButton("Baixar…")
+            dl.setToolTip("Baixa o programa, confere o SHA-256 e já define o caminho (os instaladores não vêm junto da release)")
+            dl.clicked.connect(lambda _=False, k=key: self.fetch(k))
+            gl.addWidget(dl, 0, 2, Qt.AlignmentFlag.AlignTop)
+            self.action_buttons.append(dl)
             gl.addWidget(fe, 1, 0, 1, 2)
             gl.addWidget(muted_label("Necessário para: " + self.NEEDED[key]), 2, 0, 1, 2)
             gl.setColumnStretch(1, 1)
@@ -1881,6 +1960,43 @@ class ToolsPage(Page):
         self.footer.addWidget(self.check_btn)
         self.action_buttons.append(self.check_btn)
 
+    def _ask_fetch(self, key: str):
+        src = ((self.win.core_info or {}).get("tools", {}).get(key) or {}).get("source") or {}
+        label = dict(TOOL_ROWS).get(key, key)
+        dlg = FetchToolDialog(label, src, self)
+        return dlg.values() if dlg.exec() == QDialog.DialogCode.Accepted else None
+
+    def fetch(self, key: str):
+        if "fetch-tool" not in (self.win.core_info or {}).get("commands", {}):
+            self.show_error("Esta versão do dtv_tools.py não tem o download assistido de programas.")
+            return
+        v = self._ask_fetch(key)
+        if not v:
+            return
+        args = ["fetch-tool", key, "--accept-license", "--dest", str(config_path().parent / "tools")] + (["--url", v["url"]] if v["url"] else [])
+        if v["sha256"]:
+            args += ["--sha256", v["sha256"]]
+        if v["unverified"]:
+            args.append("--allow-unverified")
+        self.run([Job(f"Baixando {dict(TOOL_ROWS).get(key, key)}", args, kind="fetch-tool", page=self, meta={"quiet": False})])
+
+    def _fetched(self, res):
+        ins = res.get("installed") or {}
+        for k, path in (ins.get("found") or {}).items():
+            r = self.rows.get(k)
+            if r and (k == ins.get("tool") or not r["edit"].text().strip()):
+                r["edit"].setText(path)
+        self.write_config()
+        self._tries = 0
+        self._check_soon()
+
+    def _check_soon(self):
+        if self.win.runner.busy and self._tries < 30:
+            self._tries += 1
+            QTimer.singleShot(300, self._check_soon)
+            return
+        self.check()
+
     def _load_overrides(self):
         try:
             data = json.loads(config_path().read_text(encoding="utf-8"))
@@ -1913,6 +2029,9 @@ class ToolsPage(Page):
 
     def handle_error(self, job, msg):
         """A verificação falhou por inteiro (script antigo, processo que não iniciou...): nunca ficar em 'Verificando…'."""
+        if job.kind == "fetch-tool":
+            self.show_error("Download: " + (msg.strip().splitlines()[0] if msg.strip() else "falhou"))
+            return
         if job.kind != "doctor":
             return
         for r in self.rows.values():
@@ -1920,6 +2039,9 @@ class ToolsPage(Page):
             r["status"].setText("Não foi possível verificar: " + msg)
 
     def handle_result(self, job, res):
+        if job.kind == "fetch-tool":
+            self._fetched(res)
+            return
         c = Colors(self)
         for t in res.get("tools", []):
             r = self.rows.get(t["key"])

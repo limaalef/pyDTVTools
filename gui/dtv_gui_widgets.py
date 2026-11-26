@@ -934,10 +934,26 @@ class ImagePreview(Card):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._img = None
+        self._loading, self._angle, self._busy_text = False, 0, ""
+        self._spin = QTimer(self, interval=40)
+        self._spin.timeout.connect(self._tick)
         sp = QSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         sp.setHeightForWidth(True)
         self.setSizePolicy(sp)
         self.setMinimumSize(120, 90)
+
+    def _tick(self):
+        self._angle = (self._angle - 18) % 360
+        self.update()
+
+    def set_loading(self, on: bool, text: str = "Carregando…"):
+        """Indicador de carregamento: a imagem anterior (se houver) escurece e um círculo gira por cima."""
+        self._loading, self._busy_text = on, text
+        if on:
+            self._spin.start()
+        else:
+            self._spin.stop()
+        self.update()
 
     def hasHeightForWidth(self):
         return True
@@ -957,12 +973,14 @@ class ImagePreview(Card):
         if img.isNull():
             return False
         self._img = img
+        self.set_loading(False)
         self.updateGeometry()
         self.update()
         return True
 
     def clear_image(self):
         self._img = None
+        self.set_loading(False)
         self.update()
 
     def paintEvent(self, _):
@@ -970,14 +988,34 @@ class ImagePreview(Card):
         p = QPainter(self)
         self.paint_card(p, c)
         if self._img is None:
+            if not self._loading:
+                p.setPen(c.muted)
+                draw_text(p, self.width() / 2, self.height() / 2, "A pré-visualização aparece aqui", "center")
+        else:
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            r = QRectF(self.rect()).adjusted(4, 4, -4, -4)
+            k = min(r.width() / self._img.width(), r.height() / self._img.height())
+            w, h = self._img.width() * k, self._img.height() * k
+            p.drawImage(QRectF(r.center().x() - w / 2, r.center().y() - h / 2, w, h), self._img)
+        if self._loading:
+            veil = QColor(c.bg)
+            veil.setAlpha(170 if self._img is not None else 0)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(veil)
+            p.drawRect(self.rect().adjusted(1, 1, -1, -1))
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            d = 30
+            cx, cy = self.width() / 2, self.height() / 2 - 8
+            ring = QRectF(cx - d / 2, cy - d / 2, d, d)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(c.border, 3))
+            p.drawEllipse(ring)
+            pen = QPen(c.accent, 3.4)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.drawArc(ring, self._angle * 16, 100 * 16)
             p.setPen(c.muted)
-            draw_text(p, self.width() / 2, self.height() / 2, "A pré-visualização aparece aqui", "center")
-            return
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        r = QRectF(self.rect()).adjusted(4, 4, -4, -4)
-        k = min(r.width() / self._img.width(), r.height() / self._img.height())
-        w, h = self._img.width() * k, self._img.height() * k
-        p.drawImage(QRectF(r.center().x() - w / 2, r.center().y() - h / 2, w, h), self._img)
+            draw_text(p, cx, cy + d / 2 + 16, self._busy_text, "center")
 
 
 # ───────────────────────────── painel de atividade (direita) ─────────────────────────────
