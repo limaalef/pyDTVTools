@@ -4,6 +4,16 @@ O pyDTVTools é um canivete suíço (que expressão clichê) de ferramentas dire
 
 Caso você seja um uusário que tenha ressalvas ao uso de inteligência artifical na produção de códigos ou na vida em geral (eu acho toda e qualquer imagem gerada por IA horripilante), convido a ler o minha declaração de transparência para entender como isso afetou a produção deste conteúdo.
 
+## Interface gráfica
+
+Este projeto conta com uma interface gráfica e releases automáticos com o executável compilado para Mac OS ARM e Intel, Linux e Windows. Esta interface utiliza-se de todos os comandos implementados e fornece uma experiência melhor para usuários menos técnicos
+
+![Captura DASH DTV+](assets/captura_dash.png)
+![Captura de frame](assets/frame.png)
+![Cortar MP4](assets/cortar_mp4.png)
+![MPEG-TS para MP4](assets/mpegts-to-mp4.png)
+![Recodificar](assets/recodificar.png)
+
 ## Comandos e outras explicações
 
 | Comando | Descrição |
