@@ -16,7 +16,7 @@ pytestmark = pytest.mark.filterwarnings("ignore")
 
 
 def test_version():
-    assert d.__version__ == "1.3.2"
+    assert d.__version__ == "1.4.0"
 
 
 def test_every_option_has_help():

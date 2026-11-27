@@ -41,7 +41,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 PROTOCOL_VERSION = 2
 # What a controlling program (the GUI) may rely on; listed by `describe`, `doctor` and the `hello` event.
 FEATURES = ("json", "control", "begin", "stage-progress", "describe", "log-events", "isolation", "update-check", "dash-live", "preview", "fetch-tool")
@@ -4766,11 +4766,12 @@ def _base(el, cur):
     return cur
 
 
-def parse_mpd_tasks(mpd_bytes, mpd_url, out_dir, now=None, window=12):
+def parse_mpd_tasks(mpd_bytes, mpd_url, out_dir, now=None, window=12, subs=False):
     """
     Reads a DASH manifest. Supported: SegmentTemplate with SegmentTimeline, or with @duration ($Number$), formatted
     identifiers ($Number%05d$), BaseURL at every level. Returns (tracks, is_dynamic, skipped, info) where info has
-    'drm', 'periods' and 'unsupported'.
+    'drm', 'periods' and 'unsupported'. With subs=True the first subtitle/caption representation is returned as
+    tracks['subtitle'] (the other languages go to info['extra'] as 'alt_subtitle'); without it subtitles are only listed.
     """
     import urllib.parse
     import xml.etree.ElementTree as ET
@@ -4780,7 +4781,7 @@ def parse_mpd_tasks(mpd_bytes, mpd_url, out_dir, now=None, window=12):
     mpd_base = _base(root, mpd_url.rsplit("/", 1)[0] + "/")
     periods = [p for p in root if _strip_ns(p.tag) == "Period"]
     info = {"drm": False, "periods": len(periods), "unsupported": [], "extra": []}
-    tracks = {k: {"init": None, "segs": [], "meta": None} for k in DASH_KINDS}
+    tracks = {k: {"init": None, "segs": [], "meta": None} for k in DASH_KINDS + ("subtitle",)}
     skipped = []
     if not periods:
         return tracks, is_dynamic, skipped, info
@@ -4801,8 +4802,11 @@ def parse_mpd_tasks(mpd_bytes, mpd_url, out_dir, now=None, window=12):
             if any(_strip_ns(c.tag) == "ContentProtection" for el in (adap, rep) for c in el):
                 info["drm"] = True
             if kind == "ignore":
-                info["extra"].append(_rep_summary(adap, rep, _extra_kind(adap, rep)))      # listed, never downloaded
-                continue
+                if subs and _extra_kind(adap, rep) == "subtitle":
+                    kind = "subtitle"
+                else:
+                    info["extra"].append(_rep_summary(adap, rep, _extra_kind(adap, rep)))      # listed, never downloaded
+                    continue
             rep_id = rep.get("id", "0")
             chosen = tracks[kind]["meta"]
             if chosen is not None and chosen["rep_id"] != rep_id:
@@ -4868,6 +4872,179 @@ def parse_mpd_tasks(mpd_bytes, mpd_url, out_dir, now=None, window=12):
             else:
                 info["unsupported"].append(f"{kind}:{rep_id} (SegmentTemplate without SegmentTimeline or @duration)")
     return tracks, is_dynamic, skipped, info
+
+
+SUB_HANDLERS = (b"subt", b"text", b"sbtl", b"clcp")
+
+
+def m4s_shift_tfdt(data, delta):
+    """A media segment with every baseMediaDecodeTime moved earlier by `delta` ticks (floored at 0). Returns (bytes, first original time or None)."""
+    buf = bytearray(data)
+    first = None
+    for bt, ps, be in mp4_iter(buf):
+        if bt != b"moof":
+            continue
+        for tt, tps, tbe in mp4_iter(buf, ps, be):
+            if tt != b"traf":
+                continue
+            for ct, cps, cbe in mp4_iter(buf, tps, tbe):
+                if ct != b"tfdt" or cbe - cps < 8:
+                    continue
+                if buf[cps] == 1 and cbe - cps >= 12:
+                    old = struct.unpack(">Q", buf[cps + 4:cps + 12])[0]
+                    buf[cps + 4:cps + 12] = struct.pack(">Q", max(0, old - delta))
+                else:
+                    old = struct.unpack(">I", buf[cps + 4:cps + 8])[0]
+                    buf[cps + 4:cps + 8] = struct.pack(">I", max(0, min(0xFFFFFFFF, old - delta)))
+                if first is None:
+                    first = old
+    return bytes(buf), first
+
+
+def build_subtitle_mp4(init_path, segments, timescale, origin_sec, end_sec, dest):
+    """
+    Joins the init segment and the subtitle segments [(start_ticks, path, dur_sec)] into one fragmented MP4 whose timeline starts at the
+    video origin: segments that end before it (or start after `end_sec`) are dropped and the rest are moved by the origin. Returns a dict
+    {kept, dropped, first_gap}: first_gap is how much (s) the first kept segment starts before the origin (it is clamped to 0).
+    """
+    shift = int(round(origin_sec * timescale))
+    kept = dropped = 0
+    first_gap = 0.0
+    with open(dest, "wb") as out:
+        with open(init_path, "rb") as f:
+            out.write(f.read())
+        for start, path, dur in sorted(segments, key=lambda x: x[0]):
+            t0 = start / timescale
+            if t0 + dur <= origin_sec or (end_sec is not None and t0 >= end_sec):
+                dropped += 1
+                continue
+            with open(path, "rb") as f:
+                data, first = m4s_shift_tfdt(f.read(), shift)
+            if kept == 0 and first is not None:
+                first_gap = max(0.0, origin_sec - first / timescale)
+            out.write(data)
+            kept += 1
+    return {"kept": kept, "dropped": dropped, "first_gap": first_gap}
+
+
+def lang3(code):
+    """An ISO 639 code MP4Box accepts (2-3 letters), or ''."""
+    c = (code or "").strip().lower()
+    return c if re.fullmatch(r"[a-z]{2,3}", c) else ""
+
+
+def mp4_subtitle_tracks(path):
+    """[{id, fourcc, lang}] of the subtitle/text tracks of a regular MP4 ([] for any other file)."""
+    try:
+        moov, _, _ = mp4_read_moov(path)
+    except (Fail, OSError):
+        return []
+    res = []
+    for bt, s_, e_ in mp4_iter(moov):
+        if bt != b"trak":
+            continue
+        tkhd, mdia = mp4_child(moov, s_, e_, b"tkhd"), mp4_child(moov, s_, e_, b"mdia")
+        if not tkhd or not mdia:
+            continue
+        hdlr = mp4_child(moov, *mdia, b"hdlr")
+        if not hdlr or bytes(moov[hdlr[0] + 8:hdlr[0] + 12]) not in SUB_HANDLERS:
+            continue
+        tid = struct.unpack(">I", moov[_ver_off(moov, tkhd[0], 12, 20):][:4])[0]
+        mdhd = mp4_child(moov, *mdia, b"mdhd")
+        lang = ""
+        if mdhd:
+            v = struct.unpack(">H", moov[_ver_off(moov, mdhd[0], 20, 32):][:2])[0]
+            lang = "".join(chr(((v >> sh) & 31) + 0x60) for sh in (10, 5, 0))
+            lang = lang if lang.isalpha() else ""
+        minf = mp4_child(moov, *mdia, b"minf")
+        stbl = mp4_child(moov, *minf, b"stbl") if minf else None
+        stsd = mp4_child(moov, *stbl, b"stsd") if stbl else None
+        fourcc = moov[stsd[0] + 12:stsd[0] + 16].decode("latin1") if stsd and stsd[1] - stsd[0] >= 16 else "?"
+        res.append({"id": tid, "fourcc": fourcc, "lang": "" if lang == "und" else lang})
+    return res
+
+
+def reattach_subtitles(mp4box, src, dest, tracks):
+    """Copies the subtitle tracks of `src` into the finished MP4 `dest` (ffmpeg cannot write stpp/TTML into MP4). Returns '' or the reason it failed."""
+    tmp = dest.with_name(dest.name + ".sub.mp4")
+    try:
+        with MP4BoxJob(dest) as box:
+            cmd = [mp4box]
+            for t in tracks:
+                cmd += ["-add", f"{box.inp(src)}#trackID={t['id']}"]
+            cmd += [box.inp(dest), "-out", box.out(tmp)]
+            box.run(cmd, "subtitles", lambda f, d: None)
+        if not tmp.is_file() or not mp4_subtitle_tracks(tmp):
+            return "o MP4Box não gravou a trilha de legenda"
+        os.replace(tmp, dest)
+        return ""
+    except Fail as e:
+        return str(e)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def dash_session(a):
+    """requests.Session with the User-Agent, extra headers and proxy of a dash-* command."""
+    try:
+        import requests
+    except ImportError:
+        raise Fail("Este comando precisa do módulo 'requests': pip install requests")
+    sess = requests.Session()
+    sess.headers["User-Agent"] = a.user_agent or f"dtv_tools/{__version__}"
+    for h in a.header or []:
+        if ":" not in h:
+            raise Fail(f"--header deve ser 'Nome: valor' (recebi {h!r}).")
+        k_, v_ = h.split(":", 1)
+        sess.headers[k_.strip()] = v_.strip()
+    if a.proxy:
+        sess.proxies = {"http": a.proxy, "https": a.proxy}
+    return sess
+
+
+def cmd_dash_info(a):
+    """Reads a DASH manifest and says what it carries (video, LCEVC, audio, subtitles) without downloading any media."""
+    set_steps([("manifest", "Ler o manifesto")])
+    set_stages({"manifest": 100})
+    step("manifest", "running")
+    sess = dash_session(a)
+    try:
+        resp = sess.get(a.mpd_url, timeout=a.timeout)
+    except Exception as e:
+        raise Fail(f"Não consegui baixar o manifesto: {type(e).__name__}: {e}")
+    if resp.status_code != 200:
+        raise Fail(f"O manifesto respondeu HTTP {resp.status_code}.")
+    tmp = tempfile.mkdtemp(prefix="dtvinfo_")
+    try:
+        tracks, dynamic, skipped, info = parse_mpd_tasks(resp.content, a.mpd_url, tmp, subs=True)
+    except Exception as e:
+        raise Fail(f"O manifesto não pôde ser lido: {type(e).__name__}: {e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    subs = []
+    sm = tracks["subtitle"]["meta"]
+    if sm:
+        subs.append({"id": sm["rep_id"], "lang": sm.get("lang") or "", "codecs": sm.get("codecs") or "", "role": sm.get("role") or "",
+                     "label": sm.get("label") or "", "recordable": bool(tracks["subtitle"]["segs"])})
+    subs += [{"id": e["id"], "lang": e["lang"], "codecs": e["codecs"], "role": e["role"], "label": e["label"], "recordable": False}
+             for e in info["extra"] if e["kind"] == "alt_subtitle"]
+    streams = {"dynamic": bool(dynamic), "drm": bool(info["drm"]), "subtitles": subs,
+               "video": [dict(kind=k, **{x: tracks[k]["meta"].get(x) for x in ("rep_id", "codecs", "width", "height", "bandwidth")}) for k in ("vvc_base", "lcevc_enh") if tracks[k]["meta"]],
+               "audio": [{x: tracks["audio"]["meta"].get(x) for x in ("rep_id", "codecs", "lang", "channels", "bandwidth")}] if tracks["audio"]["meta"] else [],
+               "unsupported": info["unsupported"]}
+    if info["drm"]:
+        note("O stream é protegido (ContentProtection/DRM): não pode ser capturado.")
+    for u in info["unsupported"]:
+        note(f"Endereçamento não suportado, trilha ignorada: {u}")
+    rows = [["Manifesto", "dinâmico (ao vivo)" if dynamic else "estático"],
+            ["Vídeo", ", ".join(f"{v['codecs']} {v['width']}x{v['height']}" for v in streams["video"]) or "não encontrado"],
+            ["Áudio", ", ".join(f"{x['codecs']}" + (f" ({x['lang']})" if x.get("lang") else "") for x in streams["audio"]) or "não encontrado"],
+            ["Legenda", ", ".join((x["lang"] or "?") + f" ({x['codecs'] or '?'})" + ("" if x["recordable"] else " [não gravável]") for x in subs) or "nenhuma"]]
+    for k_, v_ in rows:
+        say(f"  {k_}: {v_}")
+    step("manifest", "done", "legenda encontrada" if subs else "sem legenda")
+    ev(type="result", out="", outputs=[], notes=NOTES, rows=rows, stream=streams)
+    return 0
 
 
 def compute_live_start(tracks, take_count):
@@ -5327,6 +5504,7 @@ def cmd_dash_capture(a):
         VERBOSE = True
     mp4box = find_mp4box(a.mp4box)
     ffmpeg_bin = optional_tool("ffmpeg", a.ffmpeg)
+    want_subs = bool(getattr(a, "subtitles", False))
     if a.thread_count < 1:
         raise Fail("--thread-count must be >= 1.")
     set_steps(DASH_STEPS)
@@ -5385,6 +5563,7 @@ def cmd_dash_capture(a):
     failed_logged, first_fail = set(), {}
     abandoned = {k: set() for k in DASH_KINDS}
     aud_wait = []
+    sst = {"init": None, "ts": 0, "meta": None, "files": {}, "dur": {}, "first_fail": {}, "lost": set(), "found": False}
     st = {"first_vvc_sec": None, "first_aud_sec": None, "has_audio": False, "cleaned": 0, "errors": 0, "announced": False,
           "live_start": None, "live_logged": False, "last_warn": ("", 0.0), "stop_reason": ""}
     from array import array
@@ -5477,7 +5656,7 @@ def cmd_dash_capture(a):
                 resp = session.get(a.mpd_url, timeout=3)
                 if resp.status_code != 200:
                     raise RuntimeError(f"manifest returned HTTP {resp.status_code}")
-                tracks, is_dynamic, skipped, minfo = parse_mpd_tasks(resp.content, a.mpd_url, str(work_dir))
+                tracks, is_dynamic, skipped, minfo = parse_mpd_tasks(resp.content, a.mpd_url, str(work_dir), subs=want_subs)
                 st["dynamic"] = is_dynamic
                 if minfo["drm"]:
                     raise Fail("The stream is protected (ContentProtection/DRM): it cannot be captured.")
@@ -5494,9 +5673,19 @@ def cmd_dash_capture(a):
                         note("Video or LCEVC track not found in the manifest: no 4K output is possible without both.")
                     st["announced"] = True
                     cap_t0[0] = time.time()
+                    sub_meta = tracks["subtitle"]["meta"] if want_subs else None
+                    extra_ev = list(minfo["extra"])
+                    if want_subs:
+                        if sub_meta and tracks["subtitle"]["segs"]:
+                            extra_ev.append({"kind": "subtitle", "id": sub_meta["rep_id"], "codecs": sub_meta["codecs"], "lang": sub_meta["lang"] or "",
+                                             "mime": "", "bandwidth": sub_meta["bandwidth"], "width": "", "height": "", "role": sub_meta["role"] or "",
+                                             "label": sub_meta["label"], "recorded": True})
+                            clog("INFO", f"Subtitles: recording '{sub_meta['lang'] or '?'}' ({sub_meta['codecs'] or '?'})")
+                        else:
+                            note("Legenda pedida, mas o manifesto não traz uma faixa de legenda que possa ser gravada.")
                     ev(type="tracks", dynamic=bool(is_dynamic), limit=a.live_record_limit or 0, drm=False,
                        captured=[dict(m, kind=k, id=m["rep_id"]) for k in DASH_KINDS if (m := tracks[k]["meta"])],
-                       extra=minfo["extra"])
+                       extra=extra_ev)
                     step("manifest", "done", f"{', '.join(found) or 'no tracks'}")
                     step("capture", "running")
                 if is_dynamic and a.live_take_count > 0:
@@ -5608,6 +5797,35 @@ def cmd_dash_capture(a):
                         
                     aud_wait.clear()
                     f_aud.flush()
+                if want_subs and tracks["subtitle"]["meta"]:
+                    try:
+                        sub = tracks["subtitle"]
+                        sst["meta"], sst["found"] = sub["meta"], True
+                        if sst["init"] is None and sub["init"]:
+                            nb, err = download_to_disk(session, sub["init"][0], sub["init"][1])
+                            if nb:
+                                sst["init"], sst["ts"] = sub["init"][1], parse_init_file(sub["init"][1])[0]
+                        if sst["init"]:
+                            sub_ts = sst["ts"] or sub["meta"]["timescale"]
+                            jobs_ = []
+                            for seg_key, seg_url, seg_path, dur in sub["segs"]:
+                                if seg_key in sst["files"] or seg_key in sst["lost"]:
+                                    continue
+                                if st["live_start"] is not None and seg_key / sub_ts < st["live_start"] - dur * 0.25:
+                                    continue
+                                jobs_.append((seg_key, seg_path, dur, executor.submit(download_to_disk, session, seg_url, seg_path)))
+                            for seg_key, seg_path, dur, fut in jobs_:
+                                nb, err = fut.result()
+                                if nb:
+                                    sst["files"][seg_key] = seg_path
+                                    sst["dur"][seg_key] = dur
+                                else:
+                                    now_ = time.time()
+                                    if now_ - sst["first_fail"].setdefault(seg_key, now_) > SEG_RETRY_SECONDS:
+                                        sst["lost"].add(seg_key)
+                                        clog("WARN", f"Subtitle segment lost: {os.path.basename(seg_path)} ({err})")
+                    except Exception as e_:
+                        warn_throttled(f"Subtitles: {type(e_).__name__}: {e_}")
                 st["cleaned"] += cleanup_old_segments(ttl_files, a.cleanup_after)
                 consecutive = 0
                 heartbeat()
@@ -5669,12 +5887,27 @@ def cmd_dash_capture(a):
     if final_mp4 != out_mp4:
         note(f"{out_mp4.name} appeared during the capture; saving as {final_mp4.name}.")
     origin = min(timing_p)
+    sub_info, sub_mp4 = None, None
+    if want_subs and sst["init"] and sst["files"]:
+        sub_mp4 = work_dir / "subtitles.mp4"
+        end_sec = max(timing_p) + 1.0 / max(fps, 1.0)
+        sub_info = build_subtitle_mp4(sst["init"], [(k, pth, sst["dur"][k]) for k, pth in sst["files"].items()], sst["ts"] or sst["meta"]["timescale"],
+                                      origin, end_sec, sub_mp4)
+        if not sub_info["kept"]:
+            sub_mp4 = None
+        elif sub_info["first_gap"] > 0.5:
+            note(f"A primeira legenda começa {sub_info['first_gap']:.1f} s antes do vídeo e foi alinhada ao início dele.")
+    elif want_subs and sst["found"]:
+        note("Nenhum segmento de legenda foi baixado; o MP4 sai sem legenda.")
     box = MP4BoxJob(temp_vvc)
     cmd = [mp4box, "-add", f"{box.inp(temp_vvc)}:fps={fps}#video:id=1"]
     delay_ms = 0
     if st["has_audio"]:
         delay_ms = av_delay_ms(st["first_aud_sec"], origin)
         cmd += ["-add", f"{box.inp(temp_aud)}{':delay=' + str(delay_ms) if delay_ms else ''}#audio:id=2"]
+    if sub_mp4 is not None:
+        lg = lang3(sst["meta"].get("lang"))
+        cmd += ["-add", f"{box.inp(sub_mp4)}{':lang=' + lg if lg else ''}"]
     tmp_out = work_dir / "capture_out.mp4"
     cmd += ["-new", box.out(tmp_out)]
     clog("INFO", f"Packaging the final MP4 ({merger.written} frames, {fps} fps)...")
@@ -5712,6 +5945,8 @@ def cmd_dash_capture(a):
 
     rows = [["Frames", str(merger.written)], ["Frame rate", f"{fps} fps"], ["LCEVC", f"{merger.paired}/{merger.written}"],
             ["Audio", "yes" if st["has_audio"] else "no"], ["Audio delay", f"{delay_ms} ms"]]
+    if want_subs:
+        rows.append(["Subtitles", f"{sst['meta'].get('lang') or '?'} ({sub_info['kept']} segments)" if sub_mp4 is not None else "none"])
     if verify:
         rows.append(["Enhancement", f"{verify[1]}/{verify[0]} frames"])
     ev(type="result", out=str(final_mp4), outputs=[{"kind": "capture", "title": "capture (VVC + SEI LCEVC" + (" + MPEG-H)" if st["has_audio"] else ")"),
@@ -6233,6 +6468,23 @@ def cmd_transcode(a):
                 note(f"Atraso do áudio no arquivo final: a trilha renderizada {j + 1} começa {d_ * 1000:+.0f} ms depois do vídeo, mas o esperado era "
                      f"{want * 1000:+.0f} ms. Se ouvir dessincronia, ajuste com --audio-delay (ms).")
         os.replace(part, out)                                          # only a finished file gets the final name
+        sub_row = None
+        sub_src = mp4_subtitle_tracks(src)
+        if sub_src and getattr(a, "no_subtitles", False):
+            sub_row = "removidas (--no-subtitles)"
+        elif sub_src and out.suffix.lower() not in (".mp4", ".m4v"):
+            note(f"A origem tem legenda, mas o contêiner {out.suffix.lstrip('.').upper()} não a recebe (TTML/stpp só cabe em MP4): a saída fica sem legenda.")
+            sub_row = "não copiadas (contêiner)"
+        elif sub_src:
+            try:
+                why = reattach_subtitles(find_mp4box(a.mp4box), src, out, sub_src)
+            except Fail as e:
+                why = str(e)
+            if why:
+                note(f"Não consegui copiar a legenda da origem para a saída ({why}). O vídeo está pronto, sem legenda.")
+                sub_row = "falhou"
+            else:
+                sub_row = ", ".join((t["lang"] or "?") for t in sub_src) + " (copiadas da origem)"
         step("encode", "done", f"{out.name} · {human(out.stat().st_size)} · {fmt_hms(got or 0)}")
         progress("encode", 1.0, force=True)
 
@@ -6245,6 +6497,7 @@ def cmd_transcode(a):
                 ["Trilhas de áudio", (f"{len(items)} renderizada(s): " + ", ".join(i['title'] for i in items) +
                                       (f" + {len(final['audio']) - len(items)} original(is)" if len(final['audio']) > len(items) else ""))
                  if items else f"{len(final['audio'])} (original)"],
+                *([["Legendas", sub_row]] if sub_row else []),
                 ["Tempo total", fmt_hms(time.time() - t0)]]
         made = [{"kind": "transcode", "title": f"Vídeo {CODEC_NAMES[E['codec']]} HDR10" + (" com todos os presets" if items else ""), "path": str(out.resolve()),
                  "size": out.stat().st_size, "duration": got}]
@@ -7466,9 +7719,21 @@ def build_parser():
     s_dash.add_argument("--header", action="append", metavar="'Name: value'", help="extra HTTP header (repeatable)")
     s_dash.add_argument("--user-agent", default="", help="HTTP User-Agent (default: dtv_tools/<version>)")
     s_dash.add_argument("--proxy", default="", help="HTTP(S) proxy URL")
+    s_dash.add_argument("--subtitles", action="store_true",
+                        help="also record the manifest's first subtitle/caption track (TTML/stpp) into the MP4 (default: subtitles are only listed)")
     s_dash.add_argument("--max-errors", type=int, default=150, metavar="N",
                         help="stop (and package) after N consecutive manifest failures; 0 = never (default: 150)")
     s_dash.add_argument("--overwrite", action="store_true")
+    s_info = sub.add_parser("dash-info", help="read a DASH manifest and list its tracks, subtitles included (no media is downloaded)")
+    s_info.add_argument("mpd_url", metavar="URL", help="manifest (MPD) URL")
+    s_info.add_argument("--header", action="append", metavar="'Name: value'", help="extra HTTP header (repeatable)")
+    s_info.add_argument("--user-agent", default="", help="HTTP User-Agent (default: dtv_tools/<version>)")
+    s_info.add_argument("--proxy", default="", help="HTTP(S) proxy URL")
+    s_info.add_argument("--timeout", type=float, default=10.0, metavar="SEC", help="manifest download timeout (default 10)")
+    machine_flags(s_info)
+    s_info.add_argument("-v", "--verbose", action="store_true")
+    s_info.add_argument("--no-color", action="store_true")
+    s_info.add_argument("--ascii", action="store_true")
     s_dash.add_argument("--tmpdir", "--tmp-dir", default="", help="base folder for temporary files (default: --save-dir)")
     s_dash.add_argument("--keep-temp", action="store_true")
     machine_flags(s_dash)
@@ -7497,6 +7762,8 @@ def build_parser():
     s_tc = sub.add_parser("transcode", help="single-track MP4 -> HEVC or AV1 10-bit HDR10 with every MPEG-H preset as an audio track")
     video_input_flags(s_tc)
     s_tc.add_argument("-o", "--output", default="", help="output file (default: <name>_hevc_hdr10.mp4 / <name>_av1_hdr10.mp4, or .mkv)")
+    s_tc.add_argument("--no-subtitles", action="store_true",
+                      help="do not carry the source's subtitle track(s) over to the output (by default they are copied into MP4 outputs)")
     s_tc.add_argument("--encoder", choices=tuple(ENCODERS), default="x265",
                       help="video encoder: x265 (CPU, default), nvenc (HEVC, NVIDIA GPU), av1 (SVT-AV1, CPU) or av1-nvenc (AV1, NVIDIA RTX 40+)")
     s_tc.add_argument("--crf", type=float, default=None, help="quality: x265 CRF (default 18), NVENC CQ (22), SVT-AV1 CRF (28)")
@@ -7915,7 +8182,7 @@ def main(argv=None):
     handlers = {"ts-tv3": cmd_ts_tv3, "mpegh-scan": cmd_mpegh_scan, "mpegh-audio": cmd_mpegh_audio,
                 "mp4-cut": cmd_mp4_cut, "dash-capture": cmd_dash_capture, "doctor": cmd_doctor, "check-update": cmd_check_update,
                 "transcode": cmd_transcode, "frame": cmd_frame, "sdr": cmd_sdr,
-                "preview": cmd_preview, "play": cmd_play, "fetch-tool": cmd_fetch_tool}
+                "preview": cmd_preview, "play": cmd_play, "fetch-tool": cmd_fetch_tool, "dash-info": cmd_dash_info}
     # BUILD-REMOVE-START-ADB
     handlers["adb-access"] = cmd_adb_access
     # BUILD-REMOVE-END-ADB

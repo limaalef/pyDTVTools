@@ -13,7 +13,7 @@ import os
 import sys
 
 APP_NAME = "DTV Tools"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--cli":
@@ -1272,6 +1272,10 @@ class TranscodePage(Page):
         fv.addRow("Tamanho de saída", self.size)
         fv.addRow("Codificar apenas os primeiros", self.limit)
         fv.addRow("", self.nolcevc)
+        self.nosubs = QCheckBox("Remover as legendas da origem (por padrão elas são copiadas para o MP4)")
+        self.nosubs.setToolTip("O ffmpeg não grava legenda TTML (stpp) em MP4; a cópia é feita depois da codificação, com o MP4Box. Em MKV a legenda não é copiada.")
+        fv.addRow("", self.nosubs)
+        self.remember("transcode", {"nosubs": self.nosubs})
         adv = Collapsible("Avançado: codificador e verificação", flat=True)
         f3 = QFormLayout()
         self.x265 = QLineEdit()
@@ -1592,6 +1596,8 @@ class TranscodePage(Page):
                 a += ["--limit", str(self.limit.value())]
             if self.nolcevc.isChecked():
                 a.append("--no-lcevc")
+            if self.nosubs.isChecked():
+                a.append("--no-subtitles")
             if mode == "render":
                 for s in specs:
                     a += ["--option", s]
@@ -1776,6 +1782,14 @@ class DashPage(Page):
         f.addRow("Duração máxima", self.limit)
         self.overwrite = QCheckBox("Substituir arquivo existente")
         f.addRow("", self.overwrite)
+        self.subs = QCheckBox("Gravar a legenda do stream no MP4 (quando houver)")
+        self.subs.setToolTip("Grava a primeira faixa de legenda do manifesto (TTML/stpp), alinhada ao vídeo. A escolha fica salva para as próximas capturas.")
+        self.verify_btn = QPushButton("Verificar o stream")
+        self.verify_btn.setToolTip("Lê o manifesto e mostra o que o stream traz, inclusive se há legenda. Não baixa nenhuma mídia.")
+        f.addRow("Legenda", left(self.subs, self.verify_btn))
+        self.sub_status = muted_label("")
+        self.sub_status.setWordWrap(True)
+        f.addRow("", self.sub_status)
         lay.addWidget(g)
         self.stream_card = g
         lay.addWidget(muted_label("Streams protegidos (DRM) não são suportados."))
@@ -1814,6 +1828,59 @@ class DashPage(Page):
         adv.content.addWidget(self.headers)
         lay.addWidget(adv)
         self.primary("Iniciar captura", lambda: self.run_built(self.build_jobs))
+        self.remember("dash", {"subs": self.subs})                       # a escolha de gravar ou não a legenda é lembrada
+        self.info_runner = Runner(self.win.runner.env_extra, self)        # a verificação não usa o painel de tarefas
+        self.info_runner.resultReady.connect(lambda job, res: self._info_result(res))
+        self.info_runner.errorReported.connect(lambda job, msg: self._info_error(msg))
+        self.info_runner.jobFinished.connect(lambda *_: self.verify_btn.setEnabled(not self._busy))
+        self.verify_btn.clicked.connect(self.verify_stream)
+        self.url.textChanged.connect(lambda *_: self.sub_status.setText(""))
+
+    def _remote_args(self) -> list:
+        a = []
+        for h in self.headers.values():
+            if ":" in h:
+                a += ["--header", h]
+        if self.ua.text().strip():
+            a += ["--user-agent", self.ua.text().strip()]
+        if self.proxy.text().strip():
+            a += ["--proxy", self.proxy.text().strip()]
+        return a
+
+    def verify_stream(self):
+        url = self.url.text().strip()
+        if not re.match(r"^https?://", url, re.I):
+            self.show_error("Informe a URL do manifesto (começando com http:// ou https://).")
+            return
+        self.show_error("")
+        self.sub_status.setText("Verificando o stream…")
+        self.verify_btn.setEnabled(False)
+        job = Job("Verificar o stream", ["dash-info", url, *self._remote_args()], kind="dash-info", page=self, meta={"quiet": True})
+        self._start_info(job, 25)
+
+    def _start_info(self, job, tries: int):
+        if self.info_runner.start([job]):
+            return
+        if tries > 0:                                                   # o processo anterior ainda está encerrando: tenta de novo daqui a pouco
+            QTimer.singleShot(200, lambda: self._start_info(job, tries - 1))
+        else:
+            self.sub_status.setText("Não foi possível verificar: o processo anterior não terminou.")
+            self.verify_btn.setEnabled(not self._busy)
+
+    def _info_result(self, res: dict):
+        st = res.get("stream") or {}
+        subs = st.get("subtitles") or []
+        if st.get("drm"):
+            self.sub_status.setText("O stream é protegido (DRM): não pode ser capturado.")
+        elif not subs:
+            self.sub_status.setText("Este stream não traz legenda." + (" A opção acima não terá efeito." if self.subs.isChecked() else ""))
+        else:
+            desc = ", ".join(f"{x.get('lang') or 'idioma não informado'} ({x.get('codecs') or '?'})" + ("" if x.get("recordable") else " — não gravável") for x in subs)
+            rec = any(x.get("recordable") for x in subs)
+            self.sub_status.setText(f"Legenda encontrada: {desc}. " + ("Marque a opção acima para gravá-la; a escolha fica salva." if rec else "Nenhuma pode ser gravada."))
+
+    def _info_error(self, msg: str):
+        self.sub_status.setText("Não foi possível verificar: " + msg)
 
     def set_busy(self, busy: bool):
         # a página não se desabilita inteira: o cartão de captura (e o botão Parar) precisam continuar ativos
@@ -1858,6 +1925,8 @@ class DashPage(Page):
             a += ["--header", h]
         if self.overwrite.isChecked():
             a.append("--overwrite")
+        if self.subs.isChecked():
+            a.append("--subtitles")
         a += self.extra("dash-capture")
         return [Job("Captura DASH", a, kind="dash-capture", page=self, indeterminate=not secs, stop_label="Forçar parada", force_only=True)]
 
@@ -2250,6 +2319,7 @@ class AdbPage(Page):
 
     def toggle(self):
         if self.running:
+            self._user_stop = True
             self.start_btn.setEnabled(False)
             self.runner.stop(False)
             return
@@ -2260,15 +2330,8 @@ class AdbPage(Page):
         if not re.fullmatch(r"[\w.:\-]+", dev):
             self.show_error("O aparelho deve ser um IP, IP:porta ou serial, sem espaços.")
             return
-        self.show_error("")
-        self.state, self.history = {}, []
-        self.hist.setText("")
-        self.dev_url.clear()
-        self.loc_url.clear()
-        self.player_info.setText("")
-        self.ports_card.setVisible(False)
-        for r in self.rows:
-            r.set(StatusIcon.PENDING, "")
+        self._user_stop = False
+        self._clear()
         self.rows[0].set(StatusIcon.RUNNING, "Procurando o adb…")
         a = ["adb-access", dev, "--api-port", str(self.api_port.value()), "--player-id", self.player_id.text().strip() or "1",
              "--interval", str(self.interval.value())]
@@ -2283,6 +2346,8 @@ class AdbPage(Page):
         a += self.extra("adb-access")
         if self.runner.start([Job("Acesso via ADB", a, kind="adb-access", page=self, meta={"quiet": True})]):
             self._set_running(True)
+        else:
+            self.show_error("O acompanhamento anterior ainda está encerrando. Tente de novo em instantes.")
 
     def _set_running(self, on: bool):
         self.running = on
@@ -2290,8 +2355,24 @@ class AdbPage(Page):
         self.start_btn.setEnabled(True)
         self.conn_card.setEnabled(not on)
 
+    def _clear(self):
+        """Volta o painel ao estado inicial: passos, endereços, histórico, varredura e mensagem."""
+        self.show_error("")
+        self.msg.setText("")
+        self.state, self.history = {}, []
+        for w in (self.hist, self.player_info, self.ports_lb):
+            w.setText("")
+        self.dev_url.clear()
+        self.loc_url.clear()
+        self.ports_card.setVisible(False)
+        self._reset()
+
     def _finished(self, ok: bool):
         self._set_running(False)
+        if getattr(self, "_user_stop", False):
+            self._user_stop = False
+            self._clear()
+            return
         for r in self.rows:
             if r.state == StatusIcon.RUNNING and not r.tag.text():
                 r.set(StatusIcon.PENDING, r.detail.text())

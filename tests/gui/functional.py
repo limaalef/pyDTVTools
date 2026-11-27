@@ -46,7 +46,7 @@ w.close()
 R.program_and_prefix = lambda: (sys.executable, [os.path.join(ROOT, "tests", "gui", "old_dtv.py")])
 w = G.MainWindow(); w.show(); wait(500); done(w); wait(200)
 txt = [r["status"].text() for r in w.pages["tools"].rows.values()]
-check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.3.2" in t and "unrecognized" in t for t in txt))
+check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.4.0" in t and "unrecognized" in t for t in txt))
 w.close()
 
 # --- 1d. prévia do Corte MP4: quadros (ffmpeg real) e reprodução (ffplay trocado por um script)
@@ -138,9 +138,14 @@ check("frame: tone mapping e opções voltam ao reabrir", fp.desat.value() == 1.
       and fp.hdr_avif.isChecked() and fp.white.value() == 300 and fp.avif_chroma.currentData() == "420")
 fp.desat.setValue(0); fp.tm.setCurrentIndex(0); fp.sdr_jpg.setChecked(False); fp.jpgq.setValue(95); fp.hdr_avif.setChecked(False); fp.white.setValue(203); fp.avif_chroma.setCurrentIndex(0)
 tp = w.pages["tools"]
+fe = tp.findChildren(G.FileEdit)[0]
+dlb = [b for b in tp.findChildren(G.QPushButton) if b.text().startswith("Baixar")]
+card = fe.parentWidget().layout()
+gl0 = fe.parentWidget().findChild(G.QGridLayout)
+check("ferramentas: 'Baixar…' fica na linha do status, na coluna ao lado, fora do campo", dlb and all(fe.layout().indexOf(b) < 0 for b in dlb) and gl0.getItemPosition(gl0.indexOf(dlb[0])) [:2] == (0, 2))
 import dtv_gui_dash as DG
-#b = DG.LiveBadge(); b.set_state("live", "AO VIVO")
-#check("captura DASH: selo sem animação e em texto simples", not hasattr(b, "_t") and b._text == "Ao vivo")
+b = DG.LiveBadge(); b.set_state("live", "AO VIVO")
+check("captura DASH: selo sem animação e em texto simples", not hasattr(b, "_t") and b._text == "Ao vivo")
 w.close()
 
 # --- 1g. Acesso via ADB (núcleo real + adb falso + API local do player): passo a passo, troca de canal, aviso, envio à Captura DASH
@@ -187,7 +192,7 @@ else: sys.exit(1)
     check("adb: página fica em Origem, acima da Captura DASH", [w.nav.item(i).text() for i in range(w.nav.count())][:4] == ["ORIGEM", "Acesso via ADB", "Captura DASH DTV+", "EDIÇÃO"])
     check("adb: o recurso está dentro do dtv_gui.py (sem módulo separado)", not os.path.exists(os.path.join(os.path.dirname(G.__file__), "dtv_gui_adb.py")))
     ap.api_port.setValue(sa.server_address[1]); ap.interval.setValue(1); ap.adb_path.edit.setText(os.path.join(tmp, "nao_existe_adb")); ap.device.setText("192.168.0.20")
-    ap.start_btn.click(); until(lambda: not ap.running, 15000)
+    ap.start_btn.click(); until(lambda: not ap.running, 15000); wait(400)
     check("adb: sem o programa o passo 1 explica o que fazer", "platform-tools" in ap.rows[0].detail.text())
     ap.adb_path.edit.setText(fake)
     ap.device.setText(""); ap.start_btn.click()
@@ -196,7 +201,7 @@ else: sys.exit(1)
     open(os.path.join(adbdir, "state"), "w").write("unauthorized\n")
     ap.start_btn.click(); until(lambda: "aparelho" in ap.rows[1].tag.text(), 15000)
     check("adb: aparelho não autorizado pede ação no aparelho", "Permitir" in ap.rows[1].detail.text() and "aparelho" in ap.rows[1].tag.text())
-    ap.start_btn.click(); until(lambda: not ap.running, 20000)
+    ap.start_btn.click(); until(lambda: not ap.running, 20000); wait(400)
     open(os.path.join(adbdir, "state"), "w").write("device\n")
     notes = []; w.notifier.notify = lambda *a: notes.append(a) or True
     ap.start_btn.click(); until(lambda: ap.loc_url.text() != "" and "manifesto" in ap.rows[4].detail.text(), 20000)
@@ -212,10 +217,54 @@ else: sys.exit(1)
     check("adb: player sem mídia pede um canal no aparelho", "canal" in ap.rows[3].detail.text())
     ap.start_btn.click(); until(lambda: not ap.running, 20000)
     check("adb: parar encerra e remove os redirecionamentos", ap.start_btn.text() == "Iniciar" and os.path.exists(os.path.join(adbdir, "removed")))
+    check("adb: parar limpa o painel (passos, endereços, histórico)", all(r.state == G.StatusIcon.PENDING for r in ap.rows) and ap.loc_url.text() == "" and ap.dev_url.text() == "" and ap.hist.text() == "" and not ap.history and not ap.capture_btn.isEnabled())
     w.close()
     for sv in (sm, sa): threading.Thread(target=sv.shutdown, daemon=True).start()
 else:
     print("SKIP adb (adb falso é script posix)")
+
+# --- 1h. Legendas: verificar o stream (núcleo real + MPD do teste), opção lembrada, remover no transcode
+R.program_and_prefix = REAL
+import shutil as _sh
+srvdir = os.path.join(tmp, "mpd"); os.makedirs(srvdir, exist_ok=True)
+_sh.copy(os.path.join(ROOT, "tests", "data", "dash_subtitle.mpd"), os.path.join(srvdir, "manifest.mpd"))
+_sh.copy(os.path.join(ROOT, "tests", "data", "dash_subtitle.mpd"), os.path.join(srvdir, "nosub.mpd"))
+txt = open(os.path.join(srvdir, "nosub.mpd")).read()
+import re as _re
+open(os.path.join(srvdir, "nosub.mpd"), "w").write(_re.sub(r"<AdaptationSet contentType=\"text\".*?</AdaptationSet>", "", txt, flags=_re.S))
+hs = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=srvdir))
+hs.RequestHandlerClass.log_message = lambda *a, **k: None
+threading.Thread(target=hs.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{hs.server_address[1]}"
+w = G.MainWindow(); w.show(); wait(300); done(w)
+dp = w.pages["dash"]
+check("legenda: opção 'gravar legenda' começa desligada e a verificação não gera tarefa no painel", not dp.subs.isChecked() and dp.verify_btn.isEnabled())
+dp.verify_btn.click(); wait(100)
+check("legenda: URL inválida pede o endereço", "URL do manifesto" in dp.msg.text())
+dp.url.setText(base + "/manifest.mpd"); dp.verify_btn.click()
+until(lambda: "encontrada" in dp.sub_status.text().lower(), 30000); until(lambda: dp.verify_btn.isEnabled(), 10000)
+check("legenda: verificação mostra o idioma e o codec da legenda", "por" in dp.sub_status.text() and "stpp" in dp.sub_status.text() and dp.verify_btn.isEnabled())
+dp.url.setText(base + "/nosub.mpd"); dp.verify_btn.click()
+until(lambda: "não traz legenda" in dp.sub_status.text(), 30000); until(lambda: dp.verify_btn.isEnabled(), 10000)
+check("legenda: stream sem legenda é informado", "não traz legenda" in dp.sub_status.text())
+dp.url.setText(base + "/nao_existe.mpd"); dp.verify_btn.click()
+until(lambda: "Não foi possível" in dp.sub_status.text(), 30000); until(lambda: dp.verify_btn.isEnabled(), 10000)
+check("legenda: erro de rede aparece junto do botão", "404" in dp.sub_status.text())
+dp.url.setText(base + "/manifest.mpd")
+check("legenda: sem a opção a captura não pede legenda", "--subtitles" not in dp.build_jobs()[0].args)
+dp.subs.setChecked(True)
+check("legenda: com a opção a captura recebe --subtitles", "--subtitles" in dp.build_jobs()[0].args)
+check("legenda: a escolha é salva", QSettings().value("dash/subs", False, bool) is True)
+w.close()
+w = G.MainWindow(); w.show(); wait(200)
+check("legenda: a escolha volta ao reabrir", w.pages["dash"].subs.isChecked())
+tcp = w.pages["transcode"]
+check("transcode: legendas são copiadas por padrão", not tcp.nosubs.isChecked())
+import dtv_gui_dash as _DG
+tr = _DG.TrackRow({"kind": "subtitle", "lang": "por", "codecs": "stpp.ttml.im1t", "recorded": True}, False)
+check("legenda: a linha do cartão diz que a legenda é gravada", "gravada no MP4" in tr.stat.text())
+w.close()
+threading.Thread(target=hs.shutdown, daemon=True).start()
 
 # --- 1c. ferramentas escolhidas na tela vão como opção explícita, sem precisar "Salvar"
 R.program_and_prefix = REAL
@@ -473,7 +522,7 @@ check("dash: cartão ao vivo escondido antes de gravar", not pg.live.isVisible()
 pg.url.setText("https://exemplo.tv/live/manifest.mpd")
 pg.run_built(pg.build_jobs)
 until(lambda: len(pg.live._rows) == 3 and pg.live.t_frames.value.text() not in ("—", "")); wait(300)
-check("dash: cartão aparece com o selo AO VIVO", pg.live.isVisible() and pg.live.badge._text in ["Ao vivo", "AO VIVO"])
+check("dash: cartão aparece com o selo AO VIVO", pg.live.isVisible() and pg.live.badge._text == "Ao vivo")
 check("dash: trilhas gravadas + legendas listadas", set(pg.live._rows) == {"vvc_base", "lcevc_enh", "audio"} and len(pg.live._extra_rows) == 2)
 check("dash: legendas marcadas como não gravadas", all("não é gravada" in r.stat.text() for r in pg.live._extra_rows))
 check("dash: linha da trilha mostra estado, velocidade e segmentos", "Mbps" in pg.live._rows["vvc_base"].stat.text() and "seg" in pg.live._rows["vvc_base"].stat.text())
@@ -483,17 +532,17 @@ check("dash: formulário travado, botão Parar ativo", not pg.stream_card.isEnab
 check("dash: painel com botão 'Forçar parada' e indicador simples", w.panel.stop_btn.text() == "Forçar parada" and w.panel.stop_btn.isEnabled()
       and w.panel.state_lb.text() == "Gravando ao vivo")
 pg.live.stop_btn.click(); until(lambda: not w.runner.busy); wait(300)
-check("dash: parar encerra e o cartão mostra INTERROMPIDA sem botão", pg.live.badge._text in ["Interrompida", "INTERROMPIDA"] and not pg.live.stop_btn.isVisible())
+check("dash: parar encerra e o cartão mostra INTERROMPIDA sem botão", pg.live.badge._text == "Interrompida" and not pg.live.stop_btn.isVisible())
 check("dash: formulário liberado depois de parar", pg.stream_card.isEnabled())
 w.runner.env_extra["FAKE_HOLD"] = ""; os.environ.pop("FAKE_HOLD", None)
 pg.run_built(pg.build_jobs)
 until(lambda: not w.runner.busy, 60000); wait(300)
-check("dash: execução completa termina como CONCLUÍDA", pg.live.badge._text in ["Concluída", "CONCLUÍDA"])
+check("dash: execução completa termina como CONCLUÍDA", pg.live.badge._text == "Concluída")
 # 'Forçar parada' do painel mata na hora (sem esperar o empacotamento)
 w.runner.env_extra["FAKE_HOLD"] = "49"
 pg.run_built(pg.build_jobs); until(lambda: len(pg.live._rows) == 3); wait(300)
 w.panel.stop_btn.click(); until(lambda: not w.runner.busy); wait(300)
-check("dash: 'Forçar parada' do painel termina o processo e fecha o cartão", pg.live.badge._text in ["Interrompida", "INTERROMPIDA"])
+check("dash: 'Forçar parada' do painel termina o processo e fecha o cartão", pg.live.badge._text == "Interrompida")
 w.runner.env_extra.pop("FAKE_HOLD", None); os.environ.pop("FAKE_HOLD", None)
 w.close()
 R.program_and_prefix = REAL

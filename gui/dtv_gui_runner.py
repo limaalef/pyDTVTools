@@ -201,7 +201,7 @@ class Runner(QObject):
         job = self.current_job()
         if job is not None and "hello" not in self._seen and self._proc is not None:
             self.logLine.emit(job, f"⚠ O dtv_tools não enviou nenhum evento em {self.HELLO_TIMEOUT_MS // 1000} s. "
-                                   "Confira se o dtv_tools.py da pasta acima de gui/ é a versão 1.3.2 e rode o mesmo subcomando num terminal.")
+                                   "Confira se o dtv_tools.py da pasta acima de gui/ é a versão 1.4.0 e rode o mesmo subcomando num terminal.")
 
     def _on_err_ready(self):
         if self._proc is None:
@@ -280,7 +280,7 @@ class Runner(QObject):
         if job is not None and not ({"result", "error"} & self._seen) and not self._stopped:
             # o processo terminou sem dizer nada utilizável: nunca deixar a tela só em "Verificando…"
             if "hello" not in self._seen:
-                why = ("O dtv_tools.py não respondeu no protocolo " + str(PROTOCOL) + " (é uma versão antiga? a interface precisa do dtv_tools 1.3.2 ou mais novo, "
+                why = ("O dtv_tools.py não respondeu no protocolo " + str(PROTOCOL) + " (é uma versão antiga? a interface precisa do dtv_tools 1.4.0 ou mais novo, "
                        "na pasta acima de gui/).")
             else:
                 why = "O processo terminou antes de entregar o resultado."

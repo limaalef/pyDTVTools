@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MPD availabilityStartTime="2026-11-11T23:39:06Z" maxSegmentDuration="PT2.006S" minBufferTime="PT2.002S" minimumUpdatePeriod="PT2.002S" profiles="urn:mpeg:dash:profile:isoff-broadcast:2015" publishTime="2026-11-25T04:46:04Z" suggestedPresentationDelay="PT2.002S" timeShiftBufferDepth="PT1M0.06S" type="dynamic" xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:cenc="urn:mpeg:cenc:2013" xmlns:dashif="https://dashif.org/" xmlns:scte214="urn:scte:dash:scte214-extensions" xmlns:scte35="http://www.scte.org/schemas/35/2016" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemalocation="urn:mpeg:dash:schema:mpd:2011 DASH-MPD.xsd http://dashif.org/guidelines/ContentProtection laurl.xsd">
+   <Period id="P0" start="PT0S">
+      <EventStream presentationTimeOffset="0" schemeIdUri="urn:scte:scte35:2014:xml+bin" timescale="60000">
+         <!-- no event -->
+      </EventStream>
+      <AdaptationSet contentType="video" id="0" maxFrameRate="60000/1001" maxHeight="2160" maxWidth="3840" mimeType="video/mp4" minFrameRate="60000/1001" minHeight="2160" minWidth="3840" par="16:9" segmentAlignment="true" startWithSAP="1">
+         <Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>
+         <SupplementalProperty schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="1"/>
+         <SegmentTemplate initialization="$RepresentationID$-init.mp4" media="$RepresentationID$-$Time$.m4s" timescale="60000">
+            <SegmentTimeline>
+               <S d="120120" r="29" t="68493506081"/>
+            </SegmentTimeline>
+         </SegmentTemplate>
+         <Representation bandwidth="13500000" codecs="lvc1" dependencyId="v1_1" frameRate="60000/1001" height="2160" id="v1_2" sar="1:1" width="3840"/>
+      </AdaptationSet>
+      <AdaptationSet contentType="video" id="1" maxFrameRate="60000/1001" maxHeight="1080" maxWidth="1920" mimeType="video/mp4" minFrameRate="60000/1001" minHeight="1080" minWidth="1920" par="16:9" segmentAlignment="true" startWithSAP="1">
+         <Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>
+         <SupplementalProperty schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="0"/>
+         <SegmentTemplate initialization="$RepresentationID$-init.mp4" media="$RepresentationID$-$Time$.m4s" timescale="60000">
+            <SegmentTimeline>
+               <S d="120120" r="29" t="68493506081"/>
+            </SegmentTimeline>
+         </SegmentTemplate>
+         <Representation bandwidth="12150000" codecs="vvc1.1.L83.CQA" frameRate="60000/1001" height="1080" id="v1_1" sar="1:1" scanType="progressive" width="1920"/>
+      </AdaptationSet>
+      <AdaptationSet contentType="audio" id="2" mimeType="audio/mp4" segmentAlignment="true" startWithSAP="1">
+         <SegmentTemplate initialization="$RepresentationID$-init.mp4" media="$RepresentationID$-$Time$.m4s" timescale="48000">
+            <SegmentTimeline>
+               <S d="96256" r="4" t="54794818049"/>
+               <S d="95232" t="54795299329"/>
+               <S d="96256" r="5" t="54795394561"/>
+               <S d="95232" t="54795972097"/>
+               <S d="96256" r="4" t="54796067329"/>
+               <S d="95232" t="54796548609"/>
+               <S d="96256" r="4" t="54796643841"/>
+               <S d="95232" t="54797125121"/>
+               <S d="96256" r="4" t="54797220353"/>
+            </SegmentTimeline>
+         </SegmentTemplate>
+         <AudioChannelConfiguration schemeIdUri="urn:mpeg:mpegB:cicp:ChannelConfiguration" value="2"/>
+         <Representation audioSamplingRate="48000" bandwidth="384000" codecs="mhm1.0x10" id="a2_3"/>
+      </AdaptationSet>
+      <AdaptationSet contentType="text" id="3" lang="por" mimeType="application/mp4" segmentAlignment="true" startWithSAP="1">
+         <SupplementalProperty schemeIdUri="http://dashif.org/guidelines/dash-atsc-closedcaption" value="ar:16-9;er:0;profile:0;3d:0"/>
+         <Role schemeIdUri="urn:mpeg:dash:role:2011" value="caption"/>
+         <SegmentTemplate initialization="$RepresentationID$-init.mp4" media="$RepresentationID$-$Time$.m4s" timescale="60000">
+            <SegmentTimeline>
+               <S d="120120" r="30" t="68493506081"/>
+            </SegmentTimeline>
+         </SegmentTemplate>
+         <Representation bandwidth="50000" codecs="stpp.ttml.im1t" id="Data3_4"/>
+      </AdaptationSet>
+   </Period>
+</MPD>
+

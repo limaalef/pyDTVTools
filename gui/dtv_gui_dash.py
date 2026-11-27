@@ -141,45 +141,28 @@ class SpeedGraph(QWidget):
 
 # ───────────────────────────── peças pequenas ─────────────────────────────
 class LiveBadge(QWidget):
-    """Ponto que pulsa + texto (AO VIVO / ESTÁTICO / EMPACOTANDO / CONCLUÍDO…)."""
+    """Estado em texto discreto, com um ponto fixo (sem animação): Ao vivo, Estático, Empacotando, Concluída…"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._text, self._kind, self._on = "", "idle", True
-        f = QFont(self.font())
-        f.setBold(True)
-        self.setFont(f)
-        self._t = QTimer(self, interval=650)
-        self._t.timeout.connect(self._blink)
-        self.setFixedHeight(26)
+        self._text, self._kind = "", "idle"
+        self.setFixedHeight(22)
 
     def set_state(self, kind: str, text: str):
-        self._kind, self._text, self._on = kind, text, True
-        (self._t.start if kind == "live" else self._t.stop)()
-        self.setFixedWidth(self.fontMetrics().horizontalAdvance(text) + 38)
-        self.update()
-
-    def _blink(self):
-        self._on = not self._on
+        self._kind, self._text = kind, text.capitalize() if text.isupper() else text
+        self.setFixedWidth(self.fontMetrics().horizontalAdvance(self._text) + 22)
         self.update()
 
     def paintEvent(self, e):
         c = Colors(self)
-        col = {"live": QColor("#e5484d" if c.dark else "#c42b1c"), "post": c.warn, "ok": c.ok, "err": c.err}.get(self._kind, c.muted)
+        col = {"err": c.err, "ok": c.ok}.get(self._kind, c.muted)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        bg = QColor(col)
-        bg.setAlpha(34)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(bg)
-        p.drawRoundedRect(QRectF(self.rect()), 13, 13)
-        dot = QColor(col)
-        if self._kind == "live" and not self._on:
-            dot.setAlpha(70)
-        p.setBrush(dot)
-        p.drawEllipse(QPointF(14, self.height() / 2), 4.5, 4.5)
-        p.setPen(col)
-        p.drawText(QRectF(26, 0, self.width() - 26, self.height()), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), self._text)
+        p.setBrush(col)
+        p.drawEllipse(QPointF(5, self.height() / 2), 3, 3)
+        p.setPen(c.muted if self._kind not in ("err", "ok") else col)
+        p.drawText(QRectF(14, 0, self.width() - 14, self.height()), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), self._text)
         p.end()
 
 
@@ -257,6 +240,8 @@ class TrackRow(QFrame):
             self.bar = ThinBar(self.kind)
             lay.addWidget(self.bar, 1, 1, 1, 2)
             self.stat.setText("Aguardando…")
+        elif t.get("recorded"):
+            self.stat.setText("Encontrada · gravada no MP4")
         else:
             self.stat.setText("Encontrada · não é gravada")
             self.chip.setEnabled(False)

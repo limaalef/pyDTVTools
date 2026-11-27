@@ -18,6 +18,7 @@ Caso você seja um uusário que tenha ressalvas ao uso de inteligência artifica
 | `sdr` | Gera imagens SDR a partir de um PNG HDR salvo |
 | `preview` | Extrai quadros reduzidos em SDR (com LCEVC) de alguns instantes: usado na prévia do Corte MP4 |
 | `play` | Reproduz um trecho no `ffplay`, sem áudio, com LCEVC e conversão HDR → SDR |
+| `dash-info` | Lê o manifesto DASH e lista o que o stream traz (vídeo, LCEVC, áudio e legendas), sem baixar mídia |
 | `fetch-tool` | Baixa um programa (no Windows, o pacote ffmpeg + ffplay + mpegh do `limaalef/ffmpeg-autobuild-lcevc-mpegh`; ou um .zip/.tar informado), confere o SHA-256, mostra a licença e extrai |
 | `doctor` | Verifica os programas externos e os módulos Python necessários para o script funcionar |
 | `check-update` | Consulta no GitHub se há uma versão mais nova publicada (não baixa nem instala nada) |
@@ -247,6 +248,7 @@ python dtv_tools.py dash-capture URL [--save-dir PASTA] [--save-name NOME] [--li
 | `--log-level` | `OFF`, `ERROR`, `WARN`, `INFO` (padrão) ou `DEBUG` |
 | `--header 'Nome: valor'` | Cabeçalho HTTP extra, repetível (por exemplo `--header 'Authorization: Bearer ...'`) |
 | `--user-agent TEXTO`, `--proxy URL` | Identidade do cliente HTTP (padrão `dtv_tools/<versão>`) e proxy |
+| `--subtitles` | Grava também a primeira faixa de legenda do manifesto (TTML/stpp) no MP4, alinhada ao vídeo (por padrão as legendas só são listadas). Use `dash-info` para saber se o stream tem legenda |
 | `--max-errors N` | Para e empacota após N falhas consecutivas do manifesto. padrão = 150, `0` = nunca) |
  
 ```
@@ -256,6 +258,10 @@ python dtv_tools.py dash-capture "https://example.com/live.mpd" --save-dir tv30_
 # Manifesto estático (o stream inteiro), 16 downloads em paralelo, por um proxy
 python dtv_tools.py dash-capture "https://example.com/vod.mpd" --thread-count 16 --proxy http://127.0.0.1:8080
  
+# Vê se o stream tem legenda e grava com ela
+python dtv_tools.py dash-info "https://example.com/live.mpd"
+python dtv_tools.py dash-capture "https://example.com/live.mpd" --subtitles
+
 # Mantém os segmentos para inspeção, log mais silencioso
 python dtv_tools.py dash-capture "https://example.com/live.mpd" --keep-temp --log-level WARN
 ```
@@ -284,6 +290,7 @@ python dtv_tools.py transcode ENTRADA.mp4 [-o SAIDA.mp4] [--audio render|copy|no
 | `--max-bitrate MBPS` | Limita o **pico** de bitrate do vídeo, em Mbit/s, mantendo a qualidade de `--crf` (0 = sem limite, o padrão). Funciona nos quatro codificadores (tabela abaixo). Referência: HEVC 20 Mbps, AV1 15 Mbps. O limite é aproximado: a média de um trecho curto pode passar um pouco dele |
 | `--encoder` | `x265` (CPU, padrão), `nvenc` (HEVC na GPU NVIDIA), `av1` (SVT-AV1, CPU) ou `av1-nvenc` (AV1 na GPU NVIDIA RTX 40 ou mais nova). Veja a tabela abaixo |
 | `--no-lcevc` | A origem não tem LCEVC (arquivo HDR10 comum): não usa o filtro |
+| `--no-subtitles` | Não leva as legendas da origem para a saída. Por padrão elas são copiadas para saídas MP4 (o ffmpeg não grava TTML/stpp em MP4, então a cópia é feita depois, com o MP4Box); em MKV não são copiadas |
 | `--size WxH`, `--no-size-fix` | Tamanho da saída. Por padrão só se usa um tamanho medido pela verificação LCEVC |
 | `--verify-frames` | Quadros decodificados na verificação LCEVC (padrão 48) |
 | `--limit SEG` | Codifica só os primeiros SEG segundos (teste rápido) |
