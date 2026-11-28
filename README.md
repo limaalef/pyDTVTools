@@ -310,10 +310,8 @@ python dtv_tools.py transcode ENTRADA.mp4 [-o SAIDA.mp4] [--audio render|copy|no
 | `--dry-run` | Mostra o comando do ffmpeg e para |
  
 O arquivo é gravado como `<saída>.part` e só recebe o nome final quando está completo; uma execução que falha nunca deixa um arquivo truncado com o nome final. **Extras do `result`:** `rows`, `notes`, `tracks`. **Etapas:** probe, (decode), encode, report.
- 
-### `frame`
- 
-Salva um quadro do mesmo tipo de arquivo como imagem: HDR (PNG 16 bits, AVIF 10 bits) e/ou SDR com tone mapping (PNG, JPG).
+
+#### Detalhes de codificação
 
 | `--encoder` | Codificador do ffmpeg | `--crf` padrão (faixa) | `--preset` (padrão) | Extras em `--encoder-params` |
 |---|---|---|---|---|
@@ -322,9 +320,13 @@ Salva um quadro do mesmo tipo de arquivo como imagem: HDR (PNG 16 bits, AVIF 10 
 | `av1` | `libsvtav1` | 28 (0–63) | `0`…`13` (`6`) | `chave=valor:chave=valor` |
 | `av1-nvenc` | `av1_nvenc` | 28 (0–63), valor CQ | `p1`…`p7` (`p5`) | `-opção valor …` |
 
-Como `--max-bitrate` chega a cada codificador: x265 usa `vbv-maxrate` e `vbv-bufsize` (CRF limitado); SVT-AV1 usa `mbr` (só no modo CRF); os NVENC usam `-maxrate` e `-bufsize` com `-rc vbr -cq … -b:v 0`. O buffer é sempre o dobro do limite. Testado com x265 e SVT-AV1 em codificações reais; nos NVENC o comando é o recomendado pela NVIDIA, mas não foi testado sem GPU.
+Como `--max-bitrate` chega a cada codificador: x265 usa `vbv-maxrate` e `vbv-bufsize` (CRF limitado); SVT-AV1 usa `mbr` (só no modo CRF); os NVENC usam `-maxrate` e `-bufsize` com `-rc vbr -cq … -b:v 0`. O buffer é sempre o dobro do limite.
 
 Os valores de qualidade não são equivalentes entre codificadores. No AV1, o mastering display e o MaxCLL/MaxFALL vão pelos parâmetros do SVT-AV1 (precisa da versão 1.2 ou mais nova). Nos codificadores NVENC eles só saem no arquivo se vierem nos quadros de entrada: confira a saída com `ffprobe -show_frames`. AV1 não é aceito em `.mov`. O `doctor` mostra quais codificadores o seu ffmpeg tem, e o `transcode` recusa, antes de começar, um que ele não tenha.
+ 
+### `frame`
+ 
+Salva um quadro do mesmo tipo de arquivo como imagem: HDR (PNG 16 bits, AVIF 10 bits) e/ou SDR com tone mapping (PNG, JPG).
 
 > [!IMPORTANT]
 > Necessário FFmpeg para utilizar este comando. No Python, é necessário ter os módulos `numpy` e `Pillow` instalados.
@@ -412,7 +414,7 @@ Eles **não estão incluídos**. Eles podem ser disponibilizados para utilizaç�
 3. `PATH`, caminho salvo como variável do ambiente;
 4. a pasta `tools/` ao lado do script (e suas subpastas diretas)
 
-## Interface gráfica e protocolo para máquinas
+## Protocolo para máquinas na criação da interfáce gráfica
 
 A pasta `gui/` tem uma interface desktop nativa (Qt 6 / PySide6) que executa estes mesmos comandos. Quando uma fila de tarefas termina (com sucesso,
 com erro ou interrompida), ela mostra um **aviso nativo do sistema** (central de notificações do Windows, Central de Notificações do macOS ou o
