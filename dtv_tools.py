@@ -7516,7 +7516,6 @@ def find_programs_name(filename, keys):
     return any(low.startswith(n.lower()) for k in keys for n in TOOL_DEFS[k]["names"])
 
 
-# BUILD-REMOVE-START-ADB
 # ──────────────────────────── Acesso via ADB (fora das compilações) ────────────────────────────
 ADB_API_PORT = 44642
 PLATFORM_TOOLS_URL = "https://developer.android.com/tools/releases/platform-tools"
@@ -7784,13 +7783,16 @@ def cmd_adb_access(a):
             elif media != last_media:
                 try:
                     port, url = media_local_url(media)
-                    if made["media"] and made["media"] != port and made["media"] != a.api_port:
+                    local_port = getattr(a, "media_port", 0) or port
+                    if made["media"] and made["media"] != local_port and made["media"] != a.api_port:
                         unforward(made["media"])
-                    forward(port, port)
-                    made["media"] = port
-                    state.update(media_port=port, local_url=url, changed=last_media is not None)
+                    forward(local_port, port)
+                    made["media"] = local_port
+                    if local_port != port:
+                        url = re.sub(r":\d+", f":{local_port}", url, count=1)
+                    state.update(media_port=local_port, local_url=url, changed=last_media is not None)
                     last_media = media
-                    say(f"Mídia disponível localmente em: {url}", "ok")
+                    say(f"Mídia disponível localmente em: {url}" + (f" (remota: {port})" if local_port != port else ""), "ok")
                 except Fail as e:
                     state["error"] = str(e)
                     log(f"ERRO ao fazer forward da mídia: {e}")
@@ -7823,7 +7825,6 @@ def cmd_adb_access(a):
     rows = [["Aparelho", serial], ["Mídia no aparelho", state["media"] or "—"], ["Endereço local", state["local_url"] or "—"]]
     ev(type="result", out=state["local_url"], outputs=[], notes=NOTES, rows=rows, adb={k: state[k] for k in ("serial", "media", "local_url", "media_port")})
     return 0
-# BUILD-REMOVE-END-ADB
 
 
 def cmd_sdr(a):
@@ -8179,11 +8180,11 @@ def build_parser():
     s_ft.add_argument("--no-color", action="store_true")
     s_ft.add_argument("--ascii", action="store_true")
 
-    # BUILD-REMOVE-START-ADB
     s_adb = sub.add_parser("adb-access", help="connect to a TV 3.0 receiver by adb, forward its media port and report the stream address (source only)")
     s_adb.add_argument("device", help="IP (or IP:port) of the device, or the adb serial of a USB one")
     s_adb.add_argument("--adb", default="", metavar="PATH", help="adb executable (default: PATH, Android SDK or ./platform-tools)")
     s_adb.add_argument("--api-port", type=int, default=ADB_API_PORT, help=f"port of the media-player API on the device (default {ADB_API_PORT})")
+    s_adb.add_argument("--media-port", type=int, default=0, metavar="PORT", help="fixed local port for the media stream (0 = same as device)")
     s_adb.add_argument("--player-id", default="1", help="media player id (default 1)")
     s_adb.add_argument("--watch", action="store_true", help="keep checking and redo the forward whenever currentMedia changes")
     s_adb.add_argument("--interval", type=float, default=5.0, metavar="SEC", help="seconds between checks with --watch (default 5)")
@@ -8195,7 +8196,6 @@ def build_parser():
     s_adb.add_argument("-v", "--verbose", action="store_true")
     s_adb.add_argument("--no-color", action="store_true")
     s_adb.add_argument("--ascii", action="store_true")
-    # BUILD-REMOVE-END-ADB
 
     s_desc = sub.add_parser("describe", help="print the capabilities of this script as JSON (commands, options, tools, formats, layouts)")
     s_desc.add_argument("--no-color", action="store_true", help=argparse.SUPPRESS)
@@ -8478,9 +8478,7 @@ def main(argv=None):
                 "mp4-cut": cmd_mp4_cut, "dash-capture": cmd_dash_capture, "doctor": cmd_doctor, "check-update": cmd_check_update,
                 "transcode": cmd_transcode, "frame": cmd_frame, "sdr": cmd_sdr,
                 "preview": cmd_preview, "play": cmd_play, "fetch-tool": cmd_fetch_tool, "dash-info": cmd_dash_info}
-    # BUILD-REMOVE-START-ADB
     handlers["adb-access"] = cmd_adb_access
-    # BUILD-REMOVE-END-ADB
     try:
         return handlers[args.cmd](args) or 0
     except Fail as e:

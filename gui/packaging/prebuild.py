@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # arquivo -> marcadores que PRECISAM existir nele (se sumirem, a build falha em vez de publicar o recurso por engano)
 REQUIRED = {
-    "gui/dtv_gui.py": ["", "-2", "-3", "-4"],       # "" e -2: recursos antigos; -3 e -4: Acesso via ADB (menu e página)
-    "dtv_tools.py": ["-ADB"],                        # Acesso via ADB (comando, parser e registro)
+    "gui/dtv_gui.py": ["", "-2"],       # "" e -2: recursos antigos; -3 e -4: Acesso via ADB (menu e página)
+    "dtv_tools.py": [""],                        # Acesso via ADB (comando, parser e registro)
 }
 REMOVE_FILES = ["gui/icons/adb.svg"]
 

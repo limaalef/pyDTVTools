@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller (a partir da raiz do projeto): pyinstaller gui/packaging/dtv_tools_gui.spec --noconfirm
 #   DTV_TOOLS_SRC=<pasta>   (opcional) pasta com MP4Box/ffmpeg/mpegh* a embutir como tools/
-#   DTV_VERSION=1.4.0       (opcional) versão exibida no bundle do macOS
+#   DTV_VERSION=1.5.0       (opcional) versão exibida no bundle do macOS
 #   DTV_ONEDIR=1            (opcional) pasta com _internal/ em vez de um único arquivo (Windows/Linux; o macOS sempre gera .app)
 import os
 import sys
@@ -10,7 +10,7 @@ from pathlib import Path
 GUI = Path(SPECPATH).resolve().parent      # gui/
 ROOT = GUI.parent                           # raiz do projeto (dtv_tools.py)
 NAME = "DTV-Tools"
-VERSION = os.environ.get("DTV_VERSION", "1.4.0")
+VERSION = os.environ.get("DTV_VERSION", "1.5.0")
 # macOS: assinatura Developer ID (opcional). Sem DTV_MAC_IDENTITY o app sai sem assinatura própria (o PyInstaller usa assinatura ad-hoc no arm64).
 MAC_ID = os.environ.get("DTV_MAC_IDENTITY") or None
 ENTITLEMENTS = str(GUI / "packaging" / "entitlements.plist") if MAC_ID else None

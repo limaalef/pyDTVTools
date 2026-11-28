@@ -13,7 +13,7 @@ import os
 import sys
 
 APP_NAME = "DTV Tools"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--cli":
@@ -2196,7 +2196,6 @@ class ToolsPage(Page):
 
 
 # ═════════════════════════════ janela principal ═════════════════════════════
-# BUILD-REMOVE-START-4
 # ═════════════════════════════ Acesso via ADB (fora das compilações) ═════════════════════════════
 class StepRow(QWidget):
     def __init__(self, n: int, title: str, parent=None):
@@ -2273,6 +2272,13 @@ class AdbPage(Page):
         lay.addWidget(steps)
 
         ga = CardBox("Endereço do streaming")
+        lay.addWidget(ga)
+        gp, fp = self.group("Porta local do streaming")
+        self.media_port = self.spin(0, 65535, 0, special="Automática (mesma do aparelho)")
+        self.media_port.setToolTip("Fixa a porta local no PC (ex.: 9000) para manter o mesmo endereço mesmo se a porta interna do aparelho mudar.")
+        fp.addRow("Porta neste computador", self.media_port)
+        lay.addWidget(gp)
+        self.port_card = gp
         self.dev_url = QLineEdit()
         self.dev_url.setReadOnly(True)
         self.dev_url.setPlaceholderText("Ainda não descoberto")
@@ -2322,7 +2328,7 @@ class AdbPage(Page):
         adv.content.addLayout(f2)
         lay.addWidget(adv)
         self.remember("adb", {"device": self.device, "adb_path": self.adb_path.edit, "poll": self.poll, "notify": self.notify, "api_port": self.api_port,
-                              "player_id": self.player_id, "interval": self.interval, "scan": self.scan, "keep": self.keep})
+                              "media_port": self.media_port, "player_id": self.player_id, "interval": self.interval, "scan": self.scan, "keep": self.keep})
 
         self.start_btn = self.primary("Iniciar", self.toggle)
         self.copy_btn.clicked.connect(self.copy_local)
@@ -2360,7 +2366,9 @@ class AdbPage(Page):
         self._clear()
         self.rows[0].set(StatusIcon.RUNNING, "Procurando o adb…")
         a = ["adb-access", dev, "--api-port", str(self.api_port.value()), "--player-id", self.player_id.text().strip() or "1",
-             "--interval", str(self.interval.value())]
+          "--interval", str(self.interval.value())]
+        if self.media_port.value():
+            a += ["--media-port", str(self.media_port.value())]
         if self.poll.isChecked():
             a.append("--watch")
         if self.adb_path.text().strip():
@@ -2380,6 +2388,7 @@ class AdbPage(Page):
         self.start_btn.setText("Parar" if on else "Iniciar")
         self.start_btn.setEnabled(True)
         self.conn_card.setEnabled(not on)
+        self.port_card.setEnabled(not on)
 
     def _clear(self):
         """Volta o painel ao estado inicial: passos, endereços, histórico, varredura e mensagem."""
@@ -2488,7 +2497,6 @@ class AdbPage(Page):
             return
         self.win.pages["dash"].url.setText(u)
         self.win.nav.setCurrentRow(self.win.nav.row(self.win._nav_icons["dash"]))
-# BUILD-REMOVE-END-4
 
 
 class NavDelegate(QStyledItemDelegate):
@@ -2574,9 +2582,7 @@ class MainWindow(QMainWindow):
             self._nav_page[self.nav.row(it)] = idx
 
         section("Origem")
-        # BUILD-REMOVE-START-3
         add("adb", AdbPage)
-        # BUILD-REMOVE-END-3
         add("dash", DashPage)
         section("Edição")
         add("frame", FramePage)

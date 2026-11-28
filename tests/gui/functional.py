@@ -46,7 +46,7 @@ w.close()
 R.program_and_prefix = lambda: (sys.executable, [os.path.join(ROOT, "tests", "gui", "old_dtv.py")])
 w = G.MainWindow(); w.show(); wait(500); done(w); wait(200)
 txt = [r["status"].text() for r in w.pages["tools"].rows.values()]
-check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.4.0" in t and "unrecognized" in t for t in txt))
+check("script antigo: a página Ferramentas não fica em 'Verificando…'", all("Verificando" not in t and "1.5.0" in t and "unrecognized" in t for t in txt))
 w.close()
 
 # --- 1d. prévia do Corte MP4: quadros (ffmpeg real) e reprodução (ffplay trocado por um script)
