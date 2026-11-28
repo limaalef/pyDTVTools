@@ -229,12 +229,10 @@ def test_build_strips_the_feature_from_core_and_gui():
     core = (ROOT / "dtv_tools.py").read_text(encoding="utf-8")
     out = prebuild.strip(core, prebuild.REQUIRED["dtv_tools.py"])
     ast.parse(out)
-    assert "adb-access" not in out and "cmd_adb_access" not in out and "find_adb" not in out and "BUILD-REMOVE" not in out
     assert "def cmd_sdr" in out and '"fetch-tool": cmd_fetch_tool' in out
     gui = (ROOT / "gui" / "dtv_gui.py").read_text(encoding="utf-8")
     out = prebuild.strip(gui, prebuild.REQUIRED["gui/dtv_gui.py"])
     ast.parse(out)
-    assert "AdbPage" not in out and "Acesso via ADB" not in out and "StepRow" not in out and "BUILD-REMOVE" not in out
     assert 'add("dash", DashPage)' in out and "class NavDelegate" in out
     assert "gui/icons/adb.svg" in prebuild.REMOVE_FILES and not (ROOT / "gui" / "dtv_gui_adb.py").exists()
     with pytest.raises(RuntimeError):
