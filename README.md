@@ -259,6 +259,8 @@ python dtv_tools.py dash-capture URL [--save-dir PASTA] [--save-name NOME] [--li
 | `--header 'Nome: valor'` | Cabeçalho HTTP extra, repetível (por exemplo `--header 'Authorization: Bearer ...'`) |
 | `--user-agent TEXTO`, `--proxy URL` | Identidade do cliente HTTP (padrão `dtv_tools/<versão>`) e proxy |
 | `--subtitles` | Grava também a primeira faixa de legenda do manifesto (TTML/stpp) no MP4, alinhada ao vídeo (por padrão as legendas só são listadas). Use `dash-info` para saber se o stream tem legenda |
+| `--subtitle-format {tx3g,stpp,both}` | Como a legenda é gravada (com `--subtitles`). `tx3g` (padrão) converte o TTML para mov_text, que o ffmpeg, VLC, mpv, QuickTime, a maioria das TVs e Plex/Jellyfin/Emby leem (perde posição e cor, mantém itálico e negrito); `stpp` mantém o TTML original, que só players DASH e o GPAC leem; `both` grava os dois |
+| `--subtitle-sidecar` | Grava também `<vídeo>.<idioma>.srt` ao lado do MP4 |
 | `--max-errors N` | Para e empacota após N falhas consecutivas do manifesto. padrão = 150, `0` = nunca) |
  
 ```
@@ -300,6 +302,7 @@ python dtv_tools.py transcode ENTRADA.mp4 [-o SAIDA.mp4] [--audio render|copy|no
 | `--max-bitrate MBPS` | Limita o **pico** de bitrate do vídeo, em Mbit/s, mantendo a qualidade de `--crf` (0 = sem limite, o padrão). Funciona nos quatro codificadores (tabela abaixo). Referência: HEVC 20 Mbps, AV1 15 Mbps. O limite é aproximado: a média de um trecho curto pode passar um pouco dele |
 | `--encoder` | `x265` (CPU, padrão), `nvenc` (HEVC na GPU NVIDIA), `av1` (SVT-AV1, CPU) ou `av1-nvenc` (AV1 na GPU NVIDIA RTX 40 ou mais nova). Veja a tabela abaixo |
 | `--no-lcevc` | A origem não tem LCEVC (arquivo HDR10 comum): não usa o filtro |
+| `--subtitle-format {tx3g,stpp,both}`, `--subtitle-sidecar` | Legenda TTML (stpp) da origem: converte para tx3g (padrão), mantém como stpp ou grava os dois; o sidecar grava também o `.srt` |
 | `--no-subtitles` | Não leva as legendas da origem para a saída. Por padrão elas são copiadas para saídas MP4 (o ffmpeg não grava TTML/stpp em MP4, então a cópia é feita depois, com o MP4Box); em MKV não são copiadas |
 | `--size WxH`, `--no-size-fix` | Tamanho da saída. Por padrão só se usa um tamanho medido pela verificação LCEVC |
 | `--verify-frames` | Quadros decodificados na verificação LCEVC (padrão 48) |

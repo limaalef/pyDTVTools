@@ -121,16 +121,89 @@ def run_tc(media, tmp_path, *extra):
     return Path(res["out"]), res
 
 
+HAS_X265 = bool(shutil.which("ffmpeg")) and "libx265" in subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+
+
+def tracks_of(path):
+    return [(t["fourcc"], t["lang"]) for t in d.mp4_subtitle_tracks(path)]
+
+
 @need_tools
-@pytest.mark.skipif("libx265" not in subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout if shutil.which("ffmpeg") else True,
-                    reason="ffmpeg sem libx265")
-def test_transcode_copies_or_removes_the_subtitles(media, tmp_path):
-    out, res = run_tc(media, tmp_path)
-    assert [t["lang"] for t in d.mp4_subtitle_tracks(out)] == ["por"] and ["Legendas", "por (copiadas da origem)"] in res["rows"]
-    out2, res2 = run_tc(media, tmp_path / "x", "--no-subtitles") if (tmp_path / "x").mkdir() is None else (None, None)
-    assert d.mp4_subtitle_tracks(out2) == [] and any(r[0] == "Legendas" and "removidas" in r[1] for r in res2["rows"])
-    mkv, resm = run_tc(media, tmp_path, "-o", str(tmp_path / "o.mkv"))
+@pytest.mark.skipif(not HAS_X265, reason="ffmpeg sem libx265")
+def test_transcode_converts_ttml_to_tx3g_by_default(media, tmp_path):
+    out, res = run_tc(media, tmp_path, "--subtitle-sidecar")
+    assert tracks_of(out) == [("tx3g", "por")] and any(r[0] == "Legendas" and "tx3g" in r[1] and "convertida" in r[1] for r in res["rows"])
+    assert (tmp_path / f"{out.stem}.por.srt").read_text(encoding="utf-8").startswith("1\n00:00:01,000 --> 00:00:03,000\nOla mundo\n")
+    r = sh("ffmpeg", "-v", "error", "-i", out, "-map", "0:s:0", "-f", "srt", "-")                      # ffmpeg, and so most players, can read it
+    assert "Ola mundo" in r.stdout and "Terceira" in r.stdout
+
+
+@need_tools
+@pytest.mark.skipif(not HAS_X265, reason="ffmpeg sem libx265")
+def test_transcode_keeps_stpp_or_both_or_removes(media, tmp_path):
+    (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir(); (tmp_path / "c").mkdir(); (tmp_path / "e").mkdir()
+    out, _ = run_tc(media, tmp_path / "a", "--subtitle-format", "stpp")
+    assert tracks_of(out) == [("stpp", "por")]
+    out, _ = run_tc(media, tmp_path / "b", "--subtitle-format", "both")
+    assert sorted(tracks_of(out)) == [("stpp", "por"), ("tx3g", "por")]
+    out, res = run_tc(media, tmp_path / "c", "--no-subtitles")
+    assert tracks_of(out) == [] and any(r[0] == "Legendas" and "removidas" in r[1] for r in res["rows"])
+    mkv, resm = run_tc(media, tmp_path / "e", "-o", str(tmp_path / "e" / "o.mkv"))
     assert mkv.suffix == ".mkv" and any("não a recebe" in n for n in resm["notes"])
+
+
+# ───────── TTML → cues ─────────
+def tt(body, attrs=""):
+    return f'<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml" xmlns:tts="http://www.w3.org/ns/ttml#styling" xmlns:ttp="http://www.w3.org/ns/ttml#parameter" {attrs}>{body}</tt>'
+
+
+def test_ttml_times_styles_and_breaks():
+    xml = tt('<head><styling><style xml:id="it" tts:fontStyle="italic"/></styling></head><body><div begin="10s">'
+             '<p begin="00:00:01.500" end="00:00:03.000">Linha  um<br/>linha <span style="it">dois</span></p>'
+             '<p begin="500ms" dur="2s"><span tts:fontWeight="bold">Negrito</span> normal</p>'
+             '<p begin="30f" end="60f">Quadros</p><p begin="0s" end="0s">vazio</p><p begin="1s" end="2s">   </p></div></body>', 'ttp:frameRate="30"')
+    c = d.parse_ttml_cues(xml)
+    assert c[0] == (11.5, 13.0, "Linha um\nlinha <i>dois</i>")
+    assert c[1] == (10.5, 12.5, "<b>Negrito</b> normal")
+    assert c[2] == (11.0, 12.0, "Quadros")
+    assert len(c) == 3 and d.ttml_seconds("1200ms") == 1.2 and d.ttml_seconds("10t", tick=10) == 1.0 and d.ttml_seconds("xx") is None
+    assert d.parse_ttml_cues(tt("<body/>")) == []
+    with pytest.raises(Exception):
+        d.parse_ttml_cues("<tt")
+
+
+def doc(begin, end, text="Oi"):
+    begin, end = f"{begin}s", f"{end}s"
+    return tt(f'<body><div><p begin="{begin}" end="{end}">{text}</p></div></body>')
+
+
+def test_docs_to_cues_detects_the_time_base_and_merges_repeats():
+    # times on the track's own timeline (inside the sample window)
+    c, mode = d.ttml_docs_to_cues([(100.0, 2.0, doc("100.5", "103.0")), (102.0, 2.0, doc("100.5", "103.0")), (104.0, 2.0, doc("105", "105.5", "Outra"))])
+    assert mode == "aligned" and c == [(100.5, 103.0, "Oi"), (105.0, 105.5, "Outra")]            # the repeated cue became one
+    # relative to each sample
+    c, mode = d.ttml_docs_to_cues([(100.0, 2.0, doc("0.5", "1.5")), (102.0, 2.0, doc("0.2", "1")), (104.0, 2.0, "<tt")])
+    assert mode == "relative" and c == [(100.5, 101.5, "Oi"), (102.2, 103.0, "Oi")]
+    # another epoch: the constant difference seen in the first document is removed
+    c, mode = d.ttml_docs_to_cues([(0.0, 2.0, doc("5000.0", "5001.0")), (2.0, 2.0, doc("5002.0", "5003.0", "Dois"))])
+    assert mode == "offset" and c == [(0.0, 1.0, "Oi"), (2.0, 3.0, "Dois")]
+    assert d.ttml_docs_to_cues([(0.0, 2.0, tt("<body/>"))]) == ([], "aligned")
+
+
+def test_srt_text():
+    assert d.srt_text([(0.0, 1.5, "A"), (3661.25, 3662.0, "B\nC")]) == "1\n00:00:00,000 --> 00:00:01,500\nA\n\n2\n01:01:01,250 --> 01:01:02,000\nB\nC\n\n"
+
+
+@need_tools
+def test_samples_are_read_from_segments_and_files(media):
+    smp = d.m4s_samples((media / "seg_1.m4s").read_bytes())
+    assert smp and smp[0][0] == 0 and any(b"Ola mundo" in pl for _, _, pl in smp)
+    docs = [(t / 1000, du / 1000, pl.decode()) for f in ("seg_1.m4s", "seg_2.m4s", "seg_3.m4s") for t, du, pl in d.m4s_samples((media / f).read_bytes())]
+    cues, mode = d.ttml_docs_to_cues(docs)
+    assert [c[2] for c in cues] == ["Ola mundo", "Segunda", "Terceira"] and cues[0][:2] == (1.0, 3.0) and mode == "aligned"
+    tid = d.mp4_subtitle_tracks(media / "vs.mp4")[0]["id"]
+    fdocs = d.mp4_stpp_docs(media / "vs.mp4", tid)
+    assert fdocs and d.ttml_docs_to_cues(fdocs)[0][1][2] == "Segunda"
 
 
 # ───────── dash-info ─────────

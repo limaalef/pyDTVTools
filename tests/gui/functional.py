@@ -248,7 +248,11 @@ dp.url.setText(base + "/nosub.mpd"); dp.verify_btn.click()
 until(lambda: "não traz legenda" in dp.sub_status.text(), 30000); until(lambda: dp.verify_btn.isEnabled(), 10000)
 check("legenda: stream sem legenda é informado", "não traz legenda" in dp.sub_status.text())
 dp.url.setText(base + "/nao_existe.mpd"); dp.verify_btn.click()
-until(lambda: "Não foi possível" in dp.sub_status.text(), 30000); until(lambda: dp.verify_btn.isEnabled(), 10000)
+until(lambda: "Não foi possível" in dp.sub_status.text(), 30000)
+try:
+    until(lambda: dp.verify_btn.isEnabled(), 10000)
+except AssertionError:
+    print("DEBUG", repr(dp.sub_status.text()), dp._busy, dp.info_runner._proc); raise
 check("legenda: erro de rede aparece junto do botão", "404" in dp.sub_status.text())
 dp.url.setText(base + "/manifest.mpd")
 check("legenda: sem a opção a captura não pede legenda", "--subtitles" not in dp.build_jobs()[0].args)
@@ -257,9 +261,17 @@ check("legenda: com a opção a captura recebe --subtitles", "--subtitles" in dp
 check("legenda: a escolha é salva", QSettings().value("dash/subs", False, bool) is True)
 w.close()
 w = G.MainWindow(); w.show(); wait(200)
-check("legenda: a escolha volta ao reabrir", w.pages["dash"].subs.isChecked())
+dp2 = w.pages["dash"]
+check("legenda: a escolha volta ao reabrir", dp2.subs.isChecked())
 tcp = w.pages["transcode"]
 check("transcode: legendas são copiadas por padrão", not tcp.nosubs.isChecked())
+check("legenda: formato padrão é tx3g e o .srt é opcional", dp2.sub_fmt.currentData() == "tx3g" and not dp2.sub_srt.isChecked() and tcp.tc_sub_fmt.currentData() == "tx3g")
+dp2.url.setText(base + "/manifest.mpd"); dp2.sub_fmt.setCurrentIndex(2); dp2.sub_srt.setChecked(True)
+ja = dp2.build_jobs()[0].args
+check("legenda: captura recebe formato e .srt escolhidos", "--subtitle-format" in ja and ja[ja.index("--subtitle-format") + 1] == "both" and "--subtitle-sidecar" in ja)
+dp2.subs.setChecked(False)
+check("legenda: sem gravar legenda nada é passado", "--subtitle-format" not in dp2.build_jobs()[0].args)
+dp2.subs.setChecked(True)
 import dtv_gui_dash as _DG
 tr = _DG.TrackRow({"kind": "subtitle", "lang": "por", "codecs": "stpp.ttml.im1t", "recorded": True}, False)
 check("legenda: a linha do cartão diz que a legenda é gravada", "gravada no MP4" in tr.stat.text())

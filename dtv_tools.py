@@ -4933,6 +4933,239 @@ def lang3(code):
     return c if re.fullmatch(r"[a-z]{2,3}", c) else ""
 
 
+def ttml_seconds(v, fps=30.0, tick=1.0):
+    """A TTML time expression (clock, frames or offset) in seconds, or None."""
+    v = (v or "").strip()
+    m = re.fullmatch(r"(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", v)
+    if m:
+        return int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+    m = re.fullmatch(r"(\d+):(\d{2}):(\d{2}):(\d+)(?:\.(\d+))?", v)
+    if m:
+        return int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3]) + (int(m[4]) + float("0." + (m[5] or "0"))) / fps
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(h|ms|m|s|f|t)", v)
+    if m:
+        n, u = float(m[1]), m[2]
+        return n * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}[u] if u in ("h", "m", "s", "ms") else (n / fps if u == "f" else n / tick)
+    return None
+
+
+def parse_ttml_cues(xml_text):
+    """Cues [(start, end, text)] of one TTML/IMSC document, in the document's own timeline. <i>/<b> are kept; positions and colours are not."""
+    import xml.etree.ElementTree as ET
+    if len(xml_text) > 4_000_000:
+        raise Fail("documento TTML grande demais")
+    root = ET.fromstring(xml_text.lstrip("﻿ \t\r\n"))
+    loc = lambda el: el.tag.rsplit("}", 1)[-1]
+    attr = lambda el, name: next((v for k, v in el.attrib.items() if k.rsplit("}", 1)[-1] == name), None)
+    fps = float(attr(root, "frameRate") or 30) * (lambda m: int(m[0]) / int(m[1]) if m else 1.0)((attr(root, "frameRateMultiplier") or "1 1").split())
+    tick = float(attr(root, "tickRate") or 1) if attr(root, "tickRate") else (fps if attr(root, "frameRate") else 1.0)
+    styles = {}
+    for el in root.iter():
+        if loc(el) == "style" and attr(el, "id"):
+            styles[attr(el, "id")] = (attr(el, "fontStyle") in ("italic", "oblique"), attr(el, "fontWeight") == "bold")
+
+    def tm(el, name):
+        return ttml_seconds(attr(el, name), fps, tick)
+
+    def style_of(el, inherit):
+        it, bd = inherit
+        for sid in (attr(el, "style") or "").split():
+            a, b = styles.get(sid, (False, False))
+            it, bd = it or a, bd or b
+        fs, fw = attr(el, "fontStyle"), attr(el, "fontWeight")
+        if fs:
+            it = fs in ("italic", "oblique")
+        if fw:
+            bd = fw == "bold"
+        return it, bd
+
+    def render(el, st):
+        out = []
+        st = style_of(el, st)
+        txt = lambda t: re.sub(r"\s+", " ", t) if t else ""
+        parts = [(txt(el.text), None)]
+        for ch in el.iter() if False else list(el):
+            if loc(ch) == "br":
+                parts.append(("\n", None))
+            elif loc(ch) == "span":
+                parts.append((render(ch, st), "span"))
+            parts.append((txt(ch.tail), None))
+        text = "".join(t for t, _ in parts)
+        if text.strip() and (st[0] or st[1]) and el is not None and loc(el) == "span":
+            text = (("<i>" if st[0] else "") + ("<b>" if st[1] else "") + text + ("</b>" if st[1] else "") + ("</i>" if st[0] else ""))
+        return text
+
+    cues = []
+
+    def walk(el, base, st):
+        st = style_of(el, st)
+        b = tm(el, "begin")
+        start0 = base + (b or 0.0)
+        if loc(el) == "p":
+            e, d = tm(el, "end"), tm(el, "dur")
+            start = start0
+            end = base + e if e is not None else (start + d if d is not None else None)
+            text = "\n".join(ln.strip() for ln in render(el, st).split("\n")).strip()
+            text = re.sub(r"[ \t]+", " ", text)
+            if text and end is not None and end > start:
+                cues.append((start, end, text))
+            return
+        for ch in el:
+            walk(ch, start0 if loc(el) in ("body", "div", "region") or True else base, st)
+
+    body = next((el for el in root if loc(el) == "body"), None)
+    if body is not None:
+        walk(body, 0.0, (False, False))
+    return cues
+
+
+def ttml_docs_to_cues(docs):
+    """
+    docs [(sample_start_sec, sample_dur_sec, xml_text)] -> (cues, mode). The cue times of a TTML sample may be relative to the sample or on the
+    track's own timeline; this is decided from the first document that has cues: 'aligned' (inside the sample window), 'relative' (add the sample
+    start) or 'offset' (a different epoch: the constant difference seen in that first document is removed). Repeated cues that continue across
+    samples are merged. Documents that cannot be read are skipped.
+    """
+    mode, shift0 = None, 0.0
+    raw = []
+    for dts, dur, xml in docs:
+        try:
+            cues = parse_ttml_cues(xml)
+        except Exception:
+            continue
+        if not cues:
+            continue
+        tmin = min(c[0] for c in cues)
+        if mode is None:
+            delta = tmin - dts
+            if -1.0 <= delta <= max(dur, 0.0) + 2.0:
+                mode = "aligned"
+            elif tmin < dts - 1.0:
+                mode = "relative"
+            else:
+                mode, shift0 = "offset", delta - 0.0
+        off = {"aligned": 0.0, "relative": dts, "offset": -shift0}[mode]
+        raw += [(a + off, b + off, t) for a, b, t in cues]
+    raw.sort(key=lambda c: (c[2], c[0]))
+    merged = []
+    for a, b, t in raw:                                   # the same text continuing from one sample into the next
+        if merged and merged[-1][2] == t and a <= merged[-1][1] + 0.05:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b), t)
+        else:
+            merged.append((a, b, t))
+    merged.sort(key=lambda c: (c[0], c[1]))
+    return merged, mode or "aligned"
+
+
+def srt_text(cues):
+    def ts(x):
+        ms = int(round(max(0.0, x) * 1000))
+        return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+    return "".join(f"{i}\n{ts(a)} --> {ts(b)}\n{t}\n\n" for i, (a, b, t) in enumerate(cues, 1))
+
+
+def m4s_samples(data):
+    """Samples of a fragmented-MP4 media segment: [(decode_time_ticks, duration_ticks, payload)]."""
+    res = []
+    for bt, ps, be in mp4_iter(data):
+        if bt != b"moof":
+            continue
+        moof_start = ps - 8
+        for tt, tps, tbe in mp4_iter(data, ps, be):
+            if tt != b"traf":
+                continue
+            base, tfdt, d_dur, d_size, runs = None, 0, 0, 0, []
+            for ct, cps, cbe in mp4_iter(data, tps, tbe):
+                if ct == b"tfhd":
+                    fl = struct.unpack(">I", b"\0" + data[cps + 1:cps + 4])[0]
+                    q = cps + 8
+                    if fl & 1:
+                        base = struct.unpack(">Q", data[q:q + 8])[0]; q += 8
+                    if fl & 2:
+                        q += 4
+                    if fl & 8:
+                        d_dur = struct.unpack(">I", data[q:q + 4])[0]; q += 4
+                    if fl & 0x10:
+                        d_size = struct.unpack(">I", data[q:q + 4])[0]; q += 4
+                elif ct == b"tfdt":
+                    tfdt = struct.unpack(">Q", data[cps + 4:cps + 12])[0] if data[cps] == 1 else struct.unpack(">I", data[cps + 4:cps + 8])[0]
+                elif ct == b"trun":
+                    fl = struct.unpack(">I", b"\0" + data[cps + 1:cps + 4])[0]
+                    n = struct.unpack(">I", data[cps + 4:cps + 8])[0]
+                    q = cps + 8
+                    off = None
+                    if fl & 1:
+                        off = struct.unpack(">i", data[q:q + 4])[0]; q += 4
+                    if fl & 4:
+                        q += 4
+                    items = []
+                    for _ in range(n):
+                        du, sz = d_dur, d_size
+                        if fl & 0x100:
+                            du = struct.unpack(">I", data[q:q + 4])[0]; q += 4
+                        if fl & 0x200:
+                            sz = struct.unpack(">I", data[q:q + 4])[0]; q += 4
+                        if fl & 0x400:
+                            q += 4
+                        if fl & 0x800:
+                            q += 4
+                        items.append((du, sz))
+                    runs.append((off, items))
+            t = tfdt
+            pos_default = None
+            for off, items in runs:
+                pos = (base if base is not None else moof_start) + off if off is not None else pos_default
+                if pos is None:
+                    continue
+                for du, sz in items:
+                    res.append((t, du, bytes(data[pos:pos + sz])))
+                    t += du
+                    pos += sz
+                pos_default = pos
+    return res
+
+
+def mp4_stpp_docs(path, track_id):
+    """[(start_sec, dur_sec, xml_text)] of an stpp track in a regular MP4."""
+    tr = next((t for t in mp4_tables(str(path)) if t["id"] == track_id), None)
+    if tr is None:
+        return []
+    offs, sizes, dts = mp4_sample_offsets(tr), tr["sizes"], tr["dts"]
+    ends = dts[1:] + [tr.get("dts_end", dts[-1] if dts else 0)]
+    docs = []
+    with open(path, "rb") as f:
+        for o, sz, a, b in zip(offs, sizes, dts, ends):
+            f.seek(o)
+            docs.append((a / tr["ts"], (b - a) / tr["ts"], f.read(sz).decode("utf-8", "replace")))
+    return docs
+
+
+def add_srt_track(mp4box, dest, srt_path, lang):
+    """Adds an SRT as a tx3g (mov_text) track to the finished MP4 `dest`. Returns '' or the reason it failed."""
+    tmp = dest.with_name(dest.name + ".srt.mp4")
+    try:
+        with MP4BoxJob(dest) as box:
+            lg = lang3(lang)
+            cmd = [mp4box, "-add", f"{box.inp(srt_path)}{':lang=' + lg if lg else ''}:hdlr=sbtl", box.inp(dest), "-out", box.out(tmp)]
+            box.run(cmd, "subtitles", lambda f, d: None)
+        if not tmp.is_file():
+            return "o MP4Box não gravou a trilha"
+        os.replace(tmp, dest)
+        return ""
+    except Fail as e:
+        return str(e)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def sidecar_srt(dest, cues, lang):
+    """Writes the cues next to the video as <name>.<lang>.srt (UTF-8, what Plex/Jellyfin/Emby and most players pick up by name)."""
+    lg = lang3(lang)
+    path = dest.with_name(f"{dest.stem}.{lg}.srt" if lg else f"{dest.stem}.srt")
+    path.write_text(srt_text(cues), encoding="utf-8")
+    return path
+
+
 def mp4_subtitle_tracks(path):
     """[{id, fourcc, lang}] of the subtitle/text tracks of a regular MP4 ([] for any other file)."""
     try:
@@ -4982,6 +5215,41 @@ def reattach_subtitles(mp4box, src, dest, tracks):
         return str(e)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def carry_subtitles(mp4box, src, dest, tracks, fmt, sidecar):
+    """
+    Puts the subtitle tracks of `src` into the MP4 `dest`. TTML (stpp) is the format almost no player/TV reads, so by default it is converted to
+    tx3g (mov_text); fmt 'stpp' keeps it as it is and 'both' keeps both. Other kinds (tx3g, wvtt...) are copied untouched. Returns a summary.
+    """
+    stpp = [t for t in tracks if t["fourcc"] == "stpp"]
+    other = [t for t in tracks if t["fourcc"] != "stpp"]
+    done = []
+    if other or (stpp and fmt in ("stpp", "both")):
+        why = reattach_subtitles(mp4box, src, dest, other + (stpp if fmt in ("stpp", "both") else []))
+        if why:
+            raise Fail(why)
+        done += [f"{t['lang'] or '?'} ({t['fourcc']})" for t in other + (stpp if fmt in ("stpp", "both") else [])]
+    if stpp and fmt in ("tx3g", "both"):
+        for t in stpp:
+            cues, mode = ttml_docs_to_cues(mp4_stpp_docs(src, t["id"]))
+            if not cues:
+                note(f"A legenda {t['lang'] or '?'} da origem não tem nenhum texto legível; não foi convertida.")
+                continue
+            tmp = dest.with_name(dest.name + ".cues.srt")
+            try:
+                tmp.write_text(srt_text(cues), encoding="utf-8")
+                why = add_srt_track(mp4box, dest, tmp, t["lang"])
+            finally:
+                tmp.unlink(missing_ok=True)
+            if why:
+                raise Fail(why)
+            if mode == "offset":
+                note("Os tempos da legenda foram ajustados pelo deslocamento observado no primeiro trecho; confira o sincronismo.")
+            if sidecar:
+                sidecar_srt(dest, cues, t["lang"])
+            done.append(f"{t['lang'] or '?'} (tx3g, convertida de stpp, {len(cues)} legendas)")
+    return ", ".join(done) or "nenhuma"
 
 
 def dash_session(a):
@@ -5887,16 +6155,35 @@ def cmd_dash_capture(a):
     if final_mp4 != out_mp4:
         note(f"{out_mp4.name} appeared during the capture; saving as {final_mp4.name}.")
     origin = min(timing_p)
-    sub_info, sub_mp4 = None, None
+    sub_info, sub_mp4, sub_srt, sub_cues = None, None, None, []
+    sub_fmt = getattr(a, "subtitle_format", "tx3g")
     if want_subs and sst["init"] and sst["files"]:
-        sub_mp4 = work_dir / "subtitles.mp4"
         end_sec = max(timing_p) + 1.0 / max(fps, 1.0)
-        sub_info = build_subtitle_mp4(sst["init"], [(k, pth, sst["dur"][k]) for k, pth in sst["files"].items()], sst["ts"] or sst["meta"]["timescale"],
-                                      origin, end_sec, sub_mp4)
-        if not sub_info["kept"]:
-            sub_mp4 = None
-        elif sub_info["first_gap"] > 0.5:
-            note(f"A primeira legenda começa {sub_info['first_gap']:.1f} s antes do vídeo e foi alinhada ao início dele.")
+        sub_ts = sst["ts"] or sst["meta"]["timescale"]
+        if sub_fmt in ("tx3g", "both"):
+            try:
+                docs = []
+                for k_, pth in sorted(sst["files"].items()):
+                    with open(pth, "rb") as f_:
+                        docs += [(t_ / sub_ts, du_ / sub_ts, pl.decode("utf-8", "replace")) for t_, du_, pl in m4s_samples(f_.read())]
+                cues, mode = ttml_docs_to_cues(docs)
+                sub_cues = [(max(0.0, x - origin), y - origin, t_) for x, y, t_ in cues if y - origin > 0 and x - origin < end_sec]
+                if sub_cues:
+                    sub_srt = work_dir / "subtitles.srt"
+                    sub_srt.write_text(srt_text(sub_cues), encoding="utf-8")
+                    clog("INFO", f"Subtitles: {len(sub_cues)} cues converted to tx3g (times {mode})")
+                else:
+                    note("A legenda não tem nenhum texto no trecho gravado (os documentos TTML estão vazios).")
+            except Exception as e_:
+                note(f"Não consegui converter a legenda TTML ({type(e_).__name__}: {e_}); gravando o stpp original.")
+                sub_fmt = "stpp"
+        if sub_fmt in ("stpp", "both"):
+            sub_mp4 = work_dir / "subtitles.mp4"
+            sub_info = build_subtitle_mp4(sst["init"], [(k, pth, sst["dur"][k]) for k, pth in sst["files"].items()], sub_ts, origin, end_sec, sub_mp4)
+            if not sub_info["kept"]:
+                sub_mp4 = None
+            elif sub_info["first_gap"] > 0.5:
+                note(f"A primeira legenda começa {sub_info['first_gap']:.1f} s antes do vídeo e foi alinhada ao início dele.")
     elif want_subs and sst["found"]:
         note("Nenhum segmento de legenda foi baixado; o MP4 sai sem legenda.")
     box = MP4BoxJob(temp_vvc)
@@ -5905,8 +6192,10 @@ def cmd_dash_capture(a):
     if st["has_audio"]:
         delay_ms = av_delay_ms(st["first_aud_sec"], origin)
         cmd += ["-add", f"{box.inp(temp_aud)}{':delay=' + str(delay_ms) if delay_ms else ''}#audio:id=2"]
+    lg = lang3(sst["meta"].get("lang")) if want_subs and sst["meta"] else ""
+    if sub_srt is not None:                                         # tx3g first: it is the one players pick by default
+        cmd += ["-add", f"{box.inp(sub_srt)}{':lang=' + lg if lg else ''}:hdlr=sbtl"]
     if sub_mp4 is not None:
-        lg = lang3(sst["meta"].get("lang"))
         cmd += ["-add", f"{box.inp(sub_mp4)}{':lang=' + lg if lg else ''}"]
     tmp_out = work_dir / "capture_out.mp4"
     cmd += ["-new", box.out(tmp_out)]
@@ -5928,6 +6217,8 @@ def cmd_dash_capture(a):
     final_mp4.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(tmp_out), str(final_mp4))
     size = final_mp4.stat().st_size
+    if sub_srt is not None and getattr(a, "subtitle_sidecar", False):
+        clog("INFO", f"Subtitles saved next to the video: {sidecar_srt(final_mp4, sub_cues, lg).name}")
     if st["has_audio"]:
         sync_msg = validate_dash_sync(final_mp4, (st["first_aud_sec"] - origin))
         if "AVISO CRÍTICO" in sync_msg:
@@ -5946,7 +6237,8 @@ def cmd_dash_capture(a):
     rows = [["Frames", str(merger.written)], ["Frame rate", f"{fps} fps"], ["LCEVC", f"{merger.paired}/{merger.written}"],
             ["Audio", "yes" if st["has_audio"] else "no"], ["Audio delay", f"{delay_ms} ms"]]
     if want_subs:
-        rows.append(["Subtitles", f"{sst['meta'].get('lang') or '?'} ({sub_info['kept']} segments)" if sub_mp4 is not None else "none"])
+        kinds = ([f"tx3g, {len(sub_cues)} legendas"] if sub_srt is not None else []) + ([f"stpp, {sub_info['kept']} segmentos"] if sub_mp4 is not None else [])
+        rows.append(["Subtitles", f"{sst['meta'].get('lang') or '?'} ({'; '.join(kinds)})" if kinds else "none"])
     if verify:
         rows.append(["Enhancement", f"{verify[1]}/{verify[0]} frames"])
     ev(type="result", out=str(final_mp4), outputs=[{"kind": "capture", "title": "capture (VVC + SEI LCEVC" + (" + MPEG-H)" if st["has_audio"] else ")"),
@@ -6477,14 +6769,10 @@ def cmd_transcode(a):
             sub_row = "não copiadas (contêiner)"
         elif sub_src:
             try:
-                why = reattach_subtitles(find_mp4box(a.mp4box), src, out, sub_src)
+                sub_row = carry_subtitles(find_mp4box(a.mp4box), src, out, sub_src, getattr(a, "subtitle_format", "tx3g"), getattr(a, "subtitle_sidecar", False))
             except Fail as e:
-                why = str(e)
-            if why:
-                note(f"Não consegui copiar a legenda da origem para a saída ({why}). O vídeo está pronto, sem legenda.")
+                note(f"Não consegui copiar a legenda da origem para a saída ({e}). O vídeo está pronto, sem legenda.")
                 sub_row = "falhou"
-            else:
-                sub_row = ", ".join((t["lang"] or "?") for t in sub_src) + " (copiadas da origem)"
         step("encode", "done", f"{out.name} · {human(out.stat().st_size)} · {fmt_hms(got or 0)}")
         progress("encode", 1.0, force=True)
 
@@ -7721,6 +8009,10 @@ def build_parser():
     s_dash.add_argument("--proxy", default="", help="HTTP(S) proxy URL")
     s_dash.add_argument("--subtitles", action="store_true",
                         help="also record the manifest's first subtitle/caption track (TTML/stpp) into the MP4 (default: subtitles are only listed)")
+    s_dash.add_argument("--subtitle-format", choices=("tx3g", "stpp", "both"), default="tx3g",
+                        help="how --subtitles are stored: tx3g (mov_text; read by ffmpeg, VLC, mpv, QuickTime, most TVs and media servers; default), "
+                             "stpp (the original TTML, which only DASH players and GPAC read) or both")
+    s_dash.add_argument("--subtitle-sidecar", action="store_true", help="also write the subtitles as <video>.<lang>.srt next to the MP4 (tx3g/both only)")
     s_dash.add_argument("--max-errors", type=int, default=150, metavar="N",
                         help="stop (and package) after N consecutive manifest failures; 0 = never (default: 150)")
     s_dash.add_argument("--overwrite", action="store_true")
@@ -7762,6 +8054,9 @@ def build_parser():
     s_tc = sub.add_parser("transcode", help="single-track MP4 -> HEVC or AV1 10-bit HDR10 with every MPEG-H preset as an audio track")
     video_input_flags(s_tc)
     s_tc.add_argument("-o", "--output", default="", help="output file (default: <name>_hevc_hdr10.mp4 / <name>_av1_hdr10.mp4, or .mkv)")
+    s_tc.add_argument("--subtitle-format", choices=("tx3g", "stpp", "both"), default="tx3g",
+                      help="TTML (stpp) subtitles of the source: convert to tx3g (default; players and TVs read it), keep as stpp, or both")
+    s_tc.add_argument("--subtitle-sidecar", action="store_true", help="also write the converted subtitles as <output>.<lang>.srt")
     s_tc.add_argument("--no-subtitles", action="store_true",
                       help="do not carry the source's subtitle track(s) over to the output (by default they are copied into MP4 outputs)")
     s_tc.add_argument("--encoder", choices=tuple(ENCODERS), default="x265",

@@ -1275,7 +1275,16 @@ class TranscodePage(Page):
         self.nosubs = QCheckBox("Remover as legendas da origem (por padrão elas são copiadas para o MP4)")
         self.nosubs.setToolTip("O ffmpeg não grava legenda TTML (stpp) em MP4; a cópia é feita depois da codificação, com o MP4Box. Em MKV a legenda não é copiada.")
         fv.addRow("", self.nosubs)
-        self.remember("transcode", {"nosubs": self.nosubs})
+        self.tc_sub_fmt = QComboBox()
+        self.tc_sub_fmt.addItem("tx3g (compatível)", "tx3g")
+        self.tc_sub_fmt.addItem("stpp (TTML original: só players DASH)", "stpp")
+        self.tc_sub_fmt.addItem("Ambos", "both")
+        self.tc_sub_fmt.setToolTip("O TTML (stpp) dentro do MP4 quase nenhum player lê. O tx3g (mov_text) é lido pelo ffmpeg, VLC, mpv, QuickTime, a maioria das TVs e Plex/Jellyfin/Emby; perde só posição e cor.")
+        self.tc_sub_srt = QCheckBox("Salvar também um arquivo .srt ao lado do vídeo")
+        fv.addRow("Legenda TTML da origem", self.tc_sub_fmt)
+        fv.addRow("", self.tc_sub_srt)
+        self.nosubs.toggled.connect(lambda on: (self.tc_sub_fmt.setEnabled(not on), self.tc_sub_srt.setEnabled(not on)))
+        self.remember("transcode", {"nosubs": self.nosubs, "tc_sub_fmt": self.tc_sub_fmt, "tc_sub_srt": self.tc_sub_srt})
         adv = Collapsible("Avançado: codificador e verificação", flat=True)
         f3 = QFormLayout()
         self.x265 = QLineEdit()
@@ -1598,6 +1607,11 @@ class TranscodePage(Page):
                 a.append("--no-lcevc")
             if self.nosubs.isChecked():
                 a.append("--no-subtitles")
+            else:
+                if self.tc_sub_fmt.currentData() != "tx3g":
+                    a += ["--subtitle-format", self.tc_sub_fmt.currentData()]
+                if self.tc_sub_srt.isChecked():
+                    a.append("--subtitle-sidecar")
             if mode == "render":
                 for s in specs:
                     a += ["--option", s]
@@ -1787,6 +1801,14 @@ class DashPage(Page):
         self.verify_btn = QPushButton("Verificar o stream")
         self.verify_btn.setToolTip("Lê o manifesto e mostra o que o stream traz, inclusive se há legenda. Não baixa nenhuma mídia.")
         f.addRow("Legenda", left(self.subs, self.verify_btn))
+        self.sub_fmt = QComboBox()
+        self.sub_fmt.addItem("tx3g (compatível: players, TVs, servidores de mídia)", "tx3g")
+        self.sub_fmt.addItem("stpp (TTML original: só players DASH)", "stpp")
+        self.sub_fmt.addItem("Ambos", "both")
+        self.sub_fmt.setToolTip("O TTML (stpp) dentro do MP4 quase nenhum player lê. O tx3g (mov_text) é lido pelo ffmpeg, VLC, mpv, QuickTime, a maioria das TVs e Plex/Jellyfin/Emby; perde só posição e cor.")
+        self.sub_srt = QCheckBox("Salvar também um arquivo .srt ao lado do vídeo")
+        f.addRow("Formato da legenda", self.sub_fmt)
+        f.addRow("", self.sub_srt)
         self.sub_status = muted_label("")
         self.sub_status.setWordWrap(True)
         f.addRow("", self.sub_status)
@@ -1828,7 +1850,7 @@ class DashPage(Page):
         adv.content.addWidget(self.headers)
         lay.addWidget(adv)
         self.primary("Iniciar captura", lambda: self.run_built(self.build_jobs))
-        self.remember("dash", {"subs": self.subs})                       # a escolha de gravar ou não a legenda é lembrada
+        self.remember("dash", {"subs": self.subs, "sub_fmt": self.sub_fmt, "sub_srt": self.sub_srt})                       # a escolha de gravar ou não a legenda é lembrada
         self.info_runner = Runner(self.win.runner.env_extra, self)        # a verificação não usa o painel de tarefas
         self.info_runner.resultReady.connect(lambda job, res: self._info_result(res))
         self.info_runner.errorReported.connect(lambda job, msg: self._info_error(msg))
@@ -1927,6 +1949,10 @@ class DashPage(Page):
             a.append("--overwrite")
         if self.subs.isChecked():
             a.append("--subtitles")
+            if self.sub_fmt.currentData() != "tx3g":
+                a += ["--subtitle-format", self.sub_fmt.currentData()]
+            if self.sub_srt.isChecked():
+                a.append("--subtitle-sidecar")
         a += self.extra("dash-capture")
         return [Job("Captura DASH", a, kind="dash-capture", page=self, indeterminate=not secs, stop_label="Forçar parada", force_only=True)]
 
